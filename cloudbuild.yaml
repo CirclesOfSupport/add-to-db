@@ -25,5 +25,8 @@ steps:
       - --min-instances=0
       - --concurrency=50
 
+options:
+  logging: CLOUD_LOGGING_ONLY
+
 images:
   - us-east1-docker.pkg.dev/$PROJECT_ID/webhook-repo/add-to-db:$COMMIT_SHA
