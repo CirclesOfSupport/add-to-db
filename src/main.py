@@ -56,9 +56,6 @@ def health():
 
 @app.post("/ingest")
 def ingest():
-    if not is_authorized(request):
-        return jsonify({"error": "unauthorized"}), 401
-
     body = request.get_json(silent=True)
     if body is None:
         return jsonify({"error": "Invalid or missing JSON body"}), 400
@@ -76,11 +73,12 @@ def ingest():
     if not table_id:
         return jsonify({
             "error": "Invalid target",
-            "allowed_targets": sorted(ALLOWED_TARGETS.keys()),
+            "allowed_targets": sorted(ALLOWED_TARGETS.keys())
         }), 400
 
     try:
-        schema = get_table_schema(table_id)
+        table = client.get_table(table_id)
+        schema = list(table.schema)
     except Exception as exc:
         return jsonify({
             "status": "error",
@@ -99,7 +97,7 @@ def ingest():
     row = filter_to_schema(data, schema)
 
     try:
-        insert_errors = client.insert_rows_json(table_id, [row])
+        insert_errors = client.insert_rows(table=table, rows=[row])
     except Exception as exc:
         return jsonify({
             "status": "error",
