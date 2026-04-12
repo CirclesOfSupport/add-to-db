@@ -3,7 +3,7 @@ from flask import Flask, jsonify, request
 from google.cloud import bigquery
 
 from auth import is_authorized
-from config import ALLOWED_TARGETS
+from config import ALLOWED_TARGETS, TYPE_CHECKERS
 
 app = Flask(__name__)
 client = bigquery.Client()
