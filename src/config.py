@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os
 
-PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
+PROJECT_ID = "early-alert-responses"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 # Only allow approved destinations.
