@@ -144,7 +144,7 @@ def upsert_row(
     create_staging_table_from_target(table, staging_table_id)
 
     try:
-        insert_errors = client.insert_rows_json(staging_table_id, [row])
+        insert_errors = client.insert_rows(staging_table_id, [row])
         if insert_errors:
             raise RuntimeError(f"Failed to insert row into staging table: {insert_errors}")
 
@@ -211,7 +211,7 @@ def ingest():
     row = filter_to_schema(data, schema)
 
     try:
-        insert_errors = client.insert_rows_json(table.reference, [row])
+        insert_errors = client.insert_rows(table=table, rows=[row])
     except Exception as exc:
         return jsonify({
             "status": "error",
