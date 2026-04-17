@@ -141,10 +141,10 @@ def upsert_row(
         f"{table.project}.{table.dataset_id}._upsert_staging_{uuid.uuid4().hex}"
     )
 
-    create_staging_table_from_target(table, staging_table_id)
+    staging_table = create_staging_table_from_target(table, staging_table_id)
 
     try:
-        insert_errors = client.insert_rows(staging_table_id, [row])
+        insert_errors = client.insert_rows(table=staging_table, rows=[row])
         if insert_errors:
             raise RuntimeError(f"Failed to insert row into staging table: {insert_errors}")
 
