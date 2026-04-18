@@ -92,23 +92,26 @@ def build_struct_param(row: dict, schema: list[bigquery.SchemaField], name: str)
     return bigquery.StructQueryParameter(name, *scalar_params)
 
 
-def build_upsert_query(target_table_id: str, schema: list[bigquery.SchemaField], key_columns: list[str]):
+def build_upsert_query(target_table_id: str, row: dict, key_columns: list[str]):
     """
-    Generates a parameterized MERGE statement using UNNEST.
+    Generates a parameterized MERGE statement using only columns present in the row.
     """
-    column_names = [field.name for field in schema]
-    
-    # Map BQ types to STRUCT types for the query parameter
-    # This ensures the UNNEST handles the data types correctly
-    on_clause = " AND ".join([f"T.{quote_identifier(col)} = S.{quote_identifier(col)}" for col in key_columns])
-    
+    column_names = list(row.keys())  # Only columns we actually have
+
+    on_clause = " AND ".join([
+        f"T.{quote_identifier(col)} = S.{quote_identifier(col)}" 
+        for col in key_columns
+    ])
+
     non_key_columns = [col for col in column_names if col not in key_columns]
-    
+
     if non_key_columns:
-        update_clause = ",\n        ".join([f"{quote_identifier(col)} = S.{quote_identifier(col)}" for col in non_key_columns])
+        update_clause = ",\n        ".join([
+            f"{quote_identifier(col)} = S.{quote_identifier(col)}" 
+            for col in non_key_columns
+        ])
         matched_action = f"WHEN MATCHED THEN UPDATE SET {update_clause}"
     else:
-        # Fallback if every column is a key
         matched_action = f"WHEN MATCHED THEN UPDATE SET {quote_identifier(key_columns[0])} = S.{quote_identifier(key_columns[0])}"
 
     insert_cols = ", ".join([quote_identifier(col) for col in column_names])
@@ -124,11 +127,7 @@ def build_upsert_query(target_table_id: str, schema: list[bigquery.SchemaField],
     """
 
 def run_upsert(table_id: str, schema: list[bigquery.SchemaField], row: dict, key_columns: list[str]):
-    """
-    Executes the MERGE query using a single row passed as a parameter.
-    """
-    query = build_upsert_query(table_id, schema, key_columns)
-
+    query = build_upsert_query(table_id, row, key_columns)  # pass row, not schema
     struct_param = build_struct_param(row, schema, "placeholder")
 
     job_config = bigquery.QueryJobConfig(
