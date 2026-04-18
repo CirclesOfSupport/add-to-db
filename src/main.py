@@ -8,6 +8,7 @@ from google.cloud import bigquery
 
 from auth import is_authorized
 from config import ALLOWED_TARGETS, TYPE_CHECKERS, UPSERT_KEYS
+from bq_writer import BQ_TYPE_MAP
 
 app = Flask(__name__)
 client = bigquery.Client()
@@ -79,6 +80,18 @@ def validate_upsert_keys(
 
     return errors
 
+def build_struct_param(row: dict, schema: list[bigquery.SchemaField], name: str) -> bigquery.StructQueryParameter:
+    schema_fields = {field.name: field for field in schema}
+    scalar_params = []
+    for key, value in row.items():
+        field = schema_fields.get(key)
+        if field is None:
+            continue
+        bq_type = BQ_TYPE_MAP.get(field.field_type, "STRING")
+        scalar_params.append(bigquery.ScalarQueryParameter(key, bq_type, value))
+    return bigquery.StructQueryParameter(name, *scalar_params)
+
+
 def build_upsert_query(target_table_id: str, schema: list[bigquery.SchemaField], key_columns: list[str]):
     """
     Generates a parameterized MERGE statement using UNNEST.
@@ -115,16 +128,17 @@ def run_upsert(table_id: str, schema: list[bigquery.SchemaField], row: dict, key
     Executes the MERGE query using a single row passed as a parameter.
     """
     query = build_upsert_query(table_id, schema, key_columns)
-    
-    # We pass the row as a list containing one dictionary
+
+    struct_param = build_struct_param(row, schema, "placeholder")
+
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
-            bigquery.ArrayQueryParameter("rows", "RECORD", [row])
+            bigquery.ArrayQueryParameter("rows", "RECORD", [struct_param])
         ]
     )
-    
+
     query_job = client.query(query, job_config=job_config)
-    return query_job.result() # Blocks until finished
+    return query_job.result()
 
 
 @app.get("/")

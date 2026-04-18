@@ -1,0 +1,17 @@
+BQ_TYPE_MAP = {
+        "STRING": "STRING",
+        "BYTES": "BYTES",
+        "INTEGER": "INT64",
+        "INT64": "INT64",
+        "FLOAT": "FLOAT64",
+        "FLOAT64": "FLOAT64",
+        "BOOLEAN": "BOOL",
+        "BOOL": "BOOL",
+        "TIMESTAMP": "TIMESTAMP",
+        "DATE": "DATE",
+        "TIME": "TIME",
+        "DATETIME": "DATETIME",
+        "NUMERIC": "NUMERIC",
+        "BIGNUMERIC": "BIGNUMERIC",
+        "JSON": "JSON",
+    }
