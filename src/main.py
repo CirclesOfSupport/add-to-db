@@ -79,88 +79,52 @@ def validate_upsert_keys(
 
     return errors
 
-
-def create_staging_table_from_target(
-    target_table: bigquery.Table,
-    staging_table_id: str,
-) -> bigquery.Table:
-    staging_table = bigquery.Table(staging_table_id, schema=target_table.schema)
-    staging_table.expires = datetime.now(timezone.utc) + timedelta(hours=1)
-    return client.create_table(staging_table)
-
-
-def build_merge_sql(
-    target_table_id: str,
-    staging_table_id: str,
-    schema: list[bigquery.SchemaField],
-    key_columns: list[str],
-) -> str:
+def build_upsert_query(target_table_id: str, schema: list[bigquery.SchemaField], key_columns: list[str]):
+    """
+    Generates a parameterized MERGE statement using UNNEST.
+    """
     column_names = [field.name for field in schema]
-
-    on_clause = " AND ".join(
-        [f"T.{quote_identifier(col)} = S.{quote_identifier(col)}" for col in key_columns]
-    )
-
+    
+    # Map BQ types to STRUCT types for the query parameter
+    # This ensures the UNNEST handles the data types correctly
+    on_clause = " AND ".join([f"T.{quote_identifier(col)} = S.{quote_identifier(col)}" for col in key_columns])
+    
     non_key_columns = [col for col in column_names if col not in key_columns]
-
+    
     if non_key_columns:
-        update_clause = ",\n        ".join(
-            [f"{quote_identifier(col)} = S.{quote_identifier(col)}" for col in non_key_columns]
-        )
-        when_matched_clause = f"""WHEN MATCHED THEN
-      UPDATE SET
-        {update_clause}"""
+        update_clause = ",\n        ".join([f"{quote_identifier(col)} = S.{quote_identifier(col)}" for col in non_key_columns])
+        matched_action = f"WHEN MATCHED THEN UPDATE SET {update_clause}"
     else:
-        # Rare case: all columns are keys. Keep the MERGE valid.
-        noop_col = key_columns[0]
-        when_matched_clause = f"""WHEN MATCHED THEN
-      UPDATE SET
-        {quote_identifier(noop_col)} = T.{quote_identifier(noop_col)}"""
+        # Fallback if every column is a key
+        matched_action = f"WHEN MATCHED THEN UPDATE SET {quote_identifier(key_columns[0])} = S.{quote_identifier(key_columns[0])}"
 
-    insert_columns_sql = ", ".join([quote_identifier(col) for col in column_names])
-    insert_values_sql = ", ".join([f"S.{quote_identifier(col)}" for col in column_names])
+    insert_cols = ", ".join([quote_identifier(col) for col in column_names])
+    insert_vals = ", ".join([f"S.{quote_identifier(col)}" for col in column_names])
 
-    sql = f"""
-MERGE {quote_identifier(target_table_id)} T
-USING {quote_identifier(staging_table_id)} S
-ON {on_clause}
-{when_matched_clause}
-WHEN NOT MATCHED THEN
-  INSERT ({insert_columns_sql})
-  VALUES ({insert_values_sql})
-"""
-    return sql
+    return f"""
+    MERGE {quote_identifier(target_table_id)} T
+    USING UNNEST(@rows) S
+    ON {on_clause}
+    {matched_action}
+    WHEN NOT MATCHED THEN
+      INSERT ({insert_cols}) VALUES ({insert_vals})
+    """
 
-
-def upsert_row(
-    table: bigquery.Table,
-    row: dict,
-    key_columns: list[str],
-) -> None:
-    staging_table_id = (
-        f"{table.project}.{table.dataset_id}._upsert_staging_{uuid.uuid4().hex}"
+def run_upsert(table_id: str, schema: list[bigquery.SchemaField], row: dict, key_columns: list[str]):
+    """
+    Executes the MERGE query using a single row passed as a parameter.
+    """
+    query = build_upsert_query(table_id, schema, key_columns)
+    
+    # We pass the row as a list containing one dictionary
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("rows", "RECORD", [row])
+        ]
     )
-
-    staging_table = create_staging_table_from_target(table, staging_table_id)
-
-    try:
-        insert_errors = client.insert_rows(table=staging_table, rows=[row])
-        if insert_errors:
-            raise RuntimeError(f"Failed to insert row into staging table: {insert_errors}")
-
-        target_table_id = f"{table.project}.{table.dataset_id}.{table.table_id}"
-        merge_sql = build_merge_sql(
-            target_table_id=target_table_id,
-            staging_table_id=staging_table_id,
-            schema=list(table.schema),
-            key_columns=key_columns,
-        )
-
-        query_job = client.query(merge_sql)
-        query_job.result()
-
-    finally:
-        client.delete_table(staging_table_id, not_found_ok=True)
+    
+    query_job = client.query(query, job_config=job_config)
+    return query_job.result() # Blocks until finished
 
 
 @app.get("/")
@@ -279,26 +243,26 @@ def upsert():
     errors.extend(validate_upsert_keys(key_columns, schema, row))
 
     if errors:
-        return jsonify({
-            "status": "error",
-            "errors": errors,
-            "warnings": warnings,
-        }), 400
+        return jsonify({"status": "error", "errors": errors}), 400
 
+    # 2. Execute the optimized Upsert
     try:
-        upsert_row(table=table, row=row, key_columns=key_columns)
+        run_upsert(
+            table_id=table_id,
+            schema=schema,
+            row=row,
+            key_columns=key_columns
+        )
     except Exception as exc:
         return jsonify({
-            "status": "error",
-            "error": "BigQuery upsert failed",
-            "details": str(exc),
+            "status": "error", 
+            "error": "BigQuery MERGE failed", 
+            "details": str(exc)
         }), 500
 
     return jsonify({
         "status": "ok",
         "operation": "upsert",
         "target": target,
-        "table_id": table_id,
-        "keys": key_columns,
         "warnings": warnings,
     }), 200
