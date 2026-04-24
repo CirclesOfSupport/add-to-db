@@ -4,8 +4,14 @@ from flask import Flask, jsonify, request
 from google.cloud import bigquery
 
 from auth import is_authorized
-from config import ALLOWED_TARGETS, TYPE_CHECKERS, UPSERT_KEYS
-from bq_writer import build_upsert_query, build_struct_param, validate_upsert_keys, add_missing_fields_to_table
+from config import ALLOWED_TARGETS, TYPE_CHECKERS, UPSERT_KEYS, PROJECT_ID
+from bq_writer import (
+    build_upsert_query,
+    build_struct_param,
+    validate_upsert_keys,
+    add_missing_fields_to_table,
+    get_users_and_responses_view_query
+)
 
 app = Flask(__name__)
 client = bigquery.Client()
@@ -66,6 +72,12 @@ def run_upsert(table_id: str, schema: list[bigquery.SchemaField], row: dict, key
     )
 
     query_job = client.query(query, job_config=job_config)
+    return query_job.result()
+
+
+def update_users_and_responses_view(client: bigquery.Client, project_id: str, target: str):
+    query = get_users_and_responses_view_query(project_id, target)
+    query_job = client.query(query)
     return query_job.result()
 
 
@@ -132,6 +144,8 @@ def ingest():
             f"Added new BigQuery field: {field_name}"
             for field_name in added_fields
         ])
+        if target in {"users", "responses", "users_copy", "responses_copy"}:
+            update_users_and_responses_view(client, PROJECT_ID, target)
 
     if errors:
         return jsonify({
@@ -233,6 +247,8 @@ def upsert():
             f"Added new BigQuery field: {field_name}"
             for field_name in added_fields
         ])
+        if target in {"users", "responses", "users_copy", "responses_copy"}:
+            update_users_and_responses_view(client, PROJECT_ID, target)
 
     row = filter_to_schema(data, schema)
     errors.extend(validate_upsert_keys(key_columns, schema, row))
@@ -244,7 +260,6 @@ def upsert():
             "warnings": warnings,
         }), 400
 
-    # 2. Execute the optimized Upsert
     try:
         run_upsert(
             table_id=table_id,

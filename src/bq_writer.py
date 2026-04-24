@@ -210,3 +210,16 @@ def validate_upsert_keys(
             errors.append(f"Upsert key field '{key}' cannot be null")
 
     return errors
+
+
+def get_users_and_responses_view_query(project_id: str, target: str) -> str:
+    table_type = "COPY" if ("copy" in target.lower()) else "RESPONSES"
+    return f"""
+    CREATE OR REPLACE VIEW `{project_id}.{table_type}.users_and_responses` AS
+    SELECT
+      response_data AS resp,
+      users AS user
+    FROM `{project_id}.{table_type}.response_data` AS response_data
+    LEFT JOIN `{project_id}.{table_type}.users` AS users
+      ON users.uuid = response_data.uuid
+    """

@@ -8,7 +8,6 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 ALLOWED_TARGETS: dict[str, str] = {
     "users": f"{PROJECT_ID}.RESPONSES.users",
     "responses": f"{PROJECT_ID}.RESPONSES.response_data",
-    #"users_and_responses": f"{PROJECT_ID}.RESPONSES.users_and_responses",
     "triage_data": f"{PROJECT_ID}.RESPONSES.triage-message-data",
     "users_copy": f"{PROJECT_ID}.COPY.users",
     "responses_copy": f"{PROJECT_ID}.COPY.response_data",
@@ -16,8 +15,7 @@ ALLOWED_TARGETS: dict[str, str] = {
 
 UPSERT_KEYS: dict[str, list[str]] = {
     "users": ["uuid"],
-    "responses": ["SessionID"], #TODO check if this is the right key to upsert on
-    #"users_and_responses": ["uuid", "session_id"],
+    "responses": ["SessionID"],
     "triage_data": ["message_id"],
     "users_copy": ["uuid"],
     "responses_copy": ["SessionID"],

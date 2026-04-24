@@ -36,7 +36,8 @@ The service is built and deployed automatically via **Google Cloud Build**.
 2. Push the image to Artifact Registry at `us-east1-docker.pkg.dev/$PROJECT_ID/webhook-repo/add-to-db`
 3. Deploy to Cloud Run in `us-east1` with:
    - 0 minimum instances (scales to zero)
-   - 50 max concurrent requests per instance
+   - 50 maximum instances (burst capacity for traffic spikes)
+   - 50 max concurrent requests per instance (allows multiple requests to queue up on a single instance during bursts, reducing cold starts)
    - 1 worker / 8 threads (gunicorn)
    - Unauthenticated public access (protected by the webhook secret header)
 
