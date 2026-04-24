@@ -34,66 +34,66 @@ def get_table_schema(table_id: str) -> list[bigquery.SchemaField]:
     return list(table.schema)
 
 
-def normalize_target_requests(body: dict, query_target: str | None = None) -> tuple[list[dict], str | None]:
+def normalize_target_requests(body: dict, query_table: str | None = None) -> tuple[list[dict], str | None]:
     """
-    Supports both existing single-target requests:
+    Supports both existing single-table requests:
 
     {
-        "target": "users_copy",
+        "table": "users_copy",
         "data": {...}
     }
 
-    and new multi-target requests:
+    and new multi-table requests:
 
     {
-        "targets": [
-            {"target": "users_copy", "data": {...}},
-            {"target": "responses_copy", "data": {...}}
+        "tables": [
+            {"table": "users_copy", "data": {...}},
+            {"table": "responses_copy", "data": {...}}
         ]
     }
     """
 
-    if "targets" in body:
-        if query_target:
-            return [], "Do not use query parameter 'target' with multi-target requests"
+    if "tables" in body:
+        if query_table:
+            return [], "Do not use query parameter 'table' with multi-table requests"
 
-        targets = body.get("targets")
+        tables = body.get("tables")
 
-        if not isinstance(targets, list):
-            return [], "Field 'targets' must be a list"
+        if not isinstance(tables, list):
+            return [], "Field 'tables' must be a list"
 
-        if not targets:
-            return [], "Field 'targets' must not be empty"
+        if not tables:
+            return [], "Field 'tables' must not be empty"
 
         normalized = []
 
-        for index, item in enumerate(targets):
+        for index, item in enumerate(tables):
             if not isinstance(item, dict):
-                return [], f"Each item in 'targets' must be a JSON object. Invalid item at index {index}"
+                return [], f"Each item in 'tables' must be a JSON object. Invalid item at index {index}"
 
-            target = item.get("target")
+            table = item.get("table")
             data = item.get("data")
 
-            if not target:
-                return [], f"Missing target at targets[{index}]"
+            if not table:
+                return [], f"Missing table at tables[{index}]"
 
             if not isinstance(data, dict):
-                return [], f"Field 'data' at targets[{index}] must be a JSON object"
+                return [], f"Field 'data' at tables[{index}] must be a JSON object"
 
-            normalized.append({"target": target, "data": data})
+            normalized.append({"target": table, "data": data})
 
         return normalized, None
 
-    target = query_target or body.get("target")
+    table = query_table or body.get("table")
     data = body.get("data")
 
-    if not target:
-        return [], "Missing target"
+    if not table:
+        return [], "Missing table"
 
     if not isinstance(data, dict):
         return [], "Field 'data' must be a JSON object"
 
-    return [{"target": target, "data": data}], None
+    return [{"target": table, "data": data}], None
 
 
 def validate_payload(
@@ -165,25 +165,25 @@ def prepare_item(target: str, data: dict, results: list) -> tuple[bigquery.Table
     table_id = ALLOWED_TARGETS.get(target)
     if not table_id:
         return err(
-            "Invalid target",
+            "Invalid table",
             400,
-            target=target,
-            allowed_targets=sorted(ALLOWED_TARGETS.keys()),
+            table=target,
+            allowed_tables=sorted(ALLOWED_TARGETS.keys()),
         )
 
     try:
         table = client.get_table(table_id)
         schema = list(table.schema)
     except Exception as exc:
-        return err(f"Unable to load schema for target '{target}'", 500, details=str(exc))
+        return err(f"Unable to load schema for table '{target}'", 500, details=str(exc))
 
     try:
         table, added_fields = add_missing_fields_to_table(client, table, data)
         schema = list(table.schema)
     except ValueError as exc:
-        return err("Invalid new field name", 400, target=target, details=str(exc))
+        return err("Invalid new field name", 400, table=target, details=str(exc))
     except Exception as exc:
-        return err("Unable to update BigQuery schema", 500, target=target, details=str(exc))
+        return err("Unable to update BigQuery schema", 500, table=target, details=str(exc))
 
     errors, warnings = validate_payload(data, schema)
 
@@ -206,7 +206,7 @@ def parse_request() -> tuple[list[dict], None] | tuple[None, tuple[Response, int
 
     target_requests, normalize_error = normalize_target_requests(
         body=body,
-        query_target=request.args.get("target"),
+        query_table=request.args.get("table"),
     )
 
     if normalize_error:
@@ -244,7 +244,7 @@ def ingest():
         if errors:
             return jsonify({
                 "status": "error",
-                "target": target,
+                "table": target,
                 "errors": errors,
                 "warnings": warnings,
                 "completed_results": results,
@@ -255,12 +255,12 @@ def ingest():
         try:
             insert_errors = client.insert_rows(table=table, rows=[row])
         except Exception as exc:
-            return err("BigQuery insert failed", 500, target=target, details=str(exc), completed_results=results)
+            return err("BigQuery insert failed", 500, table=target, details=str(exc), completed_results=results)
 
         if insert_errors:
             return jsonify({
                 "status": "error",
-                "target": target,
+                "table": target,
                 "details": insert_errors,
                 "completed_results": results,
             }), 500
@@ -268,7 +268,7 @@ def ingest():
         results.append({
             "status": "ok",
             "operation": "insert",
-            "target": target,
+            "table": target,
             "table_id": ALLOWED_TARGETS[target],
             "added_fields": added_fields,
             "warnings": warnings,
@@ -295,9 +295,9 @@ def upsert():
         if not key_columns:
             return jsonify({
                 "status": "error",
-                "error": f"Target '{target}' is not configured for upsert",
-                "target": target,
-                "configured_upsert_targets": sorted(UPSERT_KEYS.keys()),
+                "error": f"Table '{target}' is not configured for upsert",
+                "table": target,
+                "configured_upsert_tables": sorted(UPSERT_KEYS.keys()),
                 "completed_results": results,
             }), 400
 
@@ -313,7 +313,7 @@ def upsert():
         if errors:
             return jsonify({
                 "status": "error",
-                "target": target,
+                "table": target,
                 "errors": errors,
                 "warnings": warnings,
                 "completed_results": results,
@@ -322,12 +322,12 @@ def upsert():
         try:
             run_upsert(table_id=ALLOWED_TARGETS[target], schema=schema, row=row, key_columns=key_columns)
         except Exception as exc:
-            return err("BigQuery MERGE failed", 500, target=target, details=str(exc), completed_results=results)
+            return err("BigQuery MERGE failed", 500, table=target, details=str(exc), completed_results=results)
 
         results.append({
             "status": "ok",
             "operation": "upsert",
-            "target": target,
+            "table": target,
             "table_id": ALLOWED_TARGETS[target],
             "added_fields": added_fields,
             "warnings": warnings,
