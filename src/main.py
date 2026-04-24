@@ -76,6 +76,9 @@ def health():
 
 @app.post("/ingest")
 def ingest():
+    if not is_authorized(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
     body = request.get_json(silent=True)
     if body is None:
         return jsonify({"error": "Invalid or missing JSON body"}), 400
@@ -166,6 +169,9 @@ def ingest():
 
 @app.post("/upsert")
 def upsert():
+    if not is_authorized(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
     body = request.get_json(silent=True)
     if body is None:
         return jsonify({"error": "Invalid or missing JSON body"}), 400

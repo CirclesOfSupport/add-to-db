@@ -141,7 +141,7 @@ The `/ingest` endpoint always performs a straight **INSERT** — it never checks
 | **Field value is `null` on a `REQUIRED` column** | Rejected before hitting BigQuery. Returns `400` with `"Field '<field>' cannot be null"`. |
 | **Field value is `null` on a `NULLABLE` column** | Accepted. `NULL` is written to BigQuery. |
 | **Wrong data type for a field** | Rejected before hitting BigQuery. Returns `400` with `"Field '<field>' expected type <TYPE>, got <python_type>"`. |
-| **Input contains unknown/extra fields** | Unknown fields are stripped and ignored. A `warnings` array is returned in the response listing each ignored field. Known fields are inserted normally. |
+| **Input contains unknown/extra fields** | The service attempts to add each unknown field as a new nullable BigQuery column, then inserts the row including those fields. The response includes the new column names in `added_fields`. If a new field name is not a valid BigQuery column name, the request returns `400`. |
 | **All fields omitted (empty `data` object)** | Passes validation only if the table has no `REQUIRED` fields. Otherwise returns `400` for each missing required field. |
 | **`data` is not a JSON object (e.g., array or string)** | Rejected immediately. Returns `400` with `"Field 'data' must be a JSON object"`. |
 | **`target` is missing or invalid** | Rejected immediately. Returns `400` with `"Missing target"` or `"Invalid target"` and a list of allowed values. |
@@ -165,7 +165,7 @@ The `/upsert` endpoint uses a BigQuery `MERGE` statement keyed on the column(s) 
 | **Key exists, incoming data is identical to existing row** | BigQuery executes the update and overwrites with the same values. No error. Effectively a no-op from a data perspective, but still consumes a slot job. |
 | **Key exists, only one field changes** | Only that row is updated. All other rows and columns are unaffected. |
 | **Key exists, incoming value for a field is `null`** | The field is set to `NULL` in BigQuery, clearing the previous value. This will fail if the column is `REQUIRED` (caught by pre-write validation, returns `400`). |
-| **Input contains unknown/extra fields** | Unknown fields are stripped and ignored. A `warnings` array is returned in the response listing each ignored field. Known fields are upserted normally. |
+| **Input contains unknown/extra fields** | The service attempts to add each unknown field as a new nullable BigQuery column, then includes those fields in the MERGE. The response includes the new column names in `added_fields`. If a new field name is not a valid BigQuery column name, the request returns `400`. |
 | **Wrong data type for a field** | Rejected before hitting BigQuery. Returns `400` with `"Field '<key>' expected type <TYPE>, got <python_type>"`. |
 | **Required non-key field missing on insert** | Rejected before hitting BigQuery. Returns `400` with `"Missing required field: <field>"`. Note: this fires on both insert and update paths since validation runs before the MERGE. |
 | **Table is empty** | `WHEN NOT MATCHED` fires and the row is inserted normally. |
@@ -195,7 +195,8 @@ Before writing to BigQuery, the service:
 - Fetches the live table schema from BigQuery
 - Checks that all `REQUIRED` fields are present and non-null
 - Validates that each field's value matches the expected BigQuery type
-- Strips any fields not present in the table schema (with a warning)
+- Attempts to add fields not present in the table schema as new nullable BigQuery columns
+- Rejects unknown fields only when their names are not valid BigQuery column names
 - For upserts, additionally verifies that all configured key columns are present and non-null
 
 **Error response (`400`):**
@@ -203,7 +204,13 @@ Before writing to BigQuery, the service:
 {
   "status": "error",
   "errors": ["Missing required field: uuid"],
-  "warnings": ["Unknown field ignored: extra_field"]
+  "warnings": ["Added new BigQuery field: extra_field"]
+}
+
+{
+  "status": "error",
+  "error": "Invalid new field name",
+  "details": "Invalid BigQuery column name 'bad-field'. Column names must start with a letter or underscore and contain only letters, numbers, and underscores."
 }
 ```
 
