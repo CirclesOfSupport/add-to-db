@@ -30,3 +30,9 @@ options:
 
 images:
   - us-east1-docker.pkg.dev/$PROJECT_ID/webhook-repo/add-to-db:$COMMIT_SHA
+
+# Only trigger on pushes to main branch with changes under src/
+trigger:
+  branch: main
+  includedFiles:
+    - src/**

@@ -74,7 +74,10 @@ Health check. Returns `200 OK` when the service is running.
 
 Inserts a single row into a BigQuery table.
 
-**Request body:**
+**Single-target request body**
+
+Use this format when inserting one row into one target table. This format is still supported for backward compatibility.
+
 ```json
 {
   "target": "users",
@@ -84,8 +87,33 @@ Inserts a single row into a BigQuery table.
   }
 }
 ```
+**Multi-target request body**
 
-**Success response (`200`):**
+Use this format when inserting rows into multiple target tables in one HTTP request. Each item in `targets` must include its own `target` and `data` object.
+
+```json
+{
+  "targets": [
+    {
+      "target": "users_copy",
+      "data": {
+        "message_id": "abc123",
+        "uuid": "@contact.uuid",
+        "test_field": "this is a test"
+      }
+    },
+    {
+      "target": "responses_copy",
+      "data": {
+        "message_id": "abc123",
+        "test_field": "this is a test"
+      }
+    }
+  ]
+}
+```
+
+**Single-target success response (`200`):**
 ```json
 {
   "status": "ok",
@@ -96,15 +124,39 @@ Inserts a single row into a BigQuery table.
   "warnings": []
 }
 ```
+**Multi-target success response (`200`):**
+```json
+{
+  "status": "ok",
+  "operation": "insert",
+  "results": [
+    {
+      "status": "ok",
+      "operation": "insert",
+      "target": "users_copy",
+      "table_id": "early-alert-responses.COPY.users",
+      "added_fields": [],
+      "warnings": []
+    },
+    {
+      "status": "ok",
+      "operation": "insert",
+      "target": "responses_copy",
+      "table_id": "early-alert-responses.COPY.response_data",
+      "added_fields": [],
+      "warnings": []
+    }
+  ]
+}
+```
 
 ---
 
 ### `POST /upsert`
 
-Inserts or updates a single row using a BigQuery `MERGE` statement. If a row matching the configured key column(s) already exists, it is updated; otherwise it is inserted.
+Inserts or updates a single row using a BigQuery `MERGE` statement. If a row matching the configured key column(s) already exists, it is updated; otherwise it is inserted. Like `/ingest`, `/upsert` supports both the original single-target request body and the newer multi-target request body.
 
-**Request body:** same shape as `/ingest`
-
+**Single-target request body**
 ```json
 {
   "target": "users",
@@ -115,7 +167,30 @@ Inserts or updates a single row using a BigQuery `MERGE` statement. If a row mat
 }
 ```
 
-**Success response (`200`):**
+**Multi-target request body**
+```json
+{
+  "targets": [
+    {
+      "target": "users_copy",
+      "data": {
+        "uuid": "abc-123",
+        "name": "Jane Doe"
+      }
+    },
+    {
+      "target": "responses_copy",
+      "data": {
+        "SessionID": "session-123",
+        "message_id": "abc123",
+        "test_field": "this is a test"
+      }
+    }
+  ]
+}
+```
+
+**Single-target success response (`200`):**
 ```json
 {
   "status": "ok",
@@ -124,6 +199,72 @@ Inserts or updates a single row using a BigQuery `MERGE` statement. If a row mat
   "table_id": "early-alert-responses.RESPONSES.users",
   "added_fields": [],
   "warnings": []
+}
+```
+
+**Multi-target success response (`200`):**
+```json
+{
+  "status": "ok",
+  "operation": "upsert",
+  "results": [
+    {
+      "status": "ok",
+      "operation": "upsert",
+      "target": "users_copy",
+      "table_id": "early-alert-responses.COPY.users",
+      "added_fields": [],
+      "warnings": []
+    },
+    {
+      "status": "ok",
+      "operation": "upsert",
+      "target": "responses_copy",
+      "table_id": "early-alert-responses.COPY.response_data",
+      "added_fields": [],
+      "warnings": []
+    }
+  ]
+}
+```
+---
+
+## Multi-Target Request Behavior
+When a request uses the `targets` array, the service processes each target item in order. This behavior applies to both `/ingest` and `/upsert`.
+
+| Scenario | Behavior |
+|---|---|
+| All target items succeed | Returns `200` with a top-level `results` array containing one success result per target. |
+| One target succeeds and a later target fails | The earlier successful write remains in BigQuery. The request returns an error for the failed target and includes prior successes in `completed_results`. |
+| A target item fails validation | Processing stops at the failed target. Later target items are not attempted. |
+| `targets` is empty | Rejected immediately. Returns `400`. |
+| `targets` is not a list or cannot be normalized to a list | Rejected immediately. Returns `400`. |
+| A target item is missing `target` | Rejected immediately. Returns `400`. |
+| A target item has non-object `data` | Rejected immediately. Returns `400`. |
+| Both query parameter `target` and body field `targets` are provided | Rejected immediately. Use either the single-target query/body format or the multi-target `targets` array, not both. |
+
+_**NOTE**: Multi-target requests are not atomic across BigQuery tables. If one target succeeds and a later target fails, the successful write is not rolled back._
+
+**Partial-success error response example:**
+
+```json
+{
+  "status": "error",
+  "target": "responses_copy",
+  "errors": [
+    "Missing required field: SessionID"
+  ],
+  "warnings": [],
+  "completed_results": [
+    {
+      "status": "ok",
+      "operation": "insert",
+      "target": "users_copy",
+      "table_id": "early-alert-responses.COPY.users",
+      "added_fields": [],
+      "warnings": []
+    }
+  ]
 }
 ```
 
