@@ -19,7 +19,7 @@ Google BigQuery (early-alert-responses)
 | File | Purpose |
 |---|---|
 | `src/main.py` | Flask app — route handlers, request validation, insert/upsert orchestration |
-| `src/config.py` | Allowed targets, upsert keys, and type-checker map |
+| `src/config.py` | Allowed tables, upsert keys, and type-checker map |
 | `src/auth.py` | Request authorization via shared secret header |
 | `src/bq_writer.py` | BigQuery helpers — schema expansion, type inference, MERGE query construction, and query parameter construction |
 | `Dockerfile` | Container definition (Python 3.12 slim + gunicorn) |
@@ -74,28 +74,28 @@ Health check. Returns `200 OK` when the service is running.
 
 Inserts a single row into a BigQuery table.
 
-**Single-target request body**
+**Single-table request body**
 
-Use this format when inserting one row into one target table. This format is still supported for backward compatibility.
+Use this format when inserting one row into one table. This format is still supported for backward compatibility.
 
 ```json
 {
-  "target": "users",
+  "table": "users",
   "data": {
     "field1": "value1",
     "field2": 123
   }
 }
 ```
-**Multi-target request body**
+**Multi-table request body**
 
-Use this format when inserting rows into multiple target tables in one HTTP request. Each item in `targets` must include its own `target` and `data` object.
+Use this format when inserting rows into multiple tables in one HTTP request. Each item in `tables` must include its own `table` and `data` object.
 
 ```json
 {
-  "targets": [
+  "tables": [
     {
-      "target": "users_copy",
+      "table": "users_copy",
       "data": {
         "message_id": "abc123",
         "uuid": "@contact.uuid",
@@ -103,7 +103,7 @@ Use this format when inserting rows into multiple target tables in one HTTP requ
       }
     },
     {
-      "target": "responses_copy",
+      "table": "responses_copy",
       "data": {
         "message_id": "abc123",
         "test_field": "this is a test"
@@ -113,18 +113,18 @@ Use this format when inserting rows into multiple target tables in one HTTP requ
 }
 ```
 
-**Single-target success response (`200`):**
+**Single-table success response (`200`):**
 ```json
 {
   "status": "ok",
   "operation": "insert",
-  "target": "users",
+  "table": "users",
   "table_id": "early-alert-responses.RESPONSES.users",
   "added_fields": [],
   "warnings": []
 }
 ```
-**Multi-target success response (`200`):**
+**Multi-table success response (`200`):**
 ```json
 {
   "status": "ok",
@@ -133,7 +133,7 @@ Use this format when inserting rows into multiple target tables in one HTTP requ
     {
       "status": "ok",
       "operation": "insert",
-      "target": "users_copy",
+      "table": "users_copy",
       "table_id": "early-alert-responses.COPY.users",
       "added_fields": [],
       "warnings": []
@@ -141,7 +141,7 @@ Use this format when inserting rows into multiple target tables in one HTTP requ
     {
       "status": "ok",
       "operation": "insert",
-      "target": "responses_copy",
+      "table": "responses_copy",
       "table_id": "early-alert-responses.COPY.response_data",
       "added_fields": [],
       "warnings": []
@@ -154,12 +154,12 @@ Use this format when inserting rows into multiple target tables in one HTTP requ
 
 ### `POST /upsert`
 
-Inserts or updates a single row using a BigQuery `MERGE` statement. If a row matching the configured key column(s) already exists, it is updated; otherwise it is inserted. Like `/ingest`, `/upsert` supports both the original single-target request body and the newer multi-target request body.
+Inserts or updates a single row using a BigQuery `MERGE` statement. If a row matching the configured key column(s) already exists, it is updated; otherwise it is inserted. Like `/ingest`, `/upsert` supports both the original single-table request body and the newer multi-table request body.
 
-**Single-target request body**
+**Single-table request body**
 ```json
 {
-  "target": "users",
+  "table": "users",
   "data": {
     "uuid": "abc-123",
     "name": "Jane Doe"
@@ -167,19 +167,19 @@ Inserts or updates a single row using a BigQuery `MERGE` statement. If a row mat
 }
 ```
 
-**Multi-target request body**
+**Multi-table request body**
 ```json
 {
-  "targets": [
+  "tables": [
     {
-      "target": "users_copy",
+      "table": "users_copy",
       "data": {
         "uuid": "abc-123",
         "name": "Jane Doe"
       }
     },
     {
-      "target": "responses_copy",
+      "table": "responses_copy",
       "data": {
         "SessionID": "session-123",
         "message_id": "abc123",
@@ -190,19 +190,19 @@ Inserts or updates a single row using a BigQuery `MERGE` statement. If a row mat
 }
 ```
 
-**Single-target success response (`200`):**
+**Single-table success response (`200`):**
 ```json
 {
   "status": "ok",
   "operation": "upsert",
-  "target": "users",
+  "table": "users",
   "table_id": "early-alert-responses.RESPONSES.users",
   "added_fields": [],
   "warnings": []
 }
 ```
 
-**Multi-target success response (`200`):**
+**Multi-table success response (`200`):**
 ```json
 {
   "status": "ok",
@@ -211,7 +211,7 @@ Inserts or updates a single row using a BigQuery `MERGE` statement. If a row mat
     {
       "status": "ok",
       "operation": "upsert",
-      "target": "users_copy",
+      "table": "users_copy",
       "table_id": "early-alert-responses.COPY.users",
       "added_fields": [],
       "warnings": []
@@ -219,7 +219,7 @@ Inserts or updates a single row using a BigQuery `MERGE` statement. If a row mat
     {
       "status": "ok",
       "operation": "upsert",
-      "target": "responses_copy",
+      "table": "responses_copy",
       "table_id": "early-alert-responses.COPY.response_data",
       "added_fields": [],
       "warnings": []
@@ -229,28 +229,28 @@ Inserts or updates a single row using a BigQuery `MERGE` statement. If a row mat
 ```
 ---
 
-## Multi-Target Request Behavior
-When a request uses the `targets` array, the service processes each target item in order. This behavior applies to both `/ingest` and `/upsert`.
+## Multi-Table Request Behavior
+When a request uses the `tables` array, the service processes each table item in order. This behavior applies to both `/ingest` and `/upsert`.
 
 | Scenario | Behavior |
 |---|---|
-| All target items succeed | Returns `200` with a top-level `results` array containing one success result per target. |
-| One target succeeds and a later target fails | The earlier successful write remains in BigQuery. The request returns an error for the failed target and includes prior successes in `completed_results`. |
-| A target item fails validation | Processing stops at the failed target. Later target items are not attempted. |
-| `targets` is empty | Rejected immediately. Returns `400`. |
-| `targets` is not a list or cannot be normalized to a list | Rejected immediately. Returns `400`. |
-| A target item is missing `target` | Rejected immediately. Returns `400`. |
-| A target item has non-object `data` | Rejected immediately. Returns `400`. |
-| Both query parameter `target` and body field `targets` are provided | Rejected immediately. Use either the single-target query/body format or the multi-target `targets` array, not both. |
+| All table items succeed | Returns `200` with a top-level `results` array containing one success result per table. |
+| One table succeeds and a later table fails | The earlier successful write remains in BigQuery. The request returns an error for the failed table and includes prior successes in `completed_results`. |
+| A table item fails validation | Processing stops at the failed table. Later table items are not attempted. |
+| `tables` is empty | Rejected immediately. Returns `400`. |
+| `tables` is not a list or cannot be normalized to a list | Rejected immediately. Returns `400`. |
+| A table item is missing `table` | Rejected immediately. Returns `400`. |
+| A table item has non-object `data` | Rejected immediately. Returns `400`. |
+| Both query parameter `table` and body field `tables` are provided | Rejected immediately. Use either the single-table query/body format or the multi-table `tables` array, not both. |
 
-_**NOTE**: Multi-target requests are not atomic across BigQuery tables. If one target succeeds and a later target fails, the successful write is not rolled back._
+_**NOTE**: Multi-table requests are not atomic across BigQuery tables. If one table succeeds and a later table fails, the successful write is not rolled back._
 
 **Partial-success error response example:**
 
 ```json
 {
   "status": "error",
-  "target": "responses_copy",
+  "table": "responses_copy",
   "errors": [
     "Missing required field: SessionID"
   ],
@@ -259,7 +259,7 @@ _**NOTE**: Multi-target requests are not atomic across BigQuery tables. If one t
     {
       "status": "ok",
       "operation": "insert",
-      "target": "users_copy",
+      "table": "users_copy",
       "table_id": "early-alert-responses.COPY.users",
       "added_fields": [],
       "warnings": []
@@ -286,7 +286,7 @@ The `/ingest` endpoint always performs a straight **INSERT** — it never checks
 | **Input contains unknown/extra fields** | The service attempts to add each unknown field as a new nullable BigQuery column, then inserts the row including those fields. The response includes the new column names in `added_fields`. If a new field name is not a valid BigQuery column name, the request returns `400`. |
 | **All fields omitted (empty `data` object)** | Passes validation only if the table has no `REQUIRED` fields. Otherwise returns `400` for each missing required field. |
 | **`data` is not a JSON object (e.g., array or string)** | Rejected immediately. Returns `400` with `"Field 'data' must be a JSON object"`. |
-| **`target` is missing or invalid** | Rejected immediately. Returns `400` with `"Missing target"` or `"Invalid target"` and a list of allowed values. |
+| **`table` is missing or invalid** | Rejected immediately. Returns `400` with `"Missing table"` or `"Invalid table"` and a list of allowed values. |
 | **Two inserts in a row with the same data** | Both succeed. Two identical rows will exist in the table. |
 
 ---
@@ -299,7 +299,7 @@ The `/upsert` endpoint uses a BigQuery `MERGE` statement keyed on the column(s) 
 |---|---|
 | **Key does not exist in table** | Row is inserted. `WHEN NOT MATCHED` branch of the MERGE fires. |
 | **Key exists once** | Existing row is updated with values from `data`. `WHEN MATCHED` branch fires. |
-| **Multiple rows exist with the same key** | BigQuery raises an error — `MERGE` cannot update a target row matched more than once. Request returns `500`. This indicates a data integrity problem in the table. |
+| **Multiple rows exist with the same key** | BigQuery raises an error — `MERGE` cannot update a table row matched more than once. Request returns `500`. This indicates a data integrity problem in the table. |
 | **Key field missing from input** | Rejected before hitting BigQuery. Returns `400` with `"Missing upsert key field: <key>"`. |
 | **Key value is `null`** | Rejected before hitting BigQuery. Returns `400` with `"Upsert key field '<key>' cannot be null"`. |
 | **Key value is empty string (`""`)**  | Passes validation (empty string is a valid `STRING`). BigQuery will match or insert on the empty-string key. |
@@ -315,11 +315,11 @@ The `/upsert` endpoint uses a BigQuery `MERGE` statement keyed on the column(s) 
 
 ---
 
-## Allowed Targets
+## Allowed Tables
 
-The `target` field must be one of the following configured values:
+The `table` field must be one of the following configured values:
 
-| Target name | BigQuery table | Upsert key |
+| Table name | BigQuery table | Upsert key |
 |---|---|---|
 | `users` | `early-alert-responses.RESPONSES.users` | `uuid` |
 | `responses` | `early-alert-responses.RESPONSES.response_data` | `SessionID` |
@@ -327,7 +327,7 @@ The `target` field must be one of the following configured values:
 | `users_copy` | `early-alert-responses.COPY.users` | `uuid` |
 | `responses_copy` | `early-alert-responses.COPY.response_data` | `SessionID` |
 
-To add a new target, update `ALLOWED_TARGETS` and (for upsert support) `UPSERT_KEYS` in `src/config.py`.
+To add a new table, update `ALLOWED_TARGETS` and (for upsert support) `UPSERT_KEYS` in `src/config.py`.
 
 ---
 
@@ -390,7 +390,7 @@ flask --app main run --port 8080
 curl -X POST http://localhost:8080/ingest \
   -H "Content-Type: application/json" \
   -H "X-Webhook-Secret: dev-secret" \
-  -d '{"target": "users", "data": {"uuid": "abc-123", "name": "Jane Doe"}}'
+  -d '{"table": "users", "data": {"uuid": "abc-123", "name": "Jane Doe"}}'
 ```
 
 **Example upsert request:**
@@ -398,5 +398,5 @@ curl -X POST http://localhost:8080/ingest \
 curl -X POST http://localhost:8080/upsert \
   -H "Content-Type: application/json" \
   -H "X-Webhook-Secret: dev-secret" \
-  -d '{"target": "users", "data": {"uuid": "abc-123", "name": "Jane Updated"}}'
+  -d '{"table": "users", "data": {"uuid": "abc-123", "name": "Jane Updated"}}'
 ```
