@@ -9,6 +9,7 @@ ALLOWED_TARGETS: dict[str, str] = {
     "users": f"{PROJECT_ID}.RESPONSES.users",
     "responses": f"{PROJECT_ID}.RESPONSES.response_data",
     "triage_data": f"{PROJECT_ID}.RESPONSES.triage-message-data",
+    "feedback": f"{PROJECT_ID}.RESPONSES.subscriber_feedback",
     "users_copy": f"{PROJECT_ID}.COPY.users",
     "responses_copy": f"{PROJECT_ID}.COPY.response_data",
 }
@@ -17,6 +18,7 @@ UPSERT_KEYS: dict[str, list[str]] = {
     "users": ["uuid"],
     "responses": ["SessionID"],
     "triage_data": ["message_id"],
+    "feedback": ["testimonial_id"],
     "users_copy": ["uuid"],
     "responses_copy": ["SessionID"],
 }
