@@ -10,7 +10,9 @@ from bq_writer import (
     build_struct_param,
     validate_upsert_keys,
     add_missing_fields_to_table,
-    get_users_and_responses_view_query
+    get_users_and_responses_view_query,
+    normalize_payload_to_schema,
+    resolve_key_columns,
 )
 
 app = Flask(__name__)
@@ -154,13 +156,21 @@ def update_users_and_responses_view(client: bigquery.Client, project_id: str, ta
     return query_job.result()
 
 
-def prepare_item(target: str, data: dict, results: list) -> tuple[bigquery.Table, list[bigquery.SchemaField], list[str], list[str]] | tuple[Response, int]:
+def prepare_item(
+    target: str,
+    data: dict,
+    results: list,
+) -> tuple[bigquery.Table, list[bigquery.SchemaField], list[str], list[str], list[str], dict] | tuple[Response, int]:
     """
     Shared pre-flight for both /ingest and /upsert: validates the target,
-    loads + migrates the schema, and runs payload validation.
+    loads + migrates the schema, normalizes payload keys to BigQuery schema
+    casing, and runs payload validation.
 
-    Returns (table, schema, added_fields, warnings) on success, or a Flask
-    error response tuple on failure.
+    Returns:
+      table, schema, added_fields, errors, warnings, normalized_data
+
+    Or:
+      Flask error response tuple
     """
     table_id = ALLOWED_TARGETS.get(target)
     if not table_id:
@@ -185,14 +195,17 @@ def prepare_item(target: str, data: dict, results: list) -> tuple[bigquery.Table
     except Exception as exc:
         return err("Unable to update BigQuery schema", 500, table=target, details=str(exc))
 
-    errors, warnings = validate_payload(data, schema)
+    normalized_data, normalize_errors = normalize_payload_to_schema(data, schema)
+
+    errors, warnings = validate_payload(normalized_data, schema)
+    errors.extend(normalize_errors)
 
     if added_fields:
         warnings.extend(f"Added new BigQuery field: {f}" for f in added_fields)
         if target in USERS_RESPONSES_TARGETS:
             update_users_and_responses_view(client, PROJECT_ID, target)
 
-    return table, schema, added_fields, errors, warnings
+    return table, schema, added_fields, errors, warnings, normalized_data
 
 
 def parse_request() -> tuple[list[dict], None] | tuple[None, tuple[Response, int]]:
@@ -239,7 +252,7 @@ def ingest():
         if isinstance(prepared[0], Response):
             return prepared
 
-        table, schema, added_fields, errors, warnings = prepared
+        table, schema, added_fields, errors, warnings, data = prepared
 
         if errors:
             return jsonify({
@@ -305,10 +318,13 @@ def upsert():
         if isinstance(prepared[0], Response):
             return prepared
 
-        table, schema, added_fields, errors, warnings = prepared
+        table, schema, added_fields, errors, warnings, data = prepared
+
+        resolved_key_columns, key_errors = resolve_key_columns(key_columns, schema)
+        errors.extend(key_errors)
 
         row = filter_to_schema(data, schema)
-        errors.extend(validate_upsert_keys(key_columns, schema, row))
+        errors.extend(validate_upsert_keys(resolved_key_columns, schema, row))
 
         if errors:
             return jsonify({
@@ -320,7 +336,12 @@ def upsert():
             }), 400
 
         try:
-            run_upsert(table_id=ALLOWED_TARGETS[target], schema=schema, row=row, key_columns=key_columns)
+            run_upsert(
+                table_id=ALLOWED_TARGETS[target],
+                schema=schema,
+                row=row,
+                key_columns=resolved_key_columns,
+            )
         except Exception as exc:
             return err("BigQuery MERGE failed", 500, table=target, details=str(exc), completed_results=results)
 

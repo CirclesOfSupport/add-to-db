@@ -32,6 +32,82 @@ def quote_identifier(identifier: str) -> str:
     return f"`{identifier}`"
 
 
+def normalize_payload_to_schema(
+    payload: dict,
+    schema: list[bigquery.SchemaField],
+) -> tuple[dict, list[str]]:
+    """
+    Convert incoming payload keys to the exact BigQuery schema field names.
+
+    Example:
+      payload key: sessionID
+      schema field: SessionID
+      normalized key: SessionID
+
+    Returns:
+      normalized_payload, errors
+    """
+    errors: list[str] = []
+    schema_name_by_lower = {field.name.lower(): field.name for field in schema}
+
+    normalized: dict = {}
+    seen_lower_payload_keys: dict[str, str] = {}
+
+    for key, value in payload.items():
+        key_lower = key.lower()
+
+        if key_lower in seen_lower_payload_keys:
+            errors.append(
+                f"Ambiguous duplicate payload fields: "
+                f"'{seen_lower_payload_keys[key_lower]}' and '{key}' differ only by case"
+            )
+            continue
+
+        seen_lower_payload_keys[key_lower] = key
+
+        canonical_name = schema_name_by_lower.get(key_lower, key)
+
+        if canonical_name in normalized:
+            errors.append(
+                f"Ambiguous payload field '{key}' maps to already-normalized field '{canonical_name}'"
+            )
+            continue
+
+        normalized[canonical_name] = value
+
+    return normalized, errors
+
+
+def resolve_key_columns(
+    key_columns: list[str],
+    schema: list[bigquery.SchemaField],
+) -> tuple[list[str], list[str]]:
+    """
+    Resolve configured upsert keys to exact BigQuery schema field names.
+
+    Example:
+      configured key: sessionID
+      schema field: SessionID
+      resolved key: SessionID
+    """
+    errors: list[str] = []
+    schema_name_by_lower = {field.name.lower(): field.name for field in schema}
+
+    resolved: list[str] = []
+
+    for key in key_columns:
+        canonical_key = schema_name_by_lower.get(key.lower())
+
+        if not canonical_key:
+            errors.append(
+                f"Configured upsert key '{key}' does not exist in the table schema"
+            )
+        else:
+            resolved.append(canonical_key)
+
+    return resolved, errors
+
+
 def infer_bq_field_type(value) -> str:
     """
     Infer a safe BigQuery type for a previously unknown field.
@@ -84,14 +160,20 @@ def add_missing_fields_to_table(
     """
     Adds payload keys that do not already exist in the BigQuery table schema.
 
-    Returns:
-        updated_table, added_field_names
+    Field matching is case-insensitive to avoid trying to add duplicate
+    fields such as enrolledBy when BigQuery already has EnrolledBy/enrolledby.
     """
     existing_field_names = {field.name for field in table.schema}
+    existing_field_names_lower = {field.name.lower() for field in table.schema}
+
     new_fields: list[bigquery.SchemaField] = []
 
     for key, value in payload.items():
         if key in existing_field_names:
+            continue
+
+        if key.lower() in existing_field_names_lower:
+            # Exists already with different casing. Do not attempt to add it.
             continue
 
         validate_new_column_name(key)
@@ -112,7 +194,46 @@ def add_missing_fields_to_table(
     updated_schema = list(table.schema) + new_fields
     table.schema = updated_schema
 
-    updated_table = client.update_table(table, ["schema"])
+    try:
+        updated_table = client.update_table(table, ["schema"])
+    except Exception as exc:
+        # Another request may have added one of the same columns between
+        # get_table() and update_table(). Refresh once and retry against
+        # the latest schema so we do not silently drop other new fields.
+        if "already exists in schema" in str(exc):
+            refreshed_table = client.get_table(table.reference)
+
+            existing_field_names = {field.name for field in refreshed_table.schema}
+            existing_field_names_lower = {field.name.lower() for field in refreshed_table.schema}
+
+            retry_new_fields: list[bigquery.SchemaField] = []
+
+            for key, value in payload.items():
+                if key in existing_field_names:
+                    continue
+
+                if key.lower() in existing_field_names_lower:
+                    continue
+
+                validate_new_column_name(key)
+
+                retry_new_fields.append(
+                    bigquery.SchemaField(
+                        name=key,
+                        field_type=infer_bq_field_type(value),
+                        mode="NULLABLE",
+                    )
+                )
+
+            if not retry_new_fields:
+                return refreshed_table, []
+
+            refreshed_table.schema = list(refreshed_table.schema) + retry_new_fields
+            updated_table = client.update_table(refreshed_table, ["schema"])
+
+            return updated_table, [field.name for field in retry_new_fields]
+
+        raise
 
     return updated_table, [field.name for field in new_fields]
 
