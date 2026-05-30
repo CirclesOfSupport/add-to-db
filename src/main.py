@@ -13,6 +13,7 @@ from bq_writer import (
     get_users_and_responses_view_query,
     normalize_payload_to_schema,
     resolve_key_columns,
+    coerce_payload_to_schema
 )
 
 app = Flask(__name__)
@@ -196,16 +197,18 @@ def prepare_item(
         return err("Unable to update BigQuery schema", 500, table=target, details=str(exc))
 
     normalized_data, normalize_errors = normalize_payload_to_schema(data, schema)
+    coerced_data, coerce_errors = coerce_payload_to_schema(normalized_data, schema)
 
-    errors, warnings = validate_payload(normalized_data, schema)
+    errors, warnings = validate_payload(coerced_data, schema)
     errors.extend(normalize_errors)
+    errors.extend(coerce_errors)
 
     if added_fields:
         warnings.extend(f"Added new BigQuery field: {f}" for f in added_fields)
         if target in USERS_RESPONSES_TARGETS:
             update_users_and_responses_view(client, PROJECT_ID, target)
 
-    return table, schema, added_fields, errors, warnings, normalized_data
+    return table, schema, added_fields, errors, warnings, coerced_data
 
 
 def parse_request() -> tuple[list[dict], None] | tuple[None, tuple[Response, int]]:

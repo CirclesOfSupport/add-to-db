@@ -1,5 +1,7 @@
 from __future__ import annotations
 import os
+from datetime import date, datetime, time
+from decimal import Decimal
 
 PROJECT_ID = "early-alert-responses"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
@@ -25,12 +27,18 @@ UPSERT_KEYS: dict[str, list[str]] = {
 
 TYPE_CHECKERS = {
     "STRING": lambda v: isinstance(v, str),
-    "JSON": lambda v: isinstance(v, (dict, list)),
+    "JSON": lambda v: isinstance(v, (dict, list, str)),
     "INTEGER": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "INT64": lambda v: isinstance(v, int) and not isinstance(v, bool),
     "FLOAT": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "FLOAT64": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "NUMERIC": lambda v: isinstance(v, (int, float, Decimal)) and not isinstance(v, bool),
+    "BIGNUMERIC": lambda v: isinstance(v, (int, float, Decimal)) and not isinstance(v, bool),
     "BOOLEAN": lambda v: isinstance(v, bool),
-    "DATETIME": lambda v: isinstance(v, str),
-    "TIMESTAMP": lambda v: isinstance(v, str),
-    "DATE": lambda v: isinstance(v, str),
-    "TIME": lambda v: isinstance(v, str),
+    "BOOL": lambda v: isinstance(v, bool),
+    "DATETIME": lambda v: isinstance(v, datetime) and v.tzinfo is None,
+    "TIMESTAMP": lambda v: isinstance(v, datetime) and v.tzinfo is not None,
+    "DATE": lambda v: isinstance(v, date) and not isinstance(v, datetime),
+    "TIME": lambda v: isinstance(v, time),
+    "BYTES": lambda v: isinstance(v, (bytes, str))
 }
