@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import re
 import json
-from decimal import Decimal
-from urllib.parse import unquote
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time
 from google.cloud import bigquery
 
 
@@ -32,156 +30,6 @@ VALID_BQ_COLUMN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,299}$")
 
 def quote_identifier(identifier: str) -> str:
     return f"`{identifier}`"
-
-def decode_webhook_string(value: str) -> str:
-    """
-    Decode URL-encoded webhook string values.
-
-    Example:
-      2026-05-26T11%3A36%3A27.979285-04%3A00
-      becomes
-      2026-05-26T11:36:27.979285-04:00
-    """
-    return unquote(value)
-
-
-def parse_datetime_like(value: str) -> datetime:
-    """
-    Parse common ISO datetime strings from the webhook.
-
-    Supports:
-      2026-05-26T11:36:27.979285-04:00
-      2026-05-26T11:36:27
-      2026-05-26 11:36:27
-      2026-05-26T11:36:27Z
-    """
-    cleaned = decode_webhook_string(value).strip()
-
-    if cleaned.endswith("Z"):
-        cleaned = cleaned[:-1] + "+00:00"
-
-    return datetime.fromisoformat(cleaned)
-
-
-def coerce_value_to_bq_type(value, field: bigquery.SchemaField):
-    """
-    Convert webhook values into Python values compatible with BigQuery
-    query parameters based on the actual BigQuery schema field type.
-    """
-    field_type = field.field_type.upper()
-
-    if value is None:
-        return None
-
-    if isinstance(value, str):
-        decoded = decode_webhook_string(value)
-        stripped = decoded.strip()
-
-        # Treat blank strings as null for non-string fields.
-        if stripped == "" and field_type not in {"STRING", "BYTES", "JSON"}:
-            return None
-
-        if field_type in {"STRING", "BYTES"}:
-            return decoded
-
-        if field_type in {"INTEGER", "INT64"}:
-            return int(stripped)
-
-        if field_type in {"FLOAT", "FLOAT64"}:
-            return float(stripped)
-
-        if field_type in {"NUMERIC", "BIGNUMERIC"}:
-            return Decimal(stripped)
-
-        if field_type in {"BOOLEAN", "BOOL"}:
-            lowered = stripped.lower()
-            if lowered in {"true", "t", "yes", "y", "1"}:
-                return True
-            if lowered in {"false", "f", "no", "n", "0"}:
-                return False
-            raise ValueError(f"Cannot coerce value '{value}' to BOOLEAN")
-
-        if field_type == "DATETIME":
-            parsed = parse_datetime_like(stripped)
-
-            # BigQuery DATETIME has no timezone. Preserve the local wall-clock
-            # time from the webhook and remove tzinfo.
-            return parsed.replace(tzinfo=None)
-
-        if field_type == "TIMESTAMP":
-            parsed = parse_datetime_like(stripped)
-
-            # BigQuery TIMESTAMP represents an absolute instant. If timezone is
-            # missing, assume UTC. If present, keep/normalize it.
-            if parsed.tzinfo is None:
-                return parsed.replace(tzinfo=timezone.utc)
-
-            return parsed.astimezone(timezone.utc)
-
-        if field_type == "DATE":
-            # Handles either a date-only string or a full datetime string.
-            if "T" in stripped or " " in stripped:
-                return parse_datetime_like(stripped).date()
-
-            return date.fromisoformat(stripped)
-
-        if field_type == "TIME":
-            # Handles either a time-only string or a full datetime string.
-            if "T" in stripped or " " in stripped:
-                return parse_datetime_like(stripped).time().replace(tzinfo=None)
-
-            return time.fromisoformat(stripped)
-
-        if field_type == "JSON":
-            # BigQuery JSON parameters can accept JSON strings. Decode URL
-            # encoding but do not force json.loads here.
-            return decoded
-
-    # Already correctly typed Python values.
-    if field_type == "DATETIME" and isinstance(value, datetime):
-        return value.replace(tzinfo=None)
-
-    if field_type == "TIMESTAMP" and isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
-
-    if field_type == "DATE" and isinstance(value, datetime):
-        return value.date()
-
-    if field_type == "TIME" and isinstance(value, datetime):
-        return value.time().replace(tzinfo=None)
-
-    return value
-
-
-def coerce_payload_to_schema(
-    payload: dict,
-    schema: list[bigquery.SchemaField],
-) -> tuple[dict, list[str]]:
-    """
-    Convert payload values to match the BigQuery schema types.
-    """
-    errors: list[str] = []
-    schema_fields = {field.name: field for field in schema}
-
-    coerced: dict = {}
-
-    for key, value in payload.items():
-        field = schema_fields.get(key)
-
-        if field is None:
-            coerced[key] = value
-            continue
-
-        try:
-            coerced[key] = coerce_value_to_bq_type(value, field)
-        except Exception as exc:
-            errors.append(
-                f"Field '{key}' could not be converted to {field.field_type}: {exc}"
-            )
-
-    return coerced, errors
 
 
 def normalize_payload_to_schema(
@@ -430,23 +278,15 @@ def build_upsert_query(target_table_id: str, row: dict, key_columns: list[str]):
 
 def normalize_query_param_value(value, field: bigquery.SchemaField):
     """
-    Final normalization before passing values as BigQuery query parameters.
-    Most type coercion should already happen in coerce_payload_to_schema.
+    Normalize values before passing them as BigQuery query parameters.
     """
     if value is None:
         return None
 
-    field_type = field.field_type.upper()
-
-    if field_type == "JSON":
+    if field.field_type == "JSON":
         if isinstance(value, str):
             return value
         return json.dumps(value)
-
-    if field_type in {"NUMERIC", "BIGNUMERIC"}:
-        if isinstance(value, Decimal):
-            return value
-        return Decimal(str(value))
 
     return value
 
@@ -464,7 +304,7 @@ def build_struct_param(
         if field is None:
             continue
 
-        bq_type = BQ_TYPE_MAP.get(field.field_type.upper(), "STRING")
+        bq_type = BQ_TYPE_MAP.get(field.field_type, "STRING")
         normalized_value = normalize_query_param_value(value, field)
 
         scalar_params.append(

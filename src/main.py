@@ -1,8 +1,8 @@
+import time as time_module
+import random
 from __future__ import annotations
-
 from flask import Flask, jsonify, request, Response
 from google.cloud import bigquery
-
 from auth import is_authorized
 from config import ALLOWED_TARGETS, TYPE_CHECKERS, UPSERT_KEYS, PROJECT_ID
 from bq_writer import (
@@ -150,6 +150,30 @@ def run_upsert(table_id: str, schema: list[bigquery.SchemaField], row: dict, key
     query_job = client.query(query, job_config=job_config)
     return query_job.result()
 
+def run_upsert_with_retry(
+    table_id: str,
+    schema: list[bigquery.SchemaField],
+    row: dict,
+    key_columns: list[str],
+    max_attempts: int = 4,
+    base_delay: float = 0.25,
+):
+    """
+    Retries the MERGE on concurrent update errors with exponential backoff + jitter.
+    4 attempts with 0.25s base delay = ~0.25, ~0.5, ~1.0s waits = ~2s total worst case.
+    """
+    for attempt in range(max_attempts):
+        try:
+            return run_upsert(table_id, schema, row, key_columns)
+        except Exception as exc:
+            is_concurrent_error = "Could not serialize access" in str(exc)
+            is_last_attempt = attempt == max_attempts - 1
+
+            if not is_concurrent_error or is_last_attempt:
+                raise
+
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 0.1)
+            time_module.sleep(delay)
 
 def update_users_and_responses_view(client: bigquery.Client, project_id: str, target: str):
     query = get_users_and_responses_view_query(project_id, target)
@@ -339,7 +363,7 @@ def upsert():
             }), 400
 
         try:
-            run_upsert(
+            run_upsert_with_retry(
                 table_id=ALLOWED_TARGETS[target],
                 schema=schema,
                 row=row,
