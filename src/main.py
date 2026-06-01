@@ -1,6 +1,6 @@
+from __future__ import annotations
 import time as time_module
 import random
-from __future__ import annotations
 from flask import Flask, jsonify, request, Response
 from google.cloud import bigquery
 from auth import is_authorized
