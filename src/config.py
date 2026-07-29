@@ -6,6 +6,22 @@ from decimal import Decimal
 PROJECT_ID = "early-alert-responses"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
+# Cloud Tasks queue that the /ingest and /upsert webhook endpoints enqueue
+# onto, so the webhook can respond as soon as work is durably queued instead
+# of waiting for the BigQuery write to finish.
+TASKS_PROJECT = os.getenv("TASKS_PROJECT", PROJECT_ID)
+TASKS_LOCATION = os.getenv("TASKS_LOCATION", "us-east1")
+TASKS_QUEUE = os.getenv("TASKS_QUEUE", "add-to-db-writes")
+
+# Base URL of this Cloud Run service (e.g. https://add-to-db-xxxx-ue.a.run.app).
+# Used both as the Cloud Tasks callback target and as the expected OIDC
+# audience when verifying that a /tasks/* request really came from Cloud Tasks.
+SERVICE_URL = os.getenv("SERVICE_URL", "")
+
+# Service account Cloud Tasks uses to sign the OIDC token on its callback.
+# Requests to /tasks/* are rejected unless the token's email matches this.
+TASKS_INVOKER_SERVICE_ACCOUNT = os.getenv("TASKS_INVOKER_SERVICE_ACCOUNT", "")
+
 # Only allow approved destinations.
 ALLOWED_TARGETS: dict[str, str] = {
     "users": f"{PROJECT_ID}.RESPONSES.users",

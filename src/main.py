@@ -3,7 +3,7 @@ import time as time_module
 import random
 from flask import Flask, jsonify, request, Response
 from google.cloud import bigquery
-from auth import is_authorized
+from auth import is_authorized, is_task_request_authorized
 from config import ALLOWED_TARGETS, TYPE_CHECKERS, UPSERT_KEYS, PROJECT_ID
 from bq_writer import (
     build_upsert_query,
@@ -15,6 +15,7 @@ from bq_writer import (
     resolve_key_columns,
     coerce_payload_to_schema
 )
+from tasks import enqueue_write
 
 app = Flask(__name__)
 client = bigquery.Client()
@@ -235,6 +236,48 @@ def prepare_item(
     return table, schema, added_fields, errors, warnings, coerced_data
 
 
+def precheck_payload(
+    target: str,
+    data: dict,
+) -> tuple[list[bigquery.SchemaField], dict, list[str], list[str]] | tuple[Response, int]:
+    """
+    Fast synchronous pre-flight for the public /ingest and /upsert endpoints:
+    validates the target and payload against the *current* table schema so
+    callers still get an immediate 400 on bad data, without doing the schema
+    migration or BigQuery write. Those happen in the queued /tasks/* worker,
+    which re-validates against the freshly migrated schema before writing --
+    so unrecognized fields here just produce warnings, not errors.
+
+    Returns:
+      schema, coerced_data, errors, warnings
+
+    Or:
+      Flask error response tuple
+    """
+    table_id = ALLOWED_TARGETS.get(target)
+    if not table_id:
+        return err(
+            "Invalid table",
+            400,
+            table=target,
+            allowed_tables=sorted(ALLOWED_TARGETS.keys()),
+        )
+
+    try:
+        schema = get_table_schema(table_id)
+    except Exception as exc:
+        return err(f"Unable to load schema for table '{target}'", 500, details=str(exc))
+
+    normalized_data, normalize_errors = normalize_payload_to_schema(data, schema)
+    coerced_data, coerce_errors = coerce_payload_to_schema(normalized_data, schema)
+
+    errors, warnings = validate_payload(coerced_data, schema)
+    errors.extend(normalize_errors)
+    errors.extend(coerce_errors)
+
+    return schema, coerced_data, errors, warnings
+
+
 def parse_request() -> tuple[list[dict], None] | tuple[None, tuple[Response, int]]:
     """Authorize, parse JSON, and normalize target requests from the current Flask request."""
     if not is_authorized(request):
@@ -270,16 +313,16 @@ def ingest():
     if error_response:
         return error_response
 
-    results = []
+    queued = []
 
     for item in target_requests:
         target, data = item["target"], item["data"]
 
-        prepared = prepare_item(target, data, results)
-        if isinstance(prepared[0], Response):
-            return prepared
+        precheck = precheck_payload(target, data)
+        if isinstance(precheck[0], Response):
+            return precheck
 
-        table, schema, added_fields, errors, warnings, data = prepared
+        schema, coerced_data, errors, warnings = precheck
 
         if errors:
             return jsonify({
@@ -287,37 +330,27 @@ def ingest():
                 "table": target,
                 "errors": errors,
                 "warnings": warnings,
-                "completed_results": results,
+                "queued_results": queued,
             }), 400
 
-        row = filter_to_schema(data, schema)
-
         try:
-            insert_errors = client.insert_rows(table=table, rows=[row])
+            task_name = enqueue_write("/tasks/ingest", target, data)
         except Exception as exc:
-            return err("BigQuery insert failed", 500, table=target, details=str(exc), completed_results=results)
+            return err("Failed to queue insert", 500, table=target, details=str(exc), queued_results=queued)
 
-        if insert_errors:
-            return jsonify({
-                "status": "error",
-                "table": target,
-                "details": insert_errors,
-                "completed_results": results,
-            }), 500
-
-        results.append({
-            "status": "ok",
+        queued.append({
+            "status": "queued",
             "operation": "insert",
             "table": target,
             "table_id": ALLOWED_TARGETS[target],
-            "added_fields": added_fields,
             "warnings": warnings,
+            "task_name": task_name,
         })
 
-    if len(results) == 1:
-        return jsonify(results[0]), 200
+    if len(queued) == 1:
+        return jsonify(queued[0]), 202
 
-    return jsonify({"status": "ok", "operation": "insert", "results": results}), 200
+    return jsonify({"status": "queued", "operation": "insert", "results": queued}), 202
 
 
 @app.post("/upsert")
@@ -326,7 +359,7 @@ def upsert():
     if error_response:
         return error_response
 
-    results = []
+    queued = []
 
     for item in target_requests:
         target, data = item["target"], item["data"]
@@ -338,19 +371,19 @@ def upsert():
                 "error": f"Table '{target}' is not configured for upsert",
                 "table": target,
                 "configured_upsert_tables": sorted(UPSERT_KEYS.keys()),
-                "completed_results": results,
+                "queued_results": queued,
             }), 400
 
-        prepared = prepare_item(target, data, results)
-        if isinstance(prepared[0], Response):
-            return prepared
+        precheck = precheck_payload(target, data)
+        if isinstance(precheck[0], Response):
+            return precheck
 
-        table, schema, added_fields, errors, warnings, data = prepared
+        schema, coerced_data, errors, warnings = precheck
 
         resolved_key_columns, key_errors = resolve_key_columns(key_columns, schema)
         errors.extend(key_errors)
 
-        row = filter_to_schema(data, schema)
+        row = filter_to_schema(coerced_data, schema)
         errors.extend(validate_upsert_keys(resolved_key_columns, schema, row))
 
         if errors:
@@ -359,29 +392,140 @@ def upsert():
                 "table": target,
                 "errors": errors,
                 "warnings": warnings,
-                "completed_results": results,
+                "queued_results": queued,
             }), 400
 
         try:
-            run_upsert_with_retry(
-                table_id=ALLOWED_TARGETS[target],
-                schema=schema,
-                row=row,
-                key_columns=resolved_key_columns,
-            )
+            task_name = enqueue_write("/tasks/upsert", target, data)
         except Exception as exc:
-            return err("BigQuery MERGE failed", 500, table=target, details=str(exc), completed_results=results)
+            return err("Failed to queue upsert", 500, table=target, details=str(exc), queued_results=queued)
 
-        results.append({
-            "status": "ok",
+        queued.append({
+            "status": "queued",
             "operation": "upsert",
             "table": target,
             "table_id": ALLOWED_TARGETS[target],
-            "added_fields": added_fields,
             "warnings": warnings,
+            "task_name": task_name,
         })
 
-    if len(results) == 1:
-        return jsonify(results[0]), 200
+    if len(queued) == 1:
+        return jsonify(queued[0]), 202
 
-    return jsonify({"status": "ok", "operation": "upsert", "results": results}), 200
+    return jsonify({"status": "queued", "operation": "upsert", "results": queued}), 202
+
+
+# ---------------------------------------------------------------------------
+# Cloud Tasks worker endpoints
+#
+# These perform the actual schema migration + BigQuery write that /ingest and
+# /upsert used to do inline. They're only reachable with a valid OIDC token
+# from our own Cloud Tasks queue (see auth.is_task_request_authorized) --
+# never called directly by webhook clients. A non-2xx response tells Cloud
+# Tasks to retry with backoff; a 2xx acknowledges the task so it is not
+# retried, even when the write failed for reasons a retry can't fix.
+# ---------------------------------------------------------------------------
+
+def _parse_task_request() -> tuple[str, dict, None] | tuple[None, None, tuple[Response, int]]:
+    if not is_task_request_authorized(request):
+        return None, None, (jsonify({"error": "Unauthorized"}), 401)
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return None, None, (jsonify({"error": "Invalid or missing JSON body"}), 400)
+
+    target = body.get("table")
+    data = body.get("data")
+
+    if not target or not isinstance(data, dict):
+        return None, None, (jsonify({"error": "Malformed task payload"}), 400)
+
+    return target, data, None
+
+
+@app.post("/tasks/ingest")
+def tasks_ingest():
+    target, data, error_response = _parse_task_request()
+    if error_response:
+        return error_response
+
+    prepared = prepare_item(target, data, [])
+    if isinstance(prepared[0], Response):
+        app.logger.error("tasks/ingest: pre-flight failed for table '%s'", target)
+        return jsonify({"status": "error", "table": target}), 200
+
+    table, schema, added_fields, errors, warnings, data = prepared
+
+    if errors:
+        app.logger.error("tasks/ingest: validation errors for table '%s': %s", target, errors)
+        return jsonify({"status": "error", "table": target, "errors": errors}), 200
+
+    row = filter_to_schema(data, schema)
+
+    try:
+        insert_errors = client.insert_rows(table=table, rows=[row])
+    except Exception as exc:
+        app.logger.error("tasks/ingest: BigQuery insert failed for table '%s': %s", target, exc)
+        return err("BigQuery insert failed", 500, table=target, details=str(exc))
+
+    if insert_errors:
+        app.logger.error("tasks/ingest: insert row errors for table '%s': %s", target, insert_errors)
+        return jsonify({"status": "error", "table": target, "details": insert_errors}), 500
+
+    return jsonify({
+        "status": "ok",
+        "operation": "insert",
+        "table": target,
+        "table_id": ALLOWED_TARGETS[target],
+        "added_fields": added_fields,
+        "warnings": warnings,
+    }), 200
+
+
+@app.post("/tasks/upsert")
+def tasks_upsert():
+    target, data, error_response = _parse_task_request()
+    if error_response:
+        return error_response
+
+    key_columns = UPSERT_KEYS.get(target)
+    if not key_columns:
+        app.logger.error("tasks/upsert: table '%s' is not configured for upsert", target)
+        return jsonify({"status": "error", "table": target}), 200
+
+    prepared = prepare_item(target, data, [])
+    if isinstance(prepared[0], Response):
+        app.logger.error("tasks/upsert: pre-flight failed for table '%s'", target)
+        return jsonify({"status": "error", "table": target}), 200
+
+    table, schema, added_fields, errors, warnings, data = prepared
+
+    resolved_key_columns, key_errors = resolve_key_columns(key_columns, schema)
+    errors.extend(key_errors)
+
+    row = filter_to_schema(data, schema)
+    errors.extend(validate_upsert_keys(resolved_key_columns, schema, row))
+
+    if errors:
+        app.logger.error("tasks/upsert: validation errors for table '%s': %s", target, errors)
+        return jsonify({"status": "error", "table": target, "errors": errors}), 200
+
+    try:
+        run_upsert_with_retry(
+            table_id=ALLOWED_TARGETS[target],
+            schema=schema,
+            row=row,
+            key_columns=resolved_key_columns,
+        )
+    except Exception as exc:
+        app.logger.error("tasks/upsert: BigQuery MERGE failed for table '%s': %s", target, exc)
+        return err("BigQuery MERGE failed", 500, table=target, details=str(exc))
+
+    return jsonify({
+        "status": "ok",
+        "operation": "upsert",
+        "table": target,
+        "table_id": ALLOWED_TARGETS[target],
+        "added_fields": added_fields,
+        "warnings": warnings,
+    }), 200

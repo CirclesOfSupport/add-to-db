@@ -1,3 +1,5 @@
 Flask
 gunicorn
 google-cloud-bigquery
+google-cloud-tasks
+google-auth
