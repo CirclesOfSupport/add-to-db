@@ -12,18 +12,27 @@ steps:
       - us-east1-docker.pkg.dev/$PROJECT_ID/webhook-repo/add-to-db:$COMMIT_SHA
 
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
-    entrypoint: gcloud
+    entrypoint: bash
     args:
-      - run
-      - deploy
-      - add-to-db
-      - --image=us-east1-docker.pkg.dev/$PROJECT_ID/webhook-repo/add-to-db:$COMMIT_SHA
-      - --region=us-east1
-      - --platform=managed
-      - --allow-unauthenticated
-      - --port=8080
-      - --min-instances=0
-      - --concurrency=50
+      - -c
+      - |
+        set -e
+        # SERVICE_URL is only known once the service exists; on the very
+        # first deploy this resolves empty and gets filled in on the next
+        # build once Cloud Run has assigned the URL.
+        SERVICE_URL=$(gcloud run services describe add-to-db \
+          --region=us-east1 --platform=managed \
+          --format='value(status.url)' 2>/dev/null || true)
+
+        gcloud run deploy add-to-db \
+          --image=us-east1-docker.pkg.dev/$PROJECT_ID/webhook-repo/add-to-db:$COMMIT_SHA \
+          --region=us-east1 \
+          --platform=managed \
+          --allow-unauthenticated \
+          --port=8080 \
+          --min-instances=0 \
+          --concurrency=50 \
+          --update-env-vars="TASKS_QUEUE=add-to-db-writes,TASKS_LOCATION=us-east1,TASKS_INVOKER_SERVICE_ACCOUNT=add-to-db-tasks-invoker@$PROJECT_ID.iam.gserviceaccount.com$${SERVICE_URL:+,SERVICE_URL=$$SERVICE_URL}"
 
 options:
   logging: CLOUD_LOGGING_ONLY
