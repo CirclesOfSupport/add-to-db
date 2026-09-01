@@ -33,9 +33,28 @@ def err(message: str | dict, status: int, **extra) -> tuple[Response, int]:
     return jsonify(body), status
 
 
-def get_table_schema(table_id: str) -> list[bigquery.SchemaField]:
+# Module-level schema cache: table_id -> (schema, fetched_at_epoch_seconds).
+# Cloud Run reuses a warm container across requests, so this persists between
+# calls; after the first request per table the schema is served from memory and
+# /upsert returns 202 with no BigQuery round-trip on the hot path. TTL is short
+# because schemas only change when the /tasks/* worker runs a column migration --
+# an infrequent, write-side event -- and the worker re-reads/re-validates against
+# the freshly migrated schema before writing regardless, so a briefly-stale
+# pre-flight schema here affects warnings only, never write correctness.
+_SCHEMA_CACHE: dict[str, tuple[list[bigquery.SchemaField], float]] = {}
+_SCHEMA_CACHE_TTL_S = 300
+
+
+def get_table_schema(table_id: str, *, force_refresh: bool = False) -> list[bigquery.SchemaField]:
+    now = time_module.time()
+    if not force_refresh:
+        cached = _SCHEMA_CACHE.get(table_id)
+        if cached is not None and (now - cached[1]) < _SCHEMA_CACHE_TTL_S:
+            return cached[0]
     table = client.get_table(table_id)
-    return list(table.schema)
+    schema = list(table.schema)
+    _SCHEMA_CACHE[table_id] = (schema, now)
+    return schema
 
 
 def normalize_target_requests(body: dict, query_table: str | None = None) -> tuple[list[dict], str | None]:
@@ -230,6 +249,10 @@ def prepare_item(
 
     if added_fields:
         warnings.extend(f"Added new BigQuery field: {f}" for f in added_fields)
+        # A migration just changed this table's schema. Refresh the pre-flight
+        # cache now so the next /upsert /ingest request validates against the new
+        # column set immediately instead of serving a stale schema for up to TTL.
+        _SCHEMA_CACHE[table_id] = (schema, time_module.time())
         if target in USERS_RESPONSES_TARGETS:
             update_users_and_responses_view(client, PROJECT_ID, target)
 

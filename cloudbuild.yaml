@@ -31,7 +31,8 @@ steps:
           --allow-unauthenticated \
           --port=8080 \
           --min-instances=0 \
-          --concurrency=50 \
+          --max-instances=10 \
+          --concurrency=8 \
           --update-env-vars="TASKS_QUEUE=add-to-db-writes,TASKS_LOCATION=us-east1,TASKS_INVOKER_SERVICE_ACCOUNT=add-to-db-tasks-invoker@$PROJECT_ID.iam.gserviceaccount.com$${SERVICE_URL:+,SERVICE_URL=$$SERVICE_URL}"
 
 options:
