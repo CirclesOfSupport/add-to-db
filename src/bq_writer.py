@@ -77,8 +77,13 @@ def coerce_value_to_bq_type(value, field: bigquery.SchemaField):
         decoded = decode_webhook_string(value)
         stripped = decoded.strip()
 
-        # Treat blank strings as null for non-string fields.
-        if stripped == "" and field_type not in {"STRING", "BYTES", "JSON"}:
+        # Blank strings are never a meaningful value at this boundary: TextIt has
+        # no way to send NULL for a string field, so '' always means "absent", not
+        # "answered empty". Verified empirically across users + response_data --
+        # every STRING column shows a small '' contamination against an
+        # overwhelming NULL majority, i.e. artifacts of the write path rather than
+        # a distinct state. Normalize to NULL for ALL field types.
+        if stripped == "":
             return None
 
         if field_type in {"STRING", "BYTES"}:
@@ -138,6 +143,13 @@ def coerce_value_to_bq_type(value, field: bigquery.SchemaField):
             return decoded
 
     # Already correctly typed Python values.
+    # TextIt sends some fields as JSON numbers (e.g. k12 "grade": 8) where the
+    # BigQuery column is STRING. BigQuery itself accepts this on insert, so
+    # rejecting it here invents a failure the target column would not have:
+    # stringify instead. Bool is excluded so True does not become "True".
+    if field_type in {"STRING", "BYTES"} and isinstance(value, (int, float, Decimal)) \
+            and not isinstance(value, bool):
+        return str(value)
     if field_type == "DATETIME" and isinstance(value, datetime):
         return value.replace(tzinfo=None)
 
