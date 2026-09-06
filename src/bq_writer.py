@@ -402,16 +402,69 @@ def add_missing_fields_to_table(
     return updated_table, [field.name for field in new_fields]
 
 
-def build_upsert_query(target_table_id: str, row: dict, key_columns: list[str]):
+def resolve_partition_column(
+    partition_column: str | None,
+    schema: list[bigquery.SchemaField],
+    row: dict,
+) -> tuple[str | None, datetime | None]:
+    """
+    Decide whether this MERGE can carry a partition-range predicate.
+
+    Returns (column_name, value). Both are None -- meaning OMIT the predicate --
+    unless every condition holds:
+      * a partition column is configured for the target,
+      * it exists in the table schema (case-insensitive match, exact name returned),
+      * its BigQuery type is DATETIME (a TIMESTAMP/DATE parameter, or a cast on
+        the column, disables pruning silently),
+      * the row carries a non-null value of that column, already coerced to a
+        naive datetime.
+
+    A NULL value MUST omit the predicate: `BETWEEN NULL AND NULL` matches nothing,
+    so the MERGE would INSERT a duplicate instead of UPDATE.
+    """
+    if not partition_column:
+        return None, None
+
+    field = next(
+        (f for f in schema if f.name.lower() == partition_column.lower()),
+        None,
+    )
+    if field is None or field.field_type.upper() != "DATETIME":
+        return None, None
+
+    value = row.get(field.name)
+    if not isinstance(value, datetime) or value.tzinfo is not None:
+        return None, None
+
+    return field.name, value
+
+
+def build_upsert_query(
+    target_table_id: str,
+    row: dict,
+    key_columns: list[str],
+    partition_column: str | None = None,
+):
     """
     Generates a parameterized MERGE statement using only columns present in the row.
+
+    When partition_column is given, the ON clause also carries
+    `T.<partition_column> BETWEEN @min_dt AND @max_dt`, bound to DATETIME query
+    parameters by the caller. The parameters are plan-time constants, which is
+    what lets BigQuery prune partitions; the same range expressed through the
+    UNNEST join does not prune.
     """
     column_names = list(row.keys())
 
-    on_clause = " AND ".join([
+    on_terms = [
         f"T.{quote_identifier(col)} = S.{quote_identifier(col)}"
         for col in key_columns
-    ])
+    ]
+    if partition_column:
+        on_terms.append(
+            f"T.{quote_identifier(partition_column)} BETWEEN @min_dt AND @max_dt"
+        )
+    on_clause = " AND ".join(on_terms)
 
     non_key_columns = [col for col in column_names if col not in key_columns]
 

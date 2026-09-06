@@ -41,6 +41,17 @@ UPSERT_KEYS: dict[str, list[str]] = {
     "responses_copy": ["SessionID"],
 }
 
+# Partition column per target. When set, the MERGE gets an extra
+# `AND T.<col> BETWEEN @min_dt AND @max_dt` predicate so BigQuery can prune
+# to the partition(s) the incoming row belongs to. Only DATETIME columns are
+# supported; the value comes from the row itself (one row per MERGE, so
+# min == max). Targets not listed here get the plain key-only MERGE.
+# Harmless on an unpartitioned table (predicate is redundant), so this can
+# ship before the table is rebuilt.
+PARTITION_COLUMNS: dict[str, str] = {
+    "responses": "checkinDateTime",
+}
+
 TYPE_CHECKERS = {
     "STRING": lambda v: isinstance(v, str),
     "JSON": lambda v: isinstance(v, (dict, list, str)),

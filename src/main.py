@@ -4,7 +4,7 @@ import random
 from flask import Flask, jsonify, request, Response
 from google.cloud import bigquery
 from auth import is_authorized, is_task_request_authorized
-from config import ALLOWED_TARGETS, TYPE_CHECKERS, UPSERT_KEYS, PROJECT_ID
+from config import ALLOWED_TARGETS, TYPE_CHECKERS, UPSERT_KEYS, PROJECT_ID, PARTITION_COLUMNS
 from bq_writer import (
     build_upsert_query,
     build_struct_param,
@@ -13,6 +13,7 @@ from bq_writer import (
     get_users_and_responses_view_query,
     normalize_payload_to_schema,
     resolve_key_columns,
+    resolve_partition_column,
     coerce_payload_to_schema
 )
 from tasks import enqueue_write
@@ -157,15 +158,31 @@ def filter_to_schema(payload: dict, schema: list[bigquery.SchemaField]) -> dict:
     return {k: v for k, v in payload.items() if k in allowed_names}
 
 
-def run_upsert(table_id: str, schema: list[bigquery.SchemaField], row: dict, key_columns: list[str]):
-    query = build_upsert_query(table_id, row, key_columns)
+def run_upsert(
+    table_id: str,
+    schema: list[bigquery.SchemaField],
+    row: dict,
+    key_columns: list[str],
+    partition_column: str | None = None,
+):
+    partition_col, partition_value = resolve_partition_column(partition_column, schema, row)
+
+    query = build_upsert_query(table_id, row, key_columns, partition_col)
     struct_param = build_struct_param(row, schema, "placeholder")
 
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ArrayQueryParameter("rows", "RECORD", [struct_param])
-        ]
-    )
+    query_parameters = [
+        bigquery.ArrayQueryParameter("rows", "RECORD", [struct_param])
+    ]
+    if partition_col:
+        # One row per MERGE, so min == max == the row's own partition value.
+        query_parameters.append(
+            bigquery.ScalarQueryParameter("min_dt", "DATETIME", partition_value)
+        )
+        query_parameters.append(
+            bigquery.ScalarQueryParameter("max_dt", "DATETIME", partition_value)
+        )
+
+    job_config = bigquery.QueryJobConfig(query_parameters=query_parameters)
 
     query_job = client.query(query, job_config=job_config)
     return query_job.result()
@@ -175,6 +192,7 @@ def run_upsert_with_retry(
     schema: list[bigquery.SchemaField],
     row: dict,
     key_columns: list[str],
+    partition_column: str | None = None,
     max_attempts: int = 4,
     base_delay: float = 0.25,
 ):
@@ -184,7 +202,7 @@ def run_upsert_with_retry(
     """
     for attempt in range(max_attempts):
         try:
-            return run_upsert(table_id, schema, row, key_columns)
+            return run_upsert(table_id, schema, row, key_columns, partition_column)
         except Exception as exc:
             is_concurrent_error = "Could not serialize access" in str(exc)
             is_last_attempt = attempt == max_attempts - 1
@@ -539,6 +557,7 @@ def tasks_upsert():
             schema=schema,
             row=row,
             key_columns=resolved_key_columns,
+            partition_column=PARTITION_COLUMNS.get(target),
         )
     except Exception as exc:
         app.logger.error("tasks/upsert: BigQuery MERGE failed for table '%s': %s", target, exc)
