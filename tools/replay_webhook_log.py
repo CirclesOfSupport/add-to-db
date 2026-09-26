@@ -11,9 +11,12 @@ queue: FIFO, --workers at a time, a failed item retried up to --max-attempts
 times with backoff doubling from 0.1 s.
 
 Variants:
-  concurrent   the production shape: any worker takes the next item
+  concurrent   the production shape today: any worker takes the next item
   per_session  every item for one SessionID (responses) or uuid (users) runs on
-               one lane, in order; the per-session serialization candidate
+               one lane, in order (a reference, not a production design)
+  staged       the single-writer design: calls are held in received order and
+               one flusher writes them every --flush-interval seconds with
+               perform_flush (one MERGE per target per flush)
 
 Sessions whose first logged call falls before the window are seeded with their
 current RESPONSES row, so later calls must MATCH it (as in production).
@@ -25,7 +28,7 @@ users write failures and checkinrepliestotal type/value, items failed after all
 attempts, conflict retries, bytes billed, item latency.
 
     python tools/replay_webhook_log.py
-    python tools/replay_webhook_log.py --start "2026-09-24 16:00:00" --end "2026-09-24 17:00:00" --variant both
+    python tools/replay_webhook_log.py --start "2026-09-24 16:00:00" --end "2026-09-24 17:00:00" --variants concurrent,per_session
 Writes replay_report_<variant>_<stamp>.json next to where it runs.
 """
 from __future__ import annotations
@@ -207,6 +210,79 @@ class Runner:
             t.join()
 
 
+class StagedRunner:
+    """Single writer: hold calls in received order, flush every `interval` seconds."""
+
+    def __init__(self, svc, interval):
+        self.svc, self.interval = svc, interval
+        self.lock = threading.Lock()
+        self.pending = []          # (received_monotonic, item)
+        self.outcomes = []
+        self.flushes = []          # per flush: items, seconds, statements, error
+        self.lag_s = []            # receive -> committed, per item
+
+    def push(self, item):
+        with self.lock:
+            self.pending.append((time.monotonic(), item))
+
+    def flush_once(self):
+        with self.lock:
+            batch, self.pending = self.pending, []
+        if not batch:
+            return
+        t0 = time.monotonic()
+        stmts, err = 0, None
+        try:
+            for target in ("users", "responses"):
+                datas = [dict(it["data"]) for _, it in batch if it["target"] == target]
+                if datas:
+                    out = self.svc.perform_flush(target, datas)
+                    stmts += out["statements"]
+                    for reason in out["skipped"]:
+                        self.outcomes.append({"target": target, "attempts": 1, "conflicts": 0, "ms": [],
+                                              "final_status": 200, "final_body": {"status": "error", "errors": reason}})
+        except Exception as exc:          # keep the batch for the next flush, in front
+            err = repr(exc)[:300]
+            with self.lock:
+                self.pending = batch + self.pending
+        done = time.monotonic()
+        self.flushes.append({"items": len(batch), "seconds": round(done - t0, 2), "statements": stmts, "error": err})
+        if err is None:
+            for received, it in batch:
+                self.lag_s.append(done - received)
+                it["attempts"] = 1
+                it["final_status"], it["final_body"] = 200, {"status": "ok"}
+                self.outcomes.append(it)
+
+    def run(self, calls, start, speed):
+        stop = threading.Event()
+
+        def flusher():
+            while not stop.is_set():
+                stop.wait(self.interval)
+                self.flush_once()
+
+        t = threading.Thread(target=flusher, daemon=True)
+        t.start()
+        t0 = time.monotonic()
+        for c in calls:
+            wait = t0 + (c["fired_at"] - start).total_seconds() / speed - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            for target, data in c["items"]:
+                self.push({"target": target, "data": data, "call": c["id"], "fired_at": c["fired_at"],
+                           "attempts": 0, "conflicts": 0, "ms": []})
+        while True:
+            with self.lock:
+                empty = not self.pending
+            if empty:
+                break
+            time.sleep(1)
+        stop.set()
+        t.join()
+        self.flush_once()
+
+
 def expected_rows(svc, calls):
     """Per SessionID and per users uuid: each column's value from the LAST call carrying it."""
     import config
@@ -246,7 +322,7 @@ def same(a, b):
     return a == b
 
 
-def report(client, svc, variant, runner, calls, prior, rd, us, billed, statements, window):
+def report(client, svc, variant, runner, calls, prior, rd, us, billed, statements, window, seeded_rows, errored_jobs):
     resp_exp, users_exp, first_two, keyless_calls = expected_rows(svc, calls)
     rows = defaultdict(list)
     for r in client.query(f"SELECT * FROM `{rd}` WHERE SessionID IN UNNEST(@ids)", job_config=bigquery.QueryJobConfig(
@@ -255,18 +331,29 @@ def report(client, svc, variant, runner, calls, prior, rd, us, billed, statement
     keyless_rows = list(client.query(f"SELECT COUNT(*) n FROM `{rd}` WHERE SessionID IS NULL").result())[0]["n"]
 
     wrong_sessions, col_mismatch, examples = 0, Counter(), []
-    dup_sessions, dup_new_fast, new_fast = 0, 0, 0
-    missing = 0
+    dup_sessions, missing = 0, 0
+    dup_seeded, dup_created = [], []
+    gap_buckets = Counter()          # new sessions by gap between their first two calls
+    gap_dups = Counter()             # ... of which ended with more than one row
     for sid, exp in resp_exp.items():
         got = rows.get(sid, [])
-        fast = sid not in prior and len(first_two[sid]) == 2 and (first_two[sid][1] - first_two[sid][0]).total_seconds() < 1
-        new_fast += fast
+        bucket = None
+        if sid not in prior:
+            if len(first_two[sid]) < 2:
+                bucket = "one call"
+            else:
+                gap = (first_two[sid][1] - first_two[sid][0]).total_seconds()
+                bucket = "<1s" if gap < 1 else "1-5s" if gap < 5 else "5-30s" if gap < 30 else ">=30s"
+            gap_buckets[bucket] += 1
         if not got:
             missing += 1
             continue
         if len(got) > 1:
             dup_sessions += 1
-            dup_new_fast += fast
+            # more rows than were seeded from production = made by the replay
+            (dup_created if len(got) > seeded_rows.get(sid, 0) else dup_seeded).append(sid)
+            if bucket:
+                gap_dups[bucket] += 1
         bad = [k for k, v in exp.items() if not any(same(g.get(k), v) for g in got[:1])] if len(got) == 1 else \
               [k for k, v in exp.items() if not all(same(g.get(k), v) for g in got)]
         if bad:
@@ -294,8 +381,12 @@ def report(client, svc, variant, runner, calls, prior, rd, us, billed, statement
         "mismatch_examples": examples,
         "sessions_with_no_row": missing,
         "sessions_with_more_than_one_row": dup_sessions,
-        "new_sessions_first_two_calls_under_1s": new_fast,
-        "  of_which_more_than_one_row": dup_new_fast,
+        "  already_duplicated_in_production_and_seeded": len(dup_seeded),
+        "  created_by_the_replay": len(dup_created),
+        "created_duplicate_session_ids": dup_created,
+        "new_sessions_by_gap_between_first_two_calls": dict(gap_buckets),
+        "  of_which_more_than_one_row": dict(gap_dups),
+        "errored_statements_retried_inside_the_service": errored_jobs,
         "keyless_calls": keyless_calls, "keyless_rows": keyless_rows,
         "users_uuids": len(users_exp), "users_checkinrepliestotal_wrong": users_wrong,
         "users_checkinrepliestotal_column_type": us_type,
@@ -307,17 +398,30 @@ def report(client, svc, variant, runner, calls, prior, rd, us, billed, statement
         "item_ms_p95": sorted(ms)[int(0.95 * (len(ms) - 1))] if ms else None,
         "dev_tables": [rd, us],
     }
+    if isinstance(runner, StagedRunner):
+        secs = [f["seconds"] for f in runner.flushes if f["items"]]
+        out["staged"] = {
+            "flush_interval_s": runner.interval, "flushes": len(secs),
+            "flush_seconds_p50": statistics.median(secs) if secs else None,
+            "flush_seconds_max": max(secs) if secs else None,
+            "items_per_flush_max": max((f["items"] for f in runner.flushes), default=0),
+            "failed_flushes": [f for f in runner.flushes if f["error"]][:10],
+            "receive_to_committed_s_p50": round(statistics.median(runner.lag_s), 1) if runner.lag_s else None,
+            "receive_to_committed_s_max": round(max(runner.lag_s), 1) if runner.lag_s else None,
+        }
     return out
 
 
 def main_():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--start", default="2026-09-24 16:00:00", help="UTC")
-    ap.add_argument("--end", default="2026-09-24 17:00:00", help="UTC")
+    # default: the busiest hour of the 30 days to 2026-09-26 (2,146 calls, peak minute 127)
+    ap.add_argument("--start", default="2026-08-31 19:00:00", help="UTC")
+    ap.add_argument("--end", default="2026-08-31 20:00:00", help="UTC")
     ap.add_argument("--workers", type=int, default=15)
     ap.add_argument("--max-attempts", type=int, default=5)
     ap.add_argument("--speed", type=float, default=1.0, help="1.0 = real time")
-    ap.add_argument("--variant", choices=["concurrent", "per_session", "both"], default="both")
+    ap.add_argument("--variants", default="concurrent,staged", help="comma list of concurrent, per_session, staged")
+    ap.add_argument("--flush-interval", type=float, default=30.0, help="staged variant: seconds between flushes")
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
 
@@ -330,7 +434,10 @@ def main_():
     prior = first_seen(client, sids, start)
     print(f"{len(calls)} calls, {len(sids)} sessions ({len(prior)} began before the window), {len(uuids)} contacts")
 
-    variants = ["concurrent", "per_session"] if args.variant == "both" else [args.variant]
+    variants = [v.strip() for v in args.variants.split(",") if v.strip()]
+    for v in variants:
+        if v not in ("concurrent", "per_session", "staged"):
+            raise SystemExit(f"unknown variant {v}")
     svc = None
     for variant in variants:
         rd, us = make_tables(client, run, variant, prior, uuids)
@@ -343,11 +450,23 @@ def main_():
         svc.client = client
         jobs.jobs.clear()
         print(f"[{variant}] replaying into {rd} and {us} ...", flush=True)
-        runner = Runner(svc, args.workers, args.max_attempts, per_session=(variant == "per_session"))
+        seeded_rows = {r["SessionID"]: r["n"] for r in client.query(
+            f"SELECT SessionID, COUNT(*) n FROM `{rd}` GROUP BY 1").result()}
+        jobs.jobs.clear()
+        if variant == "staged":
+            runner = StagedRunner(svc, args.flush_interval)
+        else:
+            runner = Runner(svc, args.workers, args.max_attempts, per_session=(variant == "per_session"))
         runner.run(calls, start, args.speed)
         billed = sum((j.total_bytes_billed or 0) for j in jobs.jobs)
         statements = len(jobs.jobs)
-        out = report(client, svc, variant, runner, calls, prior, rd, us, billed, statements, [args.start, args.end])
+        errored = Counter()
+        for j in jobs.jobs:
+            if j.error_result:
+                tbl = "users" if str(j.destination or "").endswith("_users") or "_users`" in j.query else "response_data"
+                errored[f"{tbl}: {j.error_result.get('message', '')[:60]}"] += 1
+        out = report(client, svc, variant, runner, calls, prior, rd, us, billed, statements,
+                     [args.start, args.end], seeded_rows, dict(errored))
         path = f"replay_report_{variant}_{run}.json"
         with open(path, "w") as f:
             json.dump(out, f, indent=2, default=str)

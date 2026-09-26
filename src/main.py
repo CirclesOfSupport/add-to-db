@@ -16,6 +16,10 @@ from config import (
 )
 from bq_writer import (
     build_upsert_query,
+    build_batch_merge_query,
+    build_batch_struct_params,
+    build_batch_insert_query,
+    fold_rows,
     build_insert_query,
     is_keyless_row,
     build_struct_param,
@@ -626,3 +630,80 @@ def tasks_upsert():
 
     body, status = perform_upsert(target, data)
     return jsonify(body), status
+
+
+def perform_flush(target: str, items: list[dict]) -> dict:
+    """
+    The batched single-writer path: fold every queued call for `target` (in
+    the order received) into one row per key and write them with one MERGE
+    (plus one INSERT for rows without a key). Rows whose partition value is
+    unknown go in a second MERGE on the key alone. Only ONE flush may run per
+    target at a time; that single writer is what makes the last call win and
+    keeps two calls from inserting the same key twice.
+
+    items: payload dicts, oldest first. Raises on a BigQuery failure so the
+    caller can keep the items and retry them in the next flush.
+    """
+    key_columns = UPSERT_KEYS[target]
+    table_id = ALLOWED_TARGETS[target]
+    rows = []
+    schema = None
+    skipped = []
+    for data in items:
+        prepared = prepare_item(target, data, [])
+        if isinstance(prepared[0], Response):
+            skipped.append("pre-flight failed")
+            continue
+        _table, schema, _added, errors, _warnings, coerced = prepared
+        resolved, key_errors = resolve_key_columns(key_columns, schema)
+        row = filter_to_schema(coerced, schema)
+        keyless = target in KEYLESS_INSERT_TARGETS and is_keyless_row(resolved, row)
+        if not keyless:
+            errors = errors + key_errors + validate_upsert_keys(resolved, schema, row)
+        if errors:
+            skipped.append("; ".join(errors))
+            continue
+        rows.append(row)
+    if not rows:
+        return {"rows": 0, "statements": 0, "skipped": skipped}
+
+    resolved, _ = resolve_key_columns(key_columns, schema)   # schema of the last prepared item
+    preserve = PRESERVE_ON_BLANK.get(target)
+    folded, keyless_rows = fold_rows(rows, resolved, preserve)
+    partition_column = PARTITION_COLUMNS.get(target)
+    pcol = None
+    if partition_column:
+        pcol = next((f.name for f in schema if f.name.lower() == partition_column.lower()), None)
+
+    statements = 0
+    groups = [list(folded.values())]
+    if pcol:
+        groups = [[r for r in folded.values() if r.get(pcol) is not None],
+                  [r for r in folded.values() if r.get(pcol) is None]]
+    for i, group in enumerate(groups):
+        if not group:
+            continue
+        columns = sorted({c for r in group for c in r}, key=lambda c: [f.name for f in schema].index(c))
+        use_range = pcol is not None and i == 0
+        if use_range and pcol not in columns:
+            columns.append(pcol)
+        query = build_batch_merge_query(table_id, columns, resolved,
+                                        pcol if use_range else None, preserve)
+        params = [bigquery.ArrayQueryParameter("rows", "RECORD", build_batch_struct_params(group, columns, schema))]
+        if use_range:
+            values = [r[pcol] for r in group]
+            params += [bigquery.ScalarQueryParameter("min_dt", "DATETIME", min(values)),
+                       bigquery.ScalarQueryParameter("max_dt", "DATETIME", max(values))]
+        client.query(query, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
+        statements += 1
+
+    if keyless_rows:
+        columns = sorted({c for r in keyless_rows for c in r}, key=lambda c: [f.name for f in schema].index(c))
+        structs = [build_struct_param({c: r.get(c) for c in columns}, schema, "placeholder") for r in keyless_rows]
+        client.query(build_batch_insert_query(table_id, columns),
+                     job_config=bigquery.QueryJobConfig(query_parameters=[
+                         bigquery.ArrayQueryParameter("rows", "RECORD", structs)])).result()
+        statements += 1
+
+    return {"rows": len(rows), "keys": len(folded), "keyless": len(keyless_rows),
+            "statements": statements, "skipped": skipped}

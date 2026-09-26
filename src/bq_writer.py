@@ -646,3 +646,111 @@ def get_users_and_responses_view_query(project_id: str, target: str) -> str:
     LEFT JOIN `{project_id}.{table_type}.users` AS users
       ON users.uuid = response_data.uuid
     """
+
+# ---------------------------------------------------------------------------
+# Batched single-writer path (fold many calls into one statement per target)
+# ---------------------------------------------------------------------------
+
+PRESENT_FIELD = "adb_present"   # per-row list of the columns the calls carried
+
+
+def fold_rows(
+    rows: list[dict],
+    key_columns: list[str],
+    preserve_columns: list[str] | None = None,
+) -> tuple[dict[tuple, dict], list[dict]]:
+    """
+    Fold rows (already coerced and filtered to the schema, in the order the
+    calls were received) into one row per key.
+
+    A column takes the value of the LAST row that carried it; a column no row
+    carried stays absent, so the stored value is left alone. A NULL in a
+    preserve column never replaces an earlier non-NULL. Rows whose every key
+    is NULL are returned separately, unfolded (they are inserted as they are).
+
+    Returns ({key tuple: folded row}, [keyless rows]).
+    """
+    preserve = {c.lower() for c in (preserve_columns or [])}
+    folded: dict[tuple, dict] = {}
+    keyless: list[dict] = []
+    for row in rows:
+        if is_keyless_row(key_columns, row):
+            keyless.append(row)
+            continue
+        key = tuple(row.get(k) for k in key_columns)
+        into = folded.setdefault(key, {})
+        for col, value in row.items():
+            if value is None and col.lower() in preserve and into.get(col) is not None:
+                continue
+            into[col] = value
+    return folded, keyless
+
+
+def build_batch_merge_query(
+    target_table_id: str,
+    columns: list[str],
+    key_columns: list[str],
+    partition_column: str | None = None,
+    preserve_columns: list[str] | None = None,
+) -> str:
+    """
+    MERGE for many folded rows at once. Every source row carries every column
+    in `columns` plus PRESENT_FIELD ('|col|col|'), and a matched row's column is
+    updated only when the calls carried it; otherwise the stored value stays.
+    With partition_column the caller binds @min_dt/@max_dt to the range of the
+    rows' values, and every row in the statement must carry a value.
+    """
+    preserve = {c.lower() for c in (preserve_columns or [])}
+    non_key = [c for c in columns if c not in key_columns]
+    on_terms = [f"T.{quote_identifier(k)} = S.{quote_identifier(k)}" for k in key_columns]
+    if partition_column:
+        p = quote_identifier(partition_column)
+        on_terms.append(f"(T.{p} BETWEEN @min_dt AND @max_dt OR T.{p} IS NULL)")
+
+    def update_term(col: str) -> str:
+        q = quote_identifier(col)
+        value = f"COALESCE(S.{q}, T.{q})" if col.lower() in preserve else f"S.{q}"
+        return f"{q} = IF(STRPOS(S.{PRESENT_FIELD}, '|{col}|') > 0, {value}, T.{q})"
+
+    update_sql = ""
+    if non_key:
+        update_sql = "WHEN MATCHED THEN\n      UPDATE SET\n        " + ",\n        ".join(update_term(c) for c in non_key)
+    insert_cols = ", ".join(quote_identifier(c) for c in columns)
+    insert_vals = ", ".join(f"S.{quote_identifier(c)}" for c in columns)
+    return f"""
+    MERGE {quote_identifier(target_table_id)} T
+    USING UNNEST(@rows) S
+    ON {" AND ".join(on_terms)}
+    {update_sql}
+    WHEN NOT MATCHED THEN
+      INSERT ({insert_cols})
+      VALUES ({insert_vals})
+    """
+
+
+def build_batch_struct_params(
+    rows: list[dict],
+    columns: list[str],
+    schema: list[bigquery.SchemaField],
+) -> list[bigquery.StructQueryParameter]:
+    """One struct per row, uniform over `columns`, plus the presence marker."""
+    fields = {f.name: f for f in schema}
+    params = []
+    for row in rows:
+        subs = []
+        for col in columns:
+            field = fields[col]
+            bq_type = BQ_TYPE_MAP.get(field.field_type.upper(), "STRING")
+            subs.append(bigquery.ScalarQueryParameter(col, bq_type, normalize_query_param_value(row.get(col), field)))
+        present = "|" + "|".join(c for c in columns if c in row) + "|"
+        subs.append(bigquery.ScalarQueryParameter(PRESENT_FIELD, "STRING", present))
+        params.append(bigquery.StructQueryParameter("placeholder", *subs))
+    return params
+
+
+def build_batch_insert_query(target_table_id: str, columns: list[str]) -> str:
+    cols = ", ".join(quote_identifier(c) for c in columns)
+    return f"""
+    INSERT INTO {quote_identifier(target_table_id)} ({cols})
+    SELECT {cols} FROM UNNEST(@rows)
+    """
