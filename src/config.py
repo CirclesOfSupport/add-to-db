@@ -52,6 +52,39 @@ PARTITION_COLUMNS: dict[str, str] = {
     "responses": "checkinDateTime",
 }
 
+# How each date/time column of a target is stored, where it differs from the
+# plain "drop the offset, keep the local wall clock" default. Only targets
+# listed here change; every other target keeps the default exactly.
+#
+# response_data stores its timestamps as the UTC wall clock of the instant the
+# payload names (2026-05-26T11:36:27-04:00 is stored as 2026-05-26 15:36:27),
+# and its one date-only DATETIME column as midnight of the payload's own local
+# date. DATE columns keep the payload's own local date (the default).
+#   "utc"            -> convert to UTC, then drop the offset
+#   "local_midnight" -> midnight of the payload's local calendar date
+# "*" is the convention for any DATETIME column of the target not listed.
+DATETIME_CONVENTIONS: dict[str, dict[str, str]] = {
+    "responses": {
+        "checkinDateTime": "utc",
+        "checkinReplyDateTime": "utc",
+        "resourceOfferReplyDatetime": "utc",
+        "referralFollowUpUtilizedDateTime": "utc",
+        "checkinReplyDate": "local_midnight",
+        "*": "utc",
+    },
+}
+
+# Columns a blank payload value must never overwrite. A MERGE that matches a
+# stored row keeps the stored value when the payload's is NULL.
+PRESERVE_ON_BLANK: dict[str, list[str]] = {
+    "responses": ["checkinDateTime"],
+}
+
+# Targets that accept a row with no key. Such a row cannot be matched to
+# anything, so it is inserted as a new row instead of being rejected
+# (sign-up events carry no session ID).
+KEYLESS_INSERT_TARGETS: set[str] = {"responses"}
+
 TYPE_CHECKERS = {
     "STRING": lambda v: isinstance(v, str),
     "JSON": lambda v: isinstance(v, (dict, list, str)),

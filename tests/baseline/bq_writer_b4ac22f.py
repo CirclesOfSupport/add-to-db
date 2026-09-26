@@ -63,43 +63,10 @@ def parse_datetime_like(value: str) -> datetime:
     return datetime.fromisoformat(cleaned)
 
 
-def apply_datetime_convention(parsed: datetime, convention: str | None) -> datetime:
-    """
-    Turn a parsed webhook datetime into the naive value a DATETIME column stores.
-
-      None             -> drop the offset, keep the payload's local wall clock
-      "utc"            -> convert to UTC, then drop the offset (a naive value is
-                          taken as already UTC and returned unchanged)
-      "local_midnight" -> midnight of the payload's local calendar date
-    """
-    if convention == "utc":
-        if parsed.tzinfo is None:
-            return parsed
-        return parsed.astimezone(timezone.utc).replace(tzinfo=None)
-
-    if convention == "local_midnight":
-        return datetime.combine(parsed.date(), time())
-
-    if convention is not None:
-        raise ValueError(f"Unknown DATETIME convention '{convention}'")
-
-    return parsed.replace(tzinfo=None)
-
-
-def datetime_convention_for(field_name: str, conventions: dict[str, str] | None) -> str | None:
-    if not conventions:
-        return None
-    lowered = {k.lower(): v for k, v in conventions.items()}
-    return lowered.get(field_name.lower(), conventions.get("*"))
-
-
-def coerce_value_to_bq_type(value, field: bigquery.SchemaField, convention: str | None = None):
+def coerce_value_to_bq_type(value, field: bigquery.SchemaField):
     """
     Convert webhook values into Python values compatible with BigQuery
     query parameters based on the actual BigQuery schema field type.
-
-    `convention` applies to DATETIME fields only (see apply_datetime_convention);
-    None keeps the historical behaviour.
     """
     field_type = field.field_type.upper()
 
@@ -142,10 +109,9 @@ def coerce_value_to_bq_type(value, field: bigquery.SchemaField, convention: str 
         if field_type == "DATETIME":
             parsed = parse_datetime_like(stripped)
 
-            # BigQuery DATETIME has no timezone. By default preserve the local
-            # wall-clock time from the webhook and remove tzinfo; a target may
-            # store another convention (config.DATETIME_CONVENTIONS).
-            return apply_datetime_convention(parsed, convention)
+            # BigQuery DATETIME has no timezone. Preserve the local wall-clock
+            # time from the webhook and remove tzinfo.
+            return parsed.replace(tzinfo=None)
 
         if field_type == "TIMESTAMP":
             parsed = parse_datetime_like(stripped)
@@ -185,7 +151,7 @@ def coerce_value_to_bq_type(value, field: bigquery.SchemaField, convention: str 
             and not isinstance(value, bool):
         return str(value)
     if field_type == "DATETIME" and isinstance(value, datetime):
-        return apply_datetime_convention(value, convention)
+        return value.replace(tzinfo=None)
 
     if field_type == "TIMESTAMP" and isinstance(value, datetime):
         if value.tzinfo is None:
@@ -204,13 +170,9 @@ def coerce_value_to_bq_type(value, field: bigquery.SchemaField, convention: str 
 def coerce_payload_to_schema(
     payload: dict,
     schema: list[bigquery.SchemaField],
-    datetime_conventions: dict[str, str] | None = None,
 ) -> tuple[dict, list[str]]:
     """
     Convert payload values to match the BigQuery schema types.
-
-    datetime_conventions: the target's per-column DATETIME conventions
-    (config.DATETIME_CONVENTIONS); None keeps the historical behaviour.
     """
     errors: list[str] = []
     schema_fields = {field.name: field for field in schema}
@@ -225,11 +187,7 @@ def coerce_payload_to_schema(
             continue
 
         try:
-            convention = (
-                datetime_convention_for(field.name, datetime_conventions)
-                if field.field_type.upper() == "DATETIME" else None
-            )
-            coerced[key] = coerce_value_to_bq_type(value, field, convention)
+            coerced[key] = coerce_value_to_bq_type(value, field)
         except Exception as exc:
             errors.append(
                 f"Field '{key}' could not be converted to {field.field_type}: {exc}"
@@ -486,22 +444,15 @@ def build_upsert_query(
     row: dict,
     key_columns: list[str],
     partition_column: str | None = None,
-    preserve_columns: list[str] | None = None,
 ):
     """
     Generates a parameterized MERGE statement using only columns present in the row.
 
     When partition_column is given, the ON clause also carries
-    `(T.<partition_column> BETWEEN @min_dt AND @max_dt OR T.<partition_column> IS NULL)`,
-    bound to DATETIME query parameters by the caller. The parameters are
-    plan-time constants, which is what lets BigQuery prune partitions; the same
-    range expressed through the UNNEST join does not prune. The IS NULL branch
-    matches a stored row that has no partition value yet (it lives in the NULL
-    partition, which is also pruned to) -- without it such a row is never
-    matched and the MERGE inserts a duplicate.
-
-    preserve_columns: columns whose stored value a NULL in the row must not
-    overwrite (UPDATE uses COALESCE(S.col, T.col)).
+    `T.<partition_column> BETWEEN @min_dt AND @max_dt`, bound to DATETIME query
+    parameters by the caller. The parameters are plan-time constants, which is
+    what lets BigQuery prune partitions; the same range expressed through the
+    UNNEST join does not prune.
     """
     column_names = list(row.keys())
 
@@ -510,25 +461,16 @@ def build_upsert_query(
         for col in key_columns
     ]
     if partition_column:
-        pcol = quote_identifier(partition_column)
         on_terms.append(
-            f"(T.{pcol} BETWEEN @min_dt AND @max_dt OR T.{pcol} IS NULL)"
+            f"T.{quote_identifier(partition_column)} BETWEEN @min_dt AND @max_dt"
         )
     on_clause = " AND ".join(on_terms)
 
     non_key_columns = [col for col in column_names if col not in key_columns]
 
-    preserve = {c.lower() for c in (preserve_columns or [])}
-
-    def update_term(col: str) -> str:
-        q = quote_identifier(col)
-        if col.lower() in preserve:
-            return f"{q} = COALESCE(S.{q}, T.{q})"
-        return f"{q} = S.{q}"
-
     if non_key_columns:
         update_clause = ",\n        ".join([
-            update_term(col)
+            f"{quote_identifier(col)} = S.{quote_identifier(col)}"
             for col in non_key_columns
         ])
         matched_action = f"WHEN MATCHED THEN UPDATE SET {update_clause}"
@@ -548,25 +490,6 @@ def build_upsert_query(
     {matched_action}
     WHEN NOT MATCHED THEN
       INSERT ({insert_cols}) VALUES ({insert_vals})
-    """
-
-
-def is_keyless_row(key_columns: list[str], row: dict) -> bool:
-    """True when every key column is absent from the row or NULL."""
-    return bool(key_columns) and all(row.get(key) is None for key in key_columns)
-
-
-def build_insert_query(target_table_id: str, row: dict) -> str:
-    """
-    Parameterized DML INSERT of one row, using only the columns present in it.
-
-    DML rather than the streaming API: streamed rows sit in a buffer that
-    UPDATE/MERGE statements on the same table cannot touch for a while.
-    """
-    cols = ", ".join(quote_identifier(col) for col in row.keys())
-    return f"""
-    INSERT INTO {quote_identifier(target_table_id)} ({cols})
-    SELECT {cols} FROM UNNEST(@rows)
     """
 
 

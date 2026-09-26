@@ -384,6 +384,17 @@ The `/upsert` endpoint uses a BigQuery `MERGE` statement keyed on the column(s) 
 | **Table is empty** | Queued; `WHEN NOT MATCHED` fires and the row is inserted normally. |
 | **Two upserts in a row with the same new key** | Both are queued and return `202` immediately. Whichever task's `MERGE` runs first inserts the row; the second matches on the key and updates it. |
 
+### `responses` target specifics
+
+The `responses` target (`RESPONSES.response_data`) differs from the others in four ways; every other target behaves as described above.
+
+| Scenario | Behavior |
+|---|---|
+| **Date/time values** | Stored in the table's own convention (`DATETIME_CONVENTIONS` in `config.py`): `checkinDateTime`, `checkinReplyDateTime`, `resourceOfferReplyDatetime`, `referralFollowUpUtilizedDateTime` and any other DATETIME column are converted to UTC before the offset is dropped (`2026-05-26T11:36:27-04:00` is stored as `2026-05-26 15:36:27`); `checkinReplyDate` is midnight of the payload's local date; DATE columns keep the payload's local date. Other targets keep the payload's local wall clock. |
+| **Partition pruning** | The MERGE carries `(T.checkinDateTime BETWEEN @min_dt AND @max_dt OR T.checkinDateTime IS NULL)` when the payload has a check-in time, so it reads only that day's partition plus the NULL partition. A stored row without a check-in time is still matched and updated rather than duplicated. A payload without a check-in time uses the key alone (a full scan). |
+| **Blank check-in time** | Never overwrites a stored one: the update uses `COALESCE(S.checkinDateTime, T.checkinDateTime)` (`PRESERVE_ON_BLANK`). |
+| **No session ID** | A payload whose `sessionID` is absent, `null` or blank (sign-ups, some all-blank calls) is inserted as a new row with a NULL `SessionID` instead of being rejected (`KEYLESS_INSERT_TARGETS`). Such rows cannot be updated later. |
+
 ---
 
 ## Allowed Tables
@@ -474,5 +485,9 @@ curl -X POST http://localhost:8080/upsert \
   -H "X-Webhook-Secret: dev-secret" \
   -d '{"table": "users", "data": {"uuid": "abc-123", "name": "Jane Updated"}}'
 ```
+
+**Tests:** `pip install -r requirements-dev.txt`, then `python -m pytest -q tests` from the repo root. The tests need no GCP access: BigQuery is replaced by DuckDB, which runs the service's generated SQL. `tests/baseline/` holds the `bq_writer` of the revision before the `responses` changes; `tests/test_scope_guard.py` checks that triage and testimonial writes send exactly what it sends.
+
+**Proof tools (real BigQuery, DEV dataset):** `tools/prove_unit1.py` runs the `responses` write scenarios against a fresh copy of `response_data` in `DEV` and dry-runs the MERGE against the live table; `tools/replay_webhook_log.py` replays logged check-in calls in-process (not through Cloud Tasks) against DEV copies at queue concurrency and reports ordering, duplicates and failures. Both authenticate as the active `gcloud` account.
 
 **A note on testing the async path locally:** hitting your local `/ingest` or `/upsert` still validates and enqueues a *real* Cloud Tasks task (assuming your ADC has `roles/cloudtasks.enqueuer` on the queue). But `SERVICE_URL` is the callback target Cloud Tasks actually calls — since Cloud Tasks reaches out over the public internet, it can't reach `localhost`. That means the task will always be delivered to the **deployed** Cloud Run service's `/tasks/ingest`/`/tasks/upsert`, not your local process, regardless of which instance enqueued it. To exercise the write logic itself locally, call `/tasks/ingest`/`/tasks/upsert` directly — but note `is_task_request_authorized` requires a real OIDC token whose signer matches `TASKS_INVOKER_SERVICE_ACCOUNT`, so you'll need to mint one (e.g. via `gcloud auth print-identity-token --audiences=$SERVICE_URL --impersonate-service-account=$TASKS_INVOKER_SERVICE_ACCOUNT`) rather than calling it unauthenticated.

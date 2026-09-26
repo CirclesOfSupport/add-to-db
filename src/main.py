@@ -4,9 +4,20 @@ import random
 from flask import Flask, jsonify, request, Response
 from google.cloud import bigquery
 from auth import is_authorized, is_task_request_authorized
-from config import ALLOWED_TARGETS, TYPE_CHECKERS, UPSERT_KEYS, PROJECT_ID, PARTITION_COLUMNS
+from config import (
+    ALLOWED_TARGETS,
+    TYPE_CHECKERS,
+    UPSERT_KEYS,
+    PROJECT_ID,
+    PARTITION_COLUMNS,
+    DATETIME_CONVENTIONS,
+    PRESERVE_ON_BLANK,
+    KEYLESS_INSERT_TARGETS,
+)
 from bq_writer import (
     build_upsert_query,
+    build_insert_query,
+    is_keyless_row,
     build_struct_param,
     validate_upsert_keys,
     add_missing_fields_to_table,
@@ -164,10 +175,11 @@ def run_upsert(
     row: dict,
     key_columns: list[str],
     partition_column: str | None = None,
+    preserve_columns: list[str] | None = None,
 ):
     partition_col, partition_value = resolve_partition_column(partition_column, schema, row)
 
-    query = build_upsert_query(table_id, row, key_columns, partition_col)
+    query = build_upsert_query(table_id, row, key_columns, partition_col, preserve_columns)
     struct_param = build_struct_param(row, schema, "placeholder")
 
     query_parameters = [
@@ -187,6 +199,20 @@ def run_upsert(
     query_job = client.query(query, job_config=job_config)
     return query_job.result()
 
+def run_insert(
+    table_id: str,
+    schema: list[bigquery.SchemaField],
+    row: dict,
+):
+    """DML INSERT of one keyless row (see config.KEYLESS_INSERT_TARGETS)."""
+    query = build_insert_query(table_id, row)
+    struct_param = build_struct_param(row, schema, "placeholder")
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("rows", "RECORD", [struct_param])]
+    )
+    return client.query(query, job_config=job_config).result()
+
+
 def run_upsert_with_retry(
     table_id: str,
     schema: list[bigquery.SchemaField],
@@ -195,6 +221,7 @@ def run_upsert_with_retry(
     partition_column: str | None = None,
     max_attempts: int = 4,
     base_delay: float = 0.25,
+    preserve_columns: list[str] | None = None,
 ):
     """
     Retries the MERGE on concurrent update errors with exponential backoff + jitter.
@@ -202,7 +229,7 @@ def run_upsert_with_retry(
     """
     for attempt in range(max_attempts):
         try:
-            return run_upsert(table_id, schema, row, key_columns, partition_column)
+            return run_upsert(table_id, schema, row, key_columns, partition_column, preserve_columns)
         except Exception as exc:
             is_concurrent_error = "Could not serialize access" in str(exc)
             is_last_attempt = attempt == max_attempts - 1
@@ -259,7 +286,9 @@ def prepare_item(
         return err("Unable to update BigQuery schema", 500, table=target, details=str(exc))
 
     normalized_data, normalize_errors = normalize_payload_to_schema(data, schema)
-    coerced_data, coerce_errors = coerce_payload_to_schema(normalized_data, schema)
+    coerced_data, coerce_errors = coerce_payload_to_schema(
+        normalized_data, schema, DATETIME_CONVENTIONS.get(target)
+    )
 
     errors, warnings = validate_payload(coerced_data, schema)
     errors.extend(normalize_errors)
@@ -310,7 +339,9 @@ def precheck_payload(
         return err(f"Unable to load schema for table '{target}'", 500, details=str(exc))
 
     normalized_data, normalize_errors = normalize_payload_to_schema(data, schema)
-    coerced_data, coerce_errors = coerce_payload_to_schema(normalized_data, schema)
+    coerced_data, coerce_errors = coerce_payload_to_schema(
+        normalized_data, schema, DATETIME_CONVENTIONS.get(target)
+    )
 
     errors, warnings = validate_payload(coerced_data, schema)
     errors.extend(normalize_errors)
@@ -425,7 +456,8 @@ def upsert():
         errors.extend(key_errors)
 
         row = filter_to_schema(coerced_data, schema)
-        errors.extend(validate_upsert_keys(resolved_key_columns, schema, row))
+        if not (target in KEYLESS_INSERT_TARGETS and is_keyless_row(resolved_key_columns, row)):
+            errors.extend(validate_upsert_keys(resolved_key_columns, schema, row))
 
         if errors:
             return jsonify({
@@ -523,21 +555,22 @@ def tasks_ingest():
     }), 200
 
 
-@app.post("/tasks/upsert")
-def tasks_upsert():
-    target, data, error_response = _parse_task_request()
-    if error_response:
-        return error_response
-
+def perform_upsert(target: str, data: dict) -> tuple[dict, int]:
+    """
+    The /tasks/upsert worker: schema migration, coercion, validation and the
+    BigQuery write for one queued item. Returns (body, status). A non-2xx status
+    tells Cloud Tasks to retry; a 2xx acknowledges the task even when the write
+    failed for a reason a retry cannot fix.
+    """
     key_columns = UPSERT_KEYS.get(target)
     if not key_columns:
         app.logger.error("tasks/upsert: table '%s' is not configured for upsert", target)
-        return jsonify({"status": "error", "table": target}), 200
+        return {"status": "error", "table": target}, 200
 
     prepared = prepare_item(target, data, [])
     if isinstance(prepared[0], Response):
         app.logger.error("tasks/upsert: pre-flight failed for table '%s'", target)
-        return jsonify({"status": "error", "table": target}), 200
+        return {"status": "error", "table": target}, 200
 
     table, schema, added_fields, errors, warnings, data = prepared
 
@@ -545,29 +578,51 @@ def tasks_upsert():
     errors.extend(key_errors)
 
     row = filter_to_schema(data, schema)
-    errors.extend(validate_upsert_keys(resolved_key_columns, schema, row))
+    keyless = target in KEYLESS_INSERT_TARGETS and is_keyless_row(resolved_key_columns, row)
+    if not keyless:
+        errors.extend(validate_upsert_keys(resolved_key_columns, schema, row))
 
     if errors:
         app.logger.error("tasks/upsert: validation errors for table '%s': %s", target, errors)
-        return jsonify({"status": "error", "table": target, "errors": errors}), 200
+        return {"status": "error", "table": target, "errors": errors}, 200
 
     try:
-        run_upsert_with_retry(
-            table_id=ALLOWED_TARGETS[target],
-            schema=schema,
-            row=row,
-            key_columns=resolved_key_columns,
-            partition_column=PARTITION_COLUMNS.get(target),
-        )
+        if keyless:
+            run_insert(ALLOWED_TARGETS[target], schema, row)
+        else:
+            run_upsert_with_retry(
+                table_id=ALLOWED_TARGETS[target],
+                schema=schema,
+                row=row,
+                key_columns=resolved_key_columns,
+                partition_column=PARTITION_COLUMNS.get(target),
+                preserve_columns=PRESERVE_ON_BLANK.get(target),
+            )
     except Exception as exc:
-        app.logger.error("tasks/upsert: BigQuery MERGE failed for table '%s': %s", target, exc)
-        return err("BigQuery MERGE failed", 500, table=target, details=str(exc))
+        app.logger.error("tasks/upsert: BigQuery %s failed for table '%s': %s",
+                         "INSERT" if keyless else "MERGE", target, exc)
+        return {
+            "status": "error",
+            "error": "BigQuery INSERT failed" if keyless else "BigQuery MERGE failed",
+            "table": target,
+            "details": str(exc),
+        }, 500
 
-    return jsonify({
+    return {
         "status": "ok",
-        "operation": "upsert",
+        "operation": "insert" if keyless else "upsert",
         "table": target,
         "table_id": ALLOWED_TARGETS[target],
         "added_fields": added_fields,
         "warnings": warnings,
-    }), 200
+    }, 200
+
+
+@app.post("/tasks/upsert")
+def tasks_upsert():
+    target, data, error_response = _parse_task_request()
+    if error_response:
+        return error_response
+
+    body, status = perform_upsert(target, data)
+    return jsonify(body), status
