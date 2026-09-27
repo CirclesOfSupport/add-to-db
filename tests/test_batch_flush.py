@@ -85,7 +85,7 @@ def test_range_spans_the_batch(svc):
     out = svc.perform_flush("responses", [body(CHECKIN, "Yes"),
                                           dict(body("2026-09-25T10%3A00%3A00-04%3A00", "No"), sessionID=later)])
     p = svc.fake.statements[-1].params
-    assert p["min_dt"].value == CHECKIN_UTC and p["max_dt"].value == datetime(2026, 9, 25, 14, 0)
+    assert p["responses_min_dt"].value == CHECKIN_UTC and p["responses_max_dt"].value == datetime(2026, 9, 25, 14, 0)
     assert out["keys"] == 2 and len(rows(svc)) == 2
 
 

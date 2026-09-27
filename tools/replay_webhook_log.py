@@ -286,7 +286,7 @@ class StagedRunner:
 def expected_rows(svc, calls):
     """Per SessionID and per users uuid: each column's value from the LAST call carrying it."""
     import config
-    from bq_writer import coerce_payload_to_schema, normalize_payload_to_schema
+    from bq_writer import apply_stale_reply_guard, coerce_payload_to_schema, normalize_payload_to_schema
     rd_schema = svc.client.get_table(config.ALLOWED_TARGETS["responses"]).schema
     us_schema = svc.client.get_table(config.ALLOWED_TARGETS["users"]).schema
     names_rd, names_us = {f.name for f in rd_schema}, {f.name for f in us_schema}
@@ -299,6 +299,7 @@ def expected_rows(svc, calls):
             norm, _ = normalize_payload_to_schema(dict(data), schema)
             row, errs = coerce_payload_to_schema(norm, schema, config.DATETIME_CONVENTIONS.get(target))
             row = {k: v for k, v in row.items() if k in (names_rd if target == "responses" else names_us)}
+            row = apply_stale_reply_guard(row, config.STALE_REPLY_FIELDS.get(target))
             if target == "responses":
                 sid = row.get("SessionID")
                 if not sid:

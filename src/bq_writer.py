@@ -692,6 +692,9 @@ def build_batch_merge_query(
     key_columns: list[str],
     partition_column: str | None = None,
     preserve_columns: list[str] | None = None,
+    rows_param: str = "rows",
+    min_param: str = "min_dt",
+    max_param: str = "max_dt",
 ) -> str:
     """
     MERGE for many folded rows at once. Every source row carries every column
@@ -705,7 +708,7 @@ def build_batch_merge_query(
     on_terms = [f"T.{quote_identifier(k)} = S.{quote_identifier(k)}" for k in key_columns]
     if partition_column:
         p = quote_identifier(partition_column)
-        on_terms.append(f"(T.{p} BETWEEN @min_dt AND @max_dt OR T.{p} IS NULL)")
+        on_terms.append(f"(T.{p} BETWEEN @{min_param} AND @{max_param} OR T.{p} IS NULL)")
 
     def update_term(col: str) -> str:
         q = quote_identifier(col)
@@ -719,7 +722,7 @@ def build_batch_merge_query(
     insert_vals = ", ".join(f"S.{quote_identifier(c)}" for c in columns)
     return f"""
     MERGE {quote_identifier(target_table_id)} T
-    USING UNNEST(@rows) S
+    USING UNNEST(@{rows_param}) S
     ON {" AND ".join(on_terms)}
     {update_sql}
     WHEN NOT MATCHED THEN
@@ -748,9 +751,27 @@ def build_batch_struct_params(
     return params
 
 
-def build_batch_insert_query(target_table_id: str, columns: list[str]) -> str:
+def build_batch_insert_query(target_table_id: str, columns: list[str], rows_param: str = "rows") -> str:
     cols = ", ".join(quote_identifier(c) for c in columns)
     return f"""
     INSERT INTO {quote_identifier(target_table_id)} ({cols})
-    SELECT {cols} FROM UNNEST(@rows)
+    SELECT {cols} FROM UNNEST(@{rows_param})
     """
+
+
+def apply_stale_reply_guard(row: dict, reply_fields: list[str] | None) -> dict:
+    """
+    A call can carry the PREVIOUS session's reply (the webhook body is built
+    from contact fields that persist across sessions). A reply time earlier
+    than the session's own check-in time is such a carry-over: the reply
+    fields the call carries are set to NULL (not replied). Needs both times in
+    the row, already in the same convention.
+    """
+    if not reply_fields:
+        return row
+    replied = row.get("checkinReplyDateTime")
+    checkin = row.get("checkinDateTime")
+    if replied is None or checkin is None or replied >= checkin:
+        return row
+    wanted = {f.lower() for f in reply_fields}
+    return {k: (None if k.lower() in wanted else v) for k, v in row.items()}

@@ -102,3 +102,28 @@ TYPE_CHECKERS = {
     "TIME": lambda v: isinstance(v, time),
     "BYTES": lambda v: isinstance(v, (bytes, str))
 }
+
+# --- Single-writer hookup for the check-in targets --------------------------
+# Targets listed in STAGED_TARGETS are not written per call. /upsert appends
+# each validated call to STAGING_TABLE (durable before the 202) stamped with
+# its receive time; one flusher at a time (queue FLUSH_QUEUE at max
+# concurrency 1, plus a compare-and-set watermark in the same transaction as
+# the writes) folds everything received up to (now - FLUSH_SAFETY_S) into one
+# MERGE per target. Empty = every target keeps the per-call path.
+STAGED_TARGETS: set[str] = {t.strip() for t in os.getenv("STAGED_TARGETS", "").split(",") if t.strip()}
+STAGING_TABLE = os.getenv("STAGING_TABLE", f"{PROJECT_ID}.RESPONSES.adb_staging")
+DEAD_LETTER_TABLE = os.getenv("DEAD_LETTER_TABLE", f"{PROJECT_ID}.RESPONSES.adb_dead_letter")
+FLUSH_LOG_TABLE = os.getenv("FLUSH_LOG_TABLE", f"{PROJECT_ID}.RESPONSES.adb_flush_log")
+FLUSH_STATE_TABLE = os.getenv("FLUSH_STATE_TABLE", f"{PROJECT_ID}.RESPONSES.adb_flush_state")
+FLUSH_QUEUE = os.getenv("FLUSH_QUEUE", "add-to-db-flush")
+FLUSH_BUCKET_S = int(os.getenv("FLUSH_BUCKET_S", "30"))      # one flush per this many seconds of traffic
+FLUSH_SAFETY_S = int(os.getenv("FLUSH_SAFETY_S", "20"))      # only calls received this long ago are flushed
+FLUSH_MAX_ITEMS = int(os.getenv("FLUSH_MAX_ITEMS", "3000"))
+FLUSH_ALERT_AFTER = int(os.getenv("FLUSH_ALERT_AFTER", "3"))  # consecutive failed flushes before FLUSH_ALERT
+FLUSH_TARGET_ORDER = ["users", "responses"]
+
+# Reply fields a stale carry-over call must not write (see apply_stale_reply_guard).
+STALE_REPLY_FIELDS: dict[str, list[str]] = {
+    "responses": ["checkinReply", "checkinReplyText", "checkinReplyNumerical",
+                  "checkinReplyDateTime", "checkinReplyDistressed"],
+}

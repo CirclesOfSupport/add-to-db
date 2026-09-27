@@ -47,6 +47,12 @@ def _literal(value, bq_type: str) -> str:
     return f"CAST('{text}' AS {duck})"
 
 
+def _utc_duck():
+    con = duckdb.connect()
+    con.execute("SET TimeZone = 'UTC'")
+    return con
+
+
 @dataclass
 class FakeTable:
     table_id: str
@@ -61,17 +67,20 @@ class FakeTable:
 class FakeJob:
     sql: str
     params: dict
+    rows: list = field(default_factory=list)
 
     def result(self, *args, **kwargs):
-        return []
+        return self.rows
 
 
 @dataclass
 class FakeClient:
     tables: dict = field(default_factory=dict)       # table_id -> schema
     statements: list = field(default_factory=list)   # FakeJob, in order
-    duck: duckdb.DuckDBPyConnection = field(default_factory=duckdb.connect)
+    duck: duckdb.DuckDBPyConnection = field(default_factory=lambda: _utc_duck())
     fail_next: list = field(default_factory=list)    # exceptions to raise on the next query calls
+    fail_in_script: list = field(default_factory=list)  # substrings: the script statement containing it fails
+    streamed: list = field(default_factory=list)      # rows appended with insert_rows_json
 
     # --- table management -------------------------------------------------
     def _name(self, table_id: str) -> str:
@@ -108,12 +117,18 @@ class FakeClient:
         self.statements.append(job)
         if self.fail_next:
             raise self.fail_next.pop(0)
+        if sql.lstrip().startswith("BEGIN TRANSACTION"):
+            self._run_script(sql, params)
+            return job
+        if sql.lstrip().upper().startswith("SELECT"):
+            job.rows = self.select(sql, params)
+            return job
         self.duck.execute(self._translate(sql, params))
         return job
 
     # --- translation ------------------------------------------------------
-    def _rows_source(self, params: dict) -> str:
-        arr = params["rows"]
+    def _rows_source(self, params: dict, name: str = "rows") -> str:
+        arr = params[name]
         selects = []
         for struct in arr.values:
             parts = []
@@ -124,15 +139,56 @@ class FakeClient:
 
     def _translate(self, sql: str, params: dict) -> str:
         out = sql
-        m = re.search(r"MERGE\s+`([^`]+)`\s+T\s+USING\s+UNNEST\(@rows\)\s+S", out)
-        if m:
-            out = out.replace(m.group(0), f"MERGE INTO {self._name(m.group(1))} AS T USING {self._rows_source(params)} AS S")
-        m = re.search(r"INSERT INTO\s+`([^`]+)`", out)
-        if m:
+        for m in list(re.finditer(r"MERGE\s+`([^`]+)`\s+T\s+USING\s+UNNEST\(@(\w+)\)\s+S", out)):
+            out = out.replace(m.group(0), f"MERGE INTO {self._name(m.group(1))} AS T USING {self._rows_source(params, m.group(2))} AS S")
+        for m in list(re.finditer(r"INSERT INTO\s+`([^`]+)`", out)):
             out = out.replace(m.group(0), f"INSERT INTO {self._name(m.group(1))}")
-            out = out.replace("FROM UNNEST(@rows)", f"FROM {self._rows_source(params)} AS S")
-        for name in ("min_dt", "max_dt"):
-            if name in params:
-                p = params[name]
-                out = out.replace(f"@{name}", _literal(p.value, p.type_))
+        for m in list(re.finditer(r"FROM UNNEST\(@(\w+)\)", out)):
+            out = out.replace(m.group(0), f"FROM {self._rows_source(params, m.group(1))} AS S")
+        for m in list(re.finditer(r"(UPDATE|FROM|JOIN)\s+`([^`]+)`", out)):
+            out = out.replace(m.group(0), f"{m.group(1)} {self._name(m.group(2))}")
+        for name, p in sorted(params.items(), key=lambda kv: -len(kv[0])):
+            if hasattr(p, "type_") and not hasattr(p, "array_type"):
+                out = re.sub(rf"@{name}\b", _literal(p.value, p.type_).replace("\\", "\\\\"), out)
+        out = out.replace("CURRENT_TIMESTAMP()", "CAST(now() AS TIMESTAMPTZ)")
+        out = re.sub(r"TIMESTAMP_SUB\(([^,]+), (INTERVAL \d+ \w+)\)", r"(\1 - \2)", out)
+        out = out.replace("IFNULL(", "COALESCE(")
         return out.replace("`", '"')
+
+    # --- scripts (BEGIN TRANSACTION; ...; ASSERT @@row_count = 1 ...; COMMIT TRANSACTION;)
+    def _run_script(self, sql: str, params: dict) -> None:
+        parts = [p.strip() for p in sql.split(";\n") if p.strip().rstrip(";").strip()]
+        last_count = None
+        self.duck.execute("BEGIN TRANSACTION")
+        try:
+            for part in parts:
+                part = part.rstrip(";").strip()
+                if part in ("BEGIN TRANSACTION", "COMMIT TRANSACTION"):
+                    continue
+                if part.startswith("ASSERT @@row_count = 1"):
+                    if last_count != 1:
+                        raise RuntimeError("Assertion failed: " + part)
+                    continue
+                if self.fail_in_script and self.fail_in_script[0] in part:
+                    self.fail_in_script.pop(0)
+                    raise RuntimeError("Transaction is aborted due to concurrent update")
+                cur = self.duck.execute(self._translate(part, params))
+                row = cur.fetchone() if cur.description else None
+                last_count = row[0] if row is not None else None
+            self.duck.execute("COMMIT")
+        except Exception:
+            self.duck.execute("ROLLBACK")
+            raise
+
+    def insert_rows_json(self, table_id, rows, row_ids=None):
+        if self.fail_next:
+            return [{"errors": [str(self.fail_next.pop(0))]}]
+        for r in rows:
+            self.insert_raw(table_id, {k: (datetime.fromisoformat(v) if k == "received_at" else v) for k, v in r.items()})
+        self.streamed.extend(rows)
+        return []
+
+    def select(self, sql: str, params: dict) -> list[dict]:
+        cur = self.duck.execute(self._translate(sql, params))
+        names = [d[0] for d in cur.description]
+        return [dict(zip(names, r)) for r in cur.fetchall()]
