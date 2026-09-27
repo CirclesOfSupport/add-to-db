@@ -17,6 +17,12 @@ Variants:
   staged       the single-writer design: calls are held in received order and
                one flusher writes them every --flush-interval seconds with
                perform_flush (one MERGE per target per flush)
+  live         the deployed hookup end to end: every call goes through the real
+               /upsert (staged in a DEV staging table, receive time stamped) and
+               the real run_flush_cycle (per-target transactions, watermarks,
+               retries). With --speed N the flush bucket and safety window are
+               divided by N; posting runs in 8 lanes keyed by contact, so each
+               contact's calls keep their order.
 
 Sessions whose first logged call falls before the window are seeded with their
 current RESPONSES row, so later calls must MATCH it (as in production).
@@ -283,6 +289,77 @@ class StagedRunner:
         self.flush_once()
 
 
+class LiveRunner:
+    """The live hookup: real /upsert into DEV staging, real run_flush_cycle on a timer."""
+
+    LANES = 8
+
+    def __init__(self, svc, config, speed):
+        self.svc, self.config, self.speed = svc, config, speed
+        self.outcomes, self.cycles, self.lock = [], [], threading.Lock()
+
+    def run(self, calls, start, speed):
+        svc, config = self.svc, self.config
+        stop = threading.Event()
+
+        def flusher():
+            while not stop.is_set():
+                stop.wait(config.FLUSH_BUCKET_S)
+                self.cycle()
+
+        ft = threading.Thread(target=flusher, daemon=True)
+        ft.start()
+        lanes = [[] for _ in range(self.LANES)]
+        for c in calls:
+            uid = next((str(d.get("uuid")) for _, d in c["items"] if d.get("uuid")), str(c["id"]))
+            lanes[int(hashlib.md5(uid.encode()).hexdigest(), 16) % self.LANES].append(c)
+        t0 = time.monotonic()
+
+        def poster(lane):
+            web = svc.app.test_client()
+            for c in lane:
+                wait = t0 + (c["fired_at"] - start).total_seconds() / speed - time.monotonic()
+                if wait > 0:
+                    time.sleep(wait)
+                r = web.post("/upsert", json={"tables": [{"table": t, "data": d} for t, d in c["items"]]})
+                ok = r.status_code == 202
+                with self.lock:
+                    for t, d in c["items"]:
+                        self.outcomes.append({"target": t, "data": d, "call": c["id"], "attempts": 1, "conflicts": 0,
+                                              "ms": [], "final_status": 200 if ok else r.status_code,
+                                              "final_body": {"status": "ok"} if ok else (r.get_json() or {})})
+
+        threads = [threading.Thread(target=poster, args=(lane,)) for lane in lanes]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.posting_seconds = time.monotonic() - t0
+        stop.set()
+        ft.join()
+        for _ in range(20):                 # drain: flush until nothing is left
+            time.sleep(config.FLUSH_SAFETY_S + 1)
+            self.cycle()
+            if all(v["backlog_calls"] == 0 for v in svc.flush_health()["targets"].values()):
+                break
+
+    def cycle(self):
+        t0 = time.monotonic()
+        rec = {}
+        try:
+            out = self.svc.run_flush_cycle()
+            res, failed = out["targets"], {}
+        except self.svc.FlushFailed as exc:
+            res, failed = exc.results, exc.errors
+        for t in ("responses", "users"):
+            rec[t] = "ok" if t in res else "FAILED"
+            rec[f"items_{t}"] = res.get(t, {}).get("items")
+            rec[f"attempts_{t}"] = res.get(t, {}).get("attempts")
+        rec["seconds"] = round(time.monotonic() - t0, 1)
+        rec["failed"] = failed
+        self.cycles.append(rec)
+
+
 def expected_rows(svc, calls):
     """Per SessionID and per users uuid: each column's value from the LAST call carrying it."""
     import config
@@ -399,6 +476,23 @@ def report(client, svc, variant, runner, calls, prior, rd, us, billed, statement
         "item_ms_p95": sorted(ms)[int(0.95 * (len(ms) - 1))] if ms else None,
         "dev_tables": [rd, us],
     }
+    if isinstance(runner, LiveRunner):
+        import config as cfg
+        secs = [c["seconds"] for c in runner.cycles]
+        dead = list(client.query(f"SELECT COUNT(*) n FROM `{cfg.DEAD_LETTER_TABLE}`").result())[0]["n"]
+        health = svc.flush_health()
+        out["items_failed_after_all_attempts"] += dead + sum(t["backlog_calls"] for t in health["targets"].values())
+        out["live"] = {
+            "speed": runner.speed, "flush_bucket_s": cfg.FLUSH_BUCKET_S, "flush_safety_s": cfg.FLUSH_SAFETY_S,
+            "posting_seconds": round(runner.posting_seconds, 1), "cycles": len(runner.cycles),
+            "cycle_seconds_p50": statistics.median(secs) if secs else None, "cycle_seconds_max": max(secs) if secs else None,
+            "cycles_failed": {t: sum(1 for c in runner.cycles if c[t] != "ok") for t in ("responses", "users")},
+            "max_attempts": {t: max((c[f"attempts_{t}"] or 0) for c in runner.cycles) if runner.cycles else None
+                             for t in ("responses", "users")},
+            "dead_letters": dead, "backlog_at_end": {t: v["backlog_calls"] for t, v in health["targets"].items()},
+            "health_at_end": health["status"],
+            "failures_seen": [c["failed"] for c in runner.cycles if c["failed"]][:5],
+        }
     if isinstance(runner, StagedRunner):
         secs = [f["seconds"] for f in runner.flushes if f["items"]]
         out["staged"] = {
@@ -437,7 +531,7 @@ def main_():
 
     variants = [v.strip() for v in args.variants.split(",") if v.strip()]
     for v in variants:
-        if v not in ("concurrent", "per_session", "staged"):
+        if v not in ("concurrent", "per_session", "staged", "live"):
             raise SystemExit(f"unknown variant {v}")
     svc = None
     for variant in variants:
@@ -454,29 +548,50 @@ def main_():
         seeded_rows = {r["SessionID"]: r["n"] for r in client.query(
             f"SELECT SessionID, COUNT(*) n FROM `{rd}` GROUP BY 1").result()}
         jobs.jobs.clear()
-        if variant == "staged":
-            runner = StagedRunner(svc, args.flush_interval)
-        else:
-            runner = Runner(svc, args.workers, args.max_attempts, per_session=(variant == "per_session"))
-        runner.run(calls, start, args.speed)
-        billed = sum((j.total_bytes_billed or 0) for j in jobs.jobs)
-        statements = len(jobs.jobs)
-        errored = Counter()
-        for j in jobs.jobs:
-            if j.error_result:
-                tbl = "users" if str(j.destination or "").endswith("_users") or "_users`" in j.query else "response_data"
-                errored[f"{tbl}: {j.error_result.get('message', '')[:60]}"] += 1
-        out = report(client, svc, variant, runner, calls, prior, rd, us, billed, statements,
-                     [args.start, args.end], seeded_rows, dict(errored))
-        path = f"replay_report_{variant}_{run}.json"
-        with open(path, "w") as f:
-            json.dump(out, f, indent=2, default=str)
-        print(json.dumps({k: v for k, v in out.items() if k not in ("mismatch_examples",)}, indent=2, default=str))
-        print(f"report: {path}")
-        if not args.keep:
-            client.delete_table(rd)
-            client.delete_table(us)
-            print(f"dropped {rd} and {us}")
+        live_tables = []
+        try:
+            if variant == "live":
+                import config
+                from staged_ddl import ddl, dry_run
+                prefix = f"adb_replay_live_{run}_"
+                stmts = ddl("DEV", prefix)
+                bad = dry_run(client, [x for x in stmts if x.startswith("CREATE")])
+                if bad:
+                    raise SystemExit("DDL does not validate: " + "; ".join(bad))
+                for x in stmts:
+                    client.query(x).result()
+                live_tables = [f"{PROJECT}.DEV.{prefix}{n}" for n in ("staging", "dead_letter", "flush_log", "flush_state")]
+                config.STAGING_TABLE, config.DEAD_LETTER_TABLE, config.FLUSH_LOG_TABLE, config.FLUSH_STATE_TABLE = live_tables
+                config.STAGED_TARGETS = {"users", "responses"}
+                config.FLUSH_BUCKET_S = max(1, round(30 / args.speed))
+                config.FLUSH_SAFETY_S = max(1, round(20 / args.speed))
+                svc.enqueue_flush = lambda *a: None       # the replay flushes on its own timer; nothing goes to Cloud Tasks
+                svc._last_kicked_bucket = None
+                runner = LiveRunner(svc, config, args.speed)
+            elif variant == "staged":
+                runner = StagedRunner(svc, args.flush_interval)
+            else:
+                runner = Runner(svc, args.workers, args.max_attempts, per_session=(variant == "per_session"))
+            runner.run(calls, start, args.speed)
+            billed = sum((getattr(j, "total_bytes_billed", 0) or 0) for j in jobs.jobs)
+            statements = len(jobs.jobs)
+            errored = Counter()
+            for j in jobs.jobs:
+                if getattr(j, "error_result", None):
+                    tbl = "users" if str(j.destination or "").endswith("_users") or "_users`" in j.query else "response_data"
+                    errored[f"{tbl}: {j.error_result.get('message', '')[:60]}"] += 1
+            out = report(client, svc, variant, runner, calls, prior, rd, us, billed, statements,
+                         [args.start, args.end], seeded_rows, dict(errored))
+            path = f"replay_report_{variant}_{run}.json"
+            with open(path, "w") as f:
+                json.dump(out, f, indent=2, default=str)
+            print(json.dumps({k: v for k, v in out.items() if k not in ("mismatch_examples",)}, indent=2, default=str))
+            print(f"report: {path}")
+        finally:
+            if not args.keep:
+                for t in [rd, us] + live_tables:
+                    client.delete_table(t, not_found_ok=True)
+                print(f"dropped {rd}, {us}" + (" and the staging tables" if live_tables else ""))
 
 
 if __name__ == "__main__":

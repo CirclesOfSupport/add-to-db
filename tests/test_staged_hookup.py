@@ -270,3 +270,18 @@ def test_flush_endpoint_returns_500_for_a_retry(staged):
 def test_nothing_to_flush_is_a_noop(staged):
     out = staged.run_flush_cycle(now=T0)
     assert out["status"] in ("ok", "noop") and resp_rows(staged) == []
+
+
+def test_retry_lines_carry_the_whole_reason(staged, caplog):
+    stage(staged, [("users", {"uuid": UUID})], T0)
+    staged.fake.fail_in_script.append("RESPONSES.users")
+    with caplog.at_level(logging.WARNING):
+        staged.run_flush_cycle(now=T0 + timedelta(seconds=60))
+    line = next(r.getMessage() for r in caplog.records if "contended" in r.getMessage())
+    assert line.endswith("Reason: Transaction is aborted due to concurrent update")
+
+
+def test_flush_kick_requests_the_current_bucket(staged):
+    r = staged.app.test_client().post("/tasks/flush-kick")
+    assert r.status_code == 200 and len(staged.kicks) == 1
+    assert r.get_json()["bucket"] == staged.kicks[0][0]

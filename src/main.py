@@ -838,6 +838,13 @@ _RETRYABLE = ("concurrent update", "could not serialize", "transaction is aborte
               "internal error", "timed out", "deadline exceeded", "503", "500")
 
 
+def _reason(exc: Exception) -> str:
+    """The whole BigQuery reason on one line (job id included when the client gives one)."""
+    text = " ".join(str(exc).split())
+    job_id = getattr(getattr(exc, "response", None), "job_id", None) or getattr(exc, "job_id", None)
+    return f"{text} [job {job_id}]" if job_id else text
+
+
 def _is_retryable(exc: Exception) -> bool:
     text = str(exc).lower()
     return any(k in text for k in _RETRYABLE)
@@ -882,7 +889,7 @@ def _record_flush_failure(target, flush_id, started, watermark, cutoff, items, a
             bigquery.ScalarQueryParameter("b", "TIMESTAMP", cutoff),
             bigquery.ScalarQueryParameter("n", "INT64", items),
             bigquery.ScalarQueryParameter("k", "INT64", attempts),
-            bigquery.ScalarQueryParameter("e", "STRING", str(error)[:4000])])).result()
+            bigquery.ScalarQueryParameter("e", "STRING", _reason(error)[:4000])])).result()
 
 
 def consecutive_flush_failures(target: str) -> int:
@@ -975,8 +982,8 @@ def flush_target(target: str, now=None, budget_s: float | None = None) -> dict:
         except Exception as exc:
             delay = random_module.uniform(0, min(config.FLUSH_BACKOFF_CAP_S, config.FLUSH_BACKOFF_BASE_S * 2 ** (attempt - 1)))
             if _is_retryable(exc) and time_module.monotonic() + delay < deadline:
-                app.logger.warning("flush %s: attempt %s contended (%s); retrying in %.1f s",
-                                   target, attempt, str(exc).splitlines()[0][:200], delay)
+                app.logger.warning("flush %s: attempt %s contended; retrying in %.1f s. Reason: %s",
+                                   target, attempt, delay, _reason(exc))
                 time_module.sleep(delay)
                 continue
             last = exc
@@ -990,9 +997,9 @@ def flush_target(target: str, now=None, budget_s: float | None = None) -> dict:
         failures = None
         app.logger.error("flush %s: could not record the failure: %s", target, log_exc)
     if failures is None or failures >= config.FLUSH_ALERT_AFTER:
-        app.logger.error("FLUSH_ALERT: %s: %s consecutive failed flushes; last error: %s", target, failures, last)
+        app.logger.error("FLUSH_ALERT: %s: %s consecutive failed flushes; last reason: %s", target, failures, _reason(last))
     else:
-        app.logger.warning("flush %s: failed after %s attempts (the queue retries): %s", target, attempt, last)
+        app.logger.warning("flush %s: failed after %s attempts (the queue retries). Reason: %s", target, attempt, _reason(last))
     raise last
 
 
@@ -1009,7 +1016,7 @@ def run_flush_cycle(now=None) -> dict:
             out = flush_target(target, now)
             results[target] = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in out.items()}
         except Exception as exc:
-            errors[target] = str(exc).splitlines()[0][:500]
+            errors[target] = _reason(exc)
     if errors:
         raise FlushFailed(results, errors)
     return {"status": "ok", "targets": results,
@@ -1065,6 +1072,24 @@ def tasks_flush():
         return jsonify({"status": "error", "flushed": exc.results, "failed": exc.errors}), 500
     except Exception as exc:
         return jsonify({"status": "error", "details": str(exc)[:2000]}), 500
+
+
+@app.post("/tasks/flush-kick")
+def tasks_flush_kick():
+    """
+    Safety sweep for a scheduler: request the flush of the current bucket on the flush
+    queue (the same named task a call would create), so a backlog left by an exhausted
+    flush task is picked up even when no new calls arrive. Never flushes inline.
+    """
+    if not is_task_request_authorized(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    now = _dt.now(_tz.utc)
+    bucket = int(now.timestamp()) // config.FLUSH_BUCKET_S
+    try:
+        name = enqueue_flush(bucket, int(now.timestamp()))
+    except Exception as exc:
+        return jsonify({"status": "error", "details": _reason(exc)}), 500
+    return jsonify({"status": "ok", "task": name, "bucket": bucket}), 200
 
 
 @app.get("/health/flush")
