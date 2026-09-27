@@ -285,3 +285,15 @@ def test_flush_kick_requests_the_current_bucket(staged):
     r = staged.app.test_client().post("/tasks/flush-kick")
     assert r.status_code == 200 and len(staged.kicks) == 1
     assert r.get_json()["bucket"] == staged.kicks[0][0]
+
+
+def test_contended_users_gives_up_within_its_short_budget(staged):
+    stage(staged, [("users", {"uuid": UUID}), ("responses", body(CHECKIN, "Yes"))], T0)
+    staged.fake.fail_always.add("RESPONSES.users")
+    start = staged.time_module.monotonic()
+    with pytest.raises(staged.FlushFailed):
+        staged.run_flush_cycle(now=T0 + timedelta(seconds=60))
+    spent = staged.time_module.monotonic() - start          # fake clock: only backoff sleeps advance it
+    assert spent <= config.FLUSH_RETRY_BUDGET_S["users"]
+    assert config.FLUSH_RETRY_BUDGET_S["responses"] > config.FLUSH_RETRY_BUDGET_S["users"]
+    assert len(resp_rows(staged)) == 1

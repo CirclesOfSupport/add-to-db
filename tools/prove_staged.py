@@ -62,8 +62,9 @@ def main_():
         if args.keep:
             print(f"kept DEV tables {prefix}*")
         else:
-            for name in names:
-                client.delete_table(f"{ds}.{prefix}{name}", not_found_ok=True)
+            left = [t.table_id for t in client.list_tables(ds) if t.table_id.startswith(prefix)]
+            for name in set(left) | {f"{prefix}{n}" for n in names}:
+                client.delete_table(f"{ds}.{name}", not_found_ok=True)
             print(f"dropped DEV tables {prefix}*")
 
 
@@ -196,17 +197,21 @@ def _run(args, client, run, prefix, ds, rd, us, statements):
     night = nightly_statements(client)
     print(f"      nightly pattern {night['day']}: {len(night['statements'])} statements replayed "
           f"({', '.join(f'+{x[0]:.0f}s {x[1]} {x[2]} {x[3]} ms' for x in night['statements'])})")
-    for skipped in night["skipped"]:
-        print(f"      not replayed (writes outside users/response_data or uses parameters): {skipped}")
     n_users, n_rd = f"{ds}.{prefix}night_users", f"{ds}.{prefix}night_response_data"
     for clone, src in ((n_users, "users"), (n_rd, "response_data")):
         client.query(f"CREATE TABLE `{clone}` CLONE `{PROJECT}.RESPONSES.{src}` "
                      f"FOR SYSTEM_TIME AS OF TIMESTAMP('{night['as_of']}')").result()
+    mapping = {f"{PROJECT}.RESPONSES.users": n_users, f"{PROJECT}.RESPONSES.response_data": n_rd}
+    for other in night["extra_targets"]:
+        copy = f"{ds}.{prefix}x_{other.split('.')[-1]}"
+        client.query(f"CREATE TABLE `{copy}` LIKE `{other}`").result()
+        mapping[other] = copy
+        print(f"      its write to {other} goes to {copy}")
     config.ALLOWED_TARGETS["users"], config.ALLOWED_TARGETS["responses"] = n_users, n_rd
     svc._SCHEMA_CACHE.clear()
     cycles, staged_n, last_total = run_with_traffic(
         svc, config, post, body, UUID, start_n=100,
-        background=lambda: replay_statements(client, night["statements"], n_users, n_rd, replay_errors_out),
+        background=lambda: replay_statements(client, night["statements"], mapping, replay_errors_out),
         settle_cycles=2)
     replay_errors = replay_errors_out
     resp_fail = [c for c in cycles if c["responses"] != "ok"]
@@ -238,8 +243,11 @@ def _run(args, client, run, prefix, ds, rd, us, statements):
                                       hammer=(hammer, stop), hammer_cycles=3, settle_cycles=2)
     resp_fail = [c for c in cycles_h if c["responses"] != "ok"]
     after = cycles_h[-1]
-    check("6b continuous users writer: check-in rows flush every cycle; users commits once it stops",
-          not resp_fail and after["users"] == "ok" and after["phase"] == "after",
+    longest = max(c["seconds"] for c in cycles_h if c["phase"] == "hammer")
+    limit = config.FLUSH_RETRY_BUDGET_S["users"] + 45
+    check(f"6b continuous users writer: check-in rows flush every cycle, no cycle over {limit:.0f} s "
+          f"(users gives up at its {config.FLUSH_RETRY_BUDGET_S['users']:.0f} s budget); users commits once it stops",
+          not resp_fail and after["users"] == "ok" and after["phase"] == "after" and longest <= limit,
           f"cycles {cycles_h}")
     for c in cycles_h:
         print(f"      cycle {c['n']:>2} {c['phase']:<7}: responses {c['responses']} ({c['attempts_responses']} attempts), "
@@ -261,8 +269,9 @@ def _run(args, client, run, prefix, ds, rd, us, statements):
 def nightly_statements(client) -> dict:
     """
     Last night's writes to users and response_data by the nightly jobs (from the job log), with offsets.
-    Only statements whose every write target is users or response_data and that take no parameters are
-    replayed; the rest are listed as skipped.
+    A statement that also writes another table (the insert-new-contacts transaction also logs to
+    OPS.contacts_sync_diff) is replayed with that write redirected to a DEV copy; query parameters
+    (@run_id) are bound to a placeholder string.
     """
     latest = list(client.query(
         f"SELECT MAX(creation_time) t FROM `{PROJECT}.region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT "
@@ -281,37 +290,41 @@ def nightly_statements(client) -> dict:
             bigquery.ScalarQueryParameter("s", "TIMESTAMP", start),
             bigquery.ScalarQueryParameter("e", "TIMESTAMP", end)])).result())
     targets_re = re.compile(r"(?:INSERT\s+INTO|MERGE(?:\s+INTO)?|UPDATE|DELETE\s+FROM|TRUNCATE\s+TABLE)\s+`([^`]+)`", re.I)
-    keep, skipped, first = [], [], None
+    keep, first, extra = [], None, set()
+    main_tables = {f"{PROJECT}.RESPONSES.users", f"{PROJECT}.RESPONSES.response_data"}
     for j in jobs:
-        targets = {t.split(".")[-1] for t in targets_re.findall(j["query"])}
-        if not targets & {"users", "response_data"}:
+        full = set(targets_re.findall(j["query"]))
+        if not full & main_tables:
             continue
-        label = f"{j['statement_type']} -> {','.join(sorted(targets))}"
-        if targets - {"users", "response_data"} or re.search(r"@\w", j["query"]):
-            skipped.append(label)
-            continue
+        extra |= full - main_tables
         first = first or j["creation_time"]
-        keep.append(((j["creation_time"] - first).total_seconds(), j["statement_type"], ",".join(sorted(targets)),
-                     j["ms"], j["query"]))
+        keep.append(((j["creation_time"] - first).total_seconds(), j["statement_type"],
+                     ",".join(sorted(t.split(".")[-1] for t in full)), j["ms"], j["query"]))
     return {"day": latest.strftime("%Y-%m-%d"), "as_of": (start).strftime("%Y-%m-%d %H:%M:%S+00"),
-            "statements": keep, "skipped": skipped}
+            "statements": keep, "extra_targets": sorted(extra), "skipped": []}
 
 
-def replay_statements(client, statements, n_users, n_rd, errors_out):
+def replay_statements(client, statements, mapping, errors_out):
+    """Run each statement at its offset with every write target mapped to its DEV table."""
+    targets_re = re.compile(r"(?:INSERT\s+INTO|MERGE(?:\s+INTO)?|UPDATE|DELETE\s+FROM|TRUNCATE\s+TABLE)\s+`([^`]+)`", re.I)
     t0 = time.monotonic()
     for offset, kind, target, _ms, sql in statements:
         wait = t0 + offset - time.monotonic()
         if wait > 0:
             time.sleep(wait)
-        text = (sql.replace(f"`{PROJECT}.RESPONSES.users`", f"`{n_users}`")
-                   .replace(f"`{PROJECT}.RESPONSES.response_data`", f"`{n_rd}`"))
-        if f"{PROJECT}.RESPONSES.users`" in text or f"{PROJECT}.RESPONSES.response_data`" in text:
-            errors_out.append(f"{kind} {target}: a production reference survived the rewrite; not run")
+        text = sql
+        for prod, dev in mapping.items():
+            text = text.replace(f"`{prod}`", f"`{dev}`")
+        outside = [t for t in targets_re.findall(text) if not t.startswith(f"{PROJECT}.DEV.")]
+        if outside:
+            errors_out.append(f"{kind} {target}: would write {outside}; not run")
             continue
+        params = [bigquery.ScalarQueryParameter(n, "STRING", "prove_staged")
+                  for n in sorted(set(re.findall(r"@(\w+)", text)))]
         try:
-            client.query(text).result()
+            client.query(text, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
         except Exception as exc:
-            errors_out.append(f"{kind} {target}: {str(exc).splitlines()[0][:200]}")
+            errors_out.append(f"{kind} {target}: {' '.join(str(exc).split())[:300]}")
 
 
 def max_streak(flags) -> int:

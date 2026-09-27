@@ -965,10 +965,10 @@ def _flush_target_once(target: str, now, flush_id: str, started, attempt: int) -
 def flush_target(target: str, now=None, budget_s: float | None = None) -> dict:
     """
     Flush one target, retrying a contended transaction with full-jitter
-    exponential backoff until FLUSH_RETRY_BUDGET_S is spent. A failure here
+    exponential backoff until that target's FLUSH_RETRY_BUDGET_S is spent. A failure here
     never touches another target's calls, watermark or tables.
     """
-    budget = config.FLUSH_RETRY_BUDGET_S if budget_s is None else budget_s
+    budget = config.FLUSH_RETRY_BUDGET_S.get(target, 30.0) if budget_s is None else budget_s
     flush_id = uuid_module.uuid4().hex
     started = _dt.now(_tz.utc)
     deadline = time_module.monotonic() + budget

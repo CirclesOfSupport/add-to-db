@@ -121,7 +121,14 @@ FLUSH_SAFETY_S = int(os.getenv("FLUSH_SAFETY_S", "20"))      # only calls receiv
 FLUSH_MAX_ITEMS = int(os.getenv("FLUSH_MAX_ITEMS", "3000"))
 FLUSH_ALERT_AFTER = int(os.getenv("FLUSH_ALERT_AFTER", "3"))  # consecutive failed flushes before FLUSH_ALERT
 FLUSH_TARGET_ORDER = ["responses", "users"]   # check-in rows first; each target is its own transaction
-FLUSH_RETRY_BUDGET_S = float(os.getenv("FLUSH_RETRY_BUDGET_S", "75"))   # per target per cycle; covers a ~65 s nightly UPDATE
+# Per target, per cycle: how long a contended flush keeps retrying before the cycle moves on
+# (the queue and the next bucket retry it later). responses covers the ~65 s nightly vamc UPDATE
+# on response_data (2026-09-26); users is kept short so a contended users flush cannot hold the
+# single writer -- and with it the next check-in flush -- for long.
+FLUSH_RETRY_BUDGET_S: dict[str, float] = {
+    "responses": float(os.getenv("FLUSH_RETRY_BUDGET_RESPONSES_S", "75")),
+    "users": float(os.getenv("FLUSH_RETRY_BUDGET_USERS_S", "20")),
+}
 FLUSH_BACKOFF_BASE_S = float(os.getenv("FLUSH_BACKOFF_BASE_S", "1"))
 FLUSH_BACKOFF_CAP_S = float(os.getenv("FLUSH_BACKOFF_CAP_S", "15"))
 
