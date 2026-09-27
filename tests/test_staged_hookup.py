@@ -27,15 +27,20 @@ def staged(svc, monkeypatch):
     fake.create(config.DEAD_LETTER_TABLE, [F("recorded_at", "TIMESTAMP"), F("received_at", "TIMESTAMP"),
                                            F("request_id", "STRING"), F("item_index", "INT64"), F("target", "STRING"),
                                            F("stage", "STRING"), F("errors", "STRING"), F("payload", "STRING")])
-    fake.create(config.FLUSH_LOG_TABLE, [F("flush_id", "STRING"), F("started_at", "TIMESTAMP"),
+    fake.create(config.FLUSH_LOG_TABLE, [F("flush_id", "STRING"), F("target", "STRING"), F("started_at", "TIMESTAMP"),
                                          F("finished_at", "TIMESTAMP"), F("from_wm", "TIMESTAMP"),
                                          F("to_wm", "TIMESTAMP"), F("items", "INT64"), F("statements", "INT64"),
-                                         F("dead_letters", "INT64"), F("status", "STRING"), F("error", "STRING")])
+                                         F("dead_letters", "INT64"), F("attempts", "INT64"), F("status", "STRING"),
+                                         F("error", "STRING")])
     fake.create(config.FLUSH_STATE_TABLE, [F("id", "STRING"), F("watermark", "TIMESTAMP"),
                                            F("version", "INT64"), F("updated_at", "TIMESTAMP")])
-    fake.insert_raw(config.FLUSH_STATE_TABLE, {"id": "flush", "watermark": datetime(1970, 1, 1, tzinfo=timezone.utc),
-                                               "version": 0, "updated_at": None})
+    for target in ("responses", "users"):
+        fake.insert_raw(config.FLUSH_STATE_TABLE, {"id": f"flush:{target}", "updated_at": None, "version": 0,
+                                                   "watermark": datetime(1970, 1, 1, tzinfo=timezone.utc)})
     monkeypatch.setattr(config, "STAGED_TARGETS", {"users", "responses"})
+    clock = [0.0]                                  # sleeping advances a fake clock, so retry budgets run out
+    monkeypatch.setattr(svc.time_module, "sleep", lambda secs: clock.__setitem__(0, clock[0] + secs))
+    monkeypatch.setattr(svc.time_module, "monotonic", lambda: clock[0])
     kicks = []
     monkeypatch.setattr(svc, "enqueue_flush", lambda bucket, when: kicks.append((bucket, when)) or f"flush-{bucket}")
     monkeypatch.setattr(svc, "_last_kicked_bucket", None)
@@ -53,8 +58,8 @@ def resp_rows(svc):
     return svc.fake.rows(svc.table("responses"))
 
 
-def state(svc):
-    return svc.fake.rows(config.FLUSH_STATE_TABLE)[0]
+def state(svc, target="responses"):
+    return next(r for r in svc.fake.rows(config.FLUSH_STATE_TABLE) if r["id"] == f"flush:{target}")
 
 
 def test_upsert_stages_both_halves_durably_and_kicks_one_flush(staged):
@@ -106,15 +111,18 @@ def test_flush_writes_last_call_per_session_and_advances_watermark(staged):
     stage(staged, [("users", {"uuid": UUID, "checkInRepliesTotal": "34"}), ("responses", body(CHECKIN, "Yes"))],
           T0 + timedelta(seconds=2))
     out = staged.run_flush_cycle(now=T0 + timedelta(seconds=60))
-    assert out["status"] == "ok" and out["items"] == 4 and out["dead_letters"] == 0
+    assert out["status"] == "ok" and out["items"] == 4
+    assert out["targets"]["responses"]["items"] == 2 and out["targets"]["users"]["items"] == 2
     r = resp_rows(staged)
     assert len(r) == 1 and r[0]["checkinReply"] == "Yes" and r[0]["checkinDateTime"] == CHECKIN_UTC
     u = staged.fake.rows(staged.table("users"))
     assert len(u) == 1 and u[0]["checkinrepliestotal"] == 34
-    assert state(staged)["version"] == 1
-    assert state(staged)["watermark"] == T0 + timedelta(seconds=60 - config.FLUSH_SAFETY_S)
+    for target in ("responses", "users"):
+        assert state(staged, target)["version"] == 1
+        assert state(staged, target)["watermark"] == T0 + timedelta(seconds=60 - config.FLUSH_SAFETY_S)
     log = staged.fake.rows(config.FLUSH_LOG_TABLE)
-    assert [(x["status"], x["items"]) for x in log] == [("ok", 4)]
+    assert sorted((x["target"], x["status"], x["items"], x["attempts"]) for x in log) == [
+        ("responses", "ok", 2, 1), ("users", "ok", 2, 1)]
 
 
 def test_calls_inside_the_safety_window_wait_for_the_next_flush(staged):
@@ -148,62 +156,115 @@ def test_bad_call_is_dead_lettered_inside_the_flush_and_the_rest_written(staged)
     stage(staged, [("responses", body(CHECKIN, "Yes", userWeek="not-a-number"))], T0)
     stage(staged, [("users", {"uuid": UUID, "orgID": "8"})], T0 + timedelta(seconds=1))
     out = staged.run_flush_cycle(now=T0 + timedelta(seconds=60))
-    assert out["dead_letters"] == 1
+    assert out["targets"]["responses"]["dead_letters"] == 1
     dl = staged.fake.rows(config.DEAD_LETTER_TABLE)
     assert len(dl) == 1 and dl[0]["stage"] == "flush" and dl[0]["target"] == "responses" and dl[0]["request_id"]
     assert resp_rows(staged) == [] and len(staged.fake.rows(staged.table("users"))) == 1
 
 
-def test_failed_flush_writes_nothing_keeps_the_calls_and_retry_succeeds(staged):
+def test_contention_is_retried_inside_the_cycle(staged):
     stage(staged, [("users", {"uuid": UUID, "orgID": "8"}), ("responses", body(CHECKIN, "Yes"))], T0)
-    staged.fake.fail_in_script.append("RESPONSES.users")   # the users MERGE collides (e.g. nightly contacts sync)
-    with pytest.raises(RuntimeError):
+    staged.fake.fail_in_script += ["RESPONSES.users", "RESPONSES.users"]      # two collisions, then clear
+    out = staged.run_flush_cycle(now=T0 + timedelta(seconds=60))
+    assert out["targets"]["users"]["attempts"] == 3 and out["targets"]["responses"]["attempts"] == 1
+    assert len(staged.fake.rows(staged.table("users"))) == 1
+    assert [x["status"] for x in staged.fake.rows(config.FLUSH_LOG_TABLE)] == ["ok", "ok"]   # retries are not failures
+
+
+def test_users_contention_never_blocks_check_in_rows(staged):
+    stage(staged, [("users", {"uuid": UUID, "orgID": "8"}), ("responses", body(CHECKIN, "Yes"))], T0)
+    staged.fake.fail_always.add("RESPONSES.users")                           # users contended all cycle
+    with pytest.raises(staged.FlushFailed) as info:
         staged.run_flush_cycle(now=T0 + timedelta(seconds=60))
-    assert resp_rows(staged) == [] and staged.fake.rows(staged.table("users")) == []   # rolled back
-    assert state(staged)["version"] == 0
-    assert [x["status"] for x in staged.fake.rows(config.FLUSH_LOG_TABLE)] == ["failed"]
+    assert "users" in info.value.errors and info.value.results["responses"]["items"] == 1
+    assert len(resp_rows(staged)) == 1 and staged.fake.rows(staged.table("users")) == []
+    assert state(staged, "responses")["version"] == 1 and state(staged, "users")["version"] == 0
+    failed = [x for x in staged.fake.rows(config.FLUSH_LOG_TABLE) if x["status"] == "failed"]
+    assert [(x["target"], x["attempts"] > 1) for x in failed] == [("users", True)]
+    staged.fake.fail_always.clear()                                           # contention over: users catches up
     out = staged.run_flush_cycle(now=T0 + timedelta(seconds=90))
-    assert out["items"] == 2 and len(resp_rows(staged)) == 1
+    assert out["targets"]["users"]["items"] == 1 and len(staged.fake.rows(staged.table("users"))) == 1
+
+
+def test_failed_target_writes_nothing_and_keeps_its_calls(staged):
+    stage(staged, [("users", {"uuid": UUID, "orgID": "8"})], T0)
+    staged.fake.fail_always.add("RESPONSES.users")
+    with pytest.raises(staged.FlushFailed):
+        staged.run_flush_cycle(now=T0 + timedelta(seconds=60))
+    assert staged.fake.rows(staged.table("users")) == []                      # rolled back
+    assert staged.fake.rows(config.DEAD_LETTER_TABLE) == []
+    staged.fake.fail_always.clear()
+    assert staged.run_flush_cycle(now=T0 + timedelta(seconds=90))["targets"]["users"]["items"] == 1
+
+
+def test_non_retryable_error_is_not_retried(staged, monkeypatch):
+    stage(staged, [("responses", body(CHECKIN, "Yes"))], T0)
+    calls = []
+
+    def broken(*a, **k):
+        calls.append(1)
+        raise ValueError("Syntax error: unexpected keyword")
+    monkeypatch.setattr(staged, "_flush_target_once", broken)
+    with pytest.raises(staged.FlushFailed):
+        staged.run_flush_cycle(now=T0 + timedelta(seconds=60))
+    assert len(calls) == 2                                                    # once per target, no retries
 
 
 def test_a_second_writer_cannot_commit(staged, monkeypatch):
     stage(staged, [("responses", body(CHECKIN, "Yes"))], T0)
-    staged.run_flush_cycle(now=T0 + timedelta(seconds=60))            # version -> 1
+    staged.run_flush_cycle(now=T0 + timedelta(seconds=60))                   # responses version -> 1
     stage(staged, [("responses", body(CHECKIN, "No"))], T0 + timedelta(seconds=45))
-    stale_state = {"watermark": T0 + timedelta(seconds=40), "version": 0}  # what a slow writer read earlier
-    monkeypatch.setattr(staged, "_read_flush_state", lambda: dict(stale_state))
-    with pytest.raises(RuntimeError, match="Assertion failed"):
-        staged.run_flush_cycle(now=T0 + timedelta(seconds=90))
-    assert resp_rows(staged)[0]["checkinReply"] == "Yes"               # its writes rolled back
+    real = staged._read_flush_state
+    reads = []
+
+    def stale_once(target):                  # a slow writer: its first read predates the other commit
+        reads.append(target)
+        if target == "responses" and reads.count("responses") == 1:
+            return {"watermark": T0 + timedelta(seconds=40), "version": 0}
+        return real(target)
+    monkeypatch.setattr(staged, "_read_flush_state", stale_once)
+    out = staged.run_flush_cycle(now=T0 + timedelta(seconds=90))
+    assert out["targets"]["responses"]["attempts"] == 2                     # the stale attempt aborted, retry committed
+    r = resp_rows(staged)
+    assert len(r) == 1 and r[0]["checkinReply"] == "No"
 
 
-def test_alert_after_repeated_failures_and_health(staged, caplog):
-    stage(staged, [("users", {"uuid": UUID})], T0)
+def test_health_ok_when_clean_alert_only_while_failing(staged, caplog):
+    stage(staged, [("users", {"uuid": UUID}), ("responses", body(CHECKIN, "Yes"))], T0)
+    staged.run_flush_cycle(now=datetime.now(timezone.utc) + timedelta(seconds=60))
+    h = staged.flush_health()
+    assert h["status"] == "ok", h
+    stage(staged, [("users", {"uuid": UUID, "orgID": "9"})], datetime.now(timezone.utc) + timedelta(seconds=61))
+    staged.fake.fail_always.add("RESPONSES.users")
     for i in range(config.FLUSH_ALERT_AFTER):
-        staged.fake.fail_in_script.append("RESPONSES.users")
-        with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError):
-            staged.run_flush_cycle(now=T0 + timedelta(seconds=60 + i))
+        with caplog.at_level(logging.WARNING), pytest.raises(staged.FlushFailed):
+            staged.run_flush_cycle(now=datetime.now(timezone.utc) + timedelta(seconds=120 + i))
     assert any("FLUSH_ALERT" in r.message for r in caplog.records)
     h = staged.flush_health()
-    assert h["status"] == "alert" and h["consecutive_failed_flushes"] == config.FLUSH_ALERT_AFTER
-    assert h["backlog_calls"] == 1
-    staged.run_flush_cycle(now=T0 + timedelta(seconds=120))
+    assert h["status"] == "alert" and h["targets"]["users"]["status"] == "alert"
+    assert h["targets"]["responses"]["status"] == "ok"
+    assert h["targets"]["users"]["consecutive_failed_flushes"] == config.FLUSH_ALERT_AFTER
+    staged.fake.fail_always.clear()
+    staged.run_flush_cycle(now=datetime.now(timezone.utc) + timedelta(seconds=200))
     h = staged.flush_health()
-    assert h["consecutive_failed_flushes"] == 0 and h["backlog_calls"] == 0
+    assert h["status"] == "ok", h
+    assert h["targets"]["users"]["consecutive_failed_flushes"] == 0 and h["targets"]["users"]["backlog_calls"] == 0
 
 
 def test_health_sees_a_call_that_arrived_after_its_flush(staged):
     stage(staged, [("users", {"uuid": UUID})], T0)
     staged.run_flush_cycle(now=T0 + timedelta(seconds=60))
     stage(staged, [("users", {"uuid": UUID, "orgID": "9"})], T0 + timedelta(seconds=10))   # late, inside the flushed range
-    assert staged.flush_health()["flushes_with_late_calls_24h"] == 1
+    h = staged.flush_health()
+    assert h["targets"]["users"]["flushes_with_late_calls_24h"] == 1 and h["status"] == "alert"
+    assert h["targets"]["responses"]["flushes_with_late_calls_24h"] == 0
 
 
 def test_flush_endpoint_returns_500_for_a_retry(staged):
     stage(staged, [("users", {"uuid": UUID})], T0)
-    staged.fake.fail_in_script.append("RESPONSES.users")
+    staged.fake.fail_always.add("RESPONSES.users")
     r = staged.app.test_client().post("/tasks/flush")
-    assert r.status_code == 500
+    assert r.status_code == 500 and "users" in r.get_json()["failed"]
 
 
 def test_nothing_to_flush_is_a_noop(staged):

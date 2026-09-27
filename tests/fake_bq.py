@@ -80,6 +80,7 @@ class FakeClient:
     duck: duckdb.DuckDBPyConnection = field(default_factory=lambda: _utc_duck())
     fail_next: list = field(default_factory=list)    # exceptions to raise on the next query calls
     fail_in_script: list = field(default_factory=list)  # substrings: the script statement containing it fails
+    fail_always: set = field(default_factory=set)       # substrings: fail every time while present
     streamed: list = field(default_factory=list)      # rows appended with insert_rows_json
 
     # --- table management -------------------------------------------------
@@ -169,6 +170,8 @@ class FakeClient:
                     if last_count != 1:
                         raise RuntimeError("Assertion failed: " + part)
                     continue
+                if any(pat in part for pat in self.fail_always):
+                    raise RuntimeError("Transaction is aborted due to concurrent update against table")
                 if self.fail_in_script and self.fail_in_script[0] in part:
                     self.fail_in_script.pop(0)
                     raise RuntimeError("Transaction is aborted due to concurrent update")

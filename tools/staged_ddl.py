@@ -29,15 +29,16 @@ OPTIONS (partition_expiration_days = 30,
 PARTITION BY DATE(recorded_at)
 OPTIONS (description = 'add-to-db: calls that failed validation (stage upsert) or pre-flight at flush (stage flush).')""",
         f"""CREATE TABLE {t('flush_log')} (
-  flush_id STRING, started_at TIMESTAMP, finished_at TIMESTAMP, from_wm TIMESTAMP, to_wm TIMESTAMP,
-  items INT64, statements INT64, dead_letters INT64, status STRING, error STRING)
+  flush_id STRING, target STRING, started_at TIMESTAMP, finished_at TIMESTAMP, from_wm TIMESTAMP, to_wm TIMESTAMP,
+  items INT64, statements INT64, dead_letters INT64, attempts INT64, status STRING, error STRING)
 PARTITION BY DATE(started_at)
-OPTIONS (description = 'add-to-db: one row per flush attempt (ok rows are written in the flush transaction).')""",
+OPTIONS (description = 'add-to-db: one row per target per flush (ok rows are written in the flush transaction).')""",
         f"""CREATE TABLE {t('flush_state')} (
   id STRING NOT NULL, watermark TIMESTAMP NOT NULL, version INT64 NOT NULL, updated_at TIMESTAMP)
-OPTIONS (description = 'add-to-db: watermark of the single writer (compare-and-set on version).')""",
+OPTIONS (description = 'add-to-db: one watermark per target for the single writer (compare-and-set on version).')""",
         f"""INSERT INTO {t('flush_state')} (id, watermark, version, updated_at)
-VALUES ('flush', CURRENT_TIMESTAMP(), 0, CURRENT_TIMESTAMP())""",
+VALUES ('flush:responses', CURRENT_TIMESTAMP(), 0, CURRENT_TIMESTAMP()),
+       ('flush:users', CURRENT_TIMESTAMP(), 0, CURRENT_TIMESTAMP())""",
     ]
 
 
