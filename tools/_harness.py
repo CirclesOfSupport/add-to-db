@@ -22,6 +22,7 @@ from google.auth import credentials as ga_credentials  # noqa: E402
 from google.cloud import bigquery  # noqa: E402
 
 PROJECT = "early-alert-responses"
+RESUMABLE_HINT = False   # a resumable tool sets this so the sign-in message says it resumes
 
 
 class GcloudCliCredentials(ga_credentials.Credentials):
@@ -37,7 +38,15 @@ class GcloudCliCredentials(ga_credentials.Credentials):
     def refresh(self, request):
         with self._lock:
             out = subprocess.run([self._gcloud, "auth", "print-access-token"],
-                                 capture_output=True, text=True, check=True)
+                                 capture_output=True, text=True)
+            if out.returncode != 0:
+                detail = (out.stderr or "").strip().splitlines()
+                raise SystemExit(
+                    "\ngcloud could not refresh the access token (the sign-in has probably expired).\n"
+                    "Run:  gcloud auth login\n"
+                    "then run the same command again"
+                    + (" (it resumes where it stopped)." if RESUMABLE_HINT else ".")
+                    + (f"\ngcloud said: {detail[-1]}" if detail else ""))
             self.token = out.stdout.strip()
             self.expiry = (datetime.now(timezone.utc) + timedelta(minutes=45)).replace(tzinfo=None)
 

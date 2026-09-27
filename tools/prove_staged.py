@@ -27,7 +27,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from _harness import PROJECT, JobLog, load_service, make_client, stamp
-from staged_ddl import ddl
+from staged_ddl import ddl, dry_run
 
 from google.cloud import bigquery
 
@@ -46,9 +46,32 @@ def main_():
     prefix = f"adb_proof_{run}_"
     ds = f"{PROJECT}.DEV"
     rd, us = f"{ds}.{prefix}response_data", f"{ds}.{prefix}users"
+    statements = ddl("DEV", prefix)
+    creates = [s_ for s_ in statements if s_.startswith("CREATE")]
+    failed = dry_run(client, creates)          # BigQuery validates the DDL before anything is created
+    if failed:
+        raise SystemExit("DDL does not validate on BigQuery (nothing was created):\n  " + "\n  ".join(failed))
+    print(f"DDL: {len(creates)} of {len(creates)} CREATE statements valid on BigQuery")
+    names = ("response_data", "users", "staging", "dead_letter", "flush_log", "flush_state")
+    try:
+        _run(args, client, run, prefix, ds, rd, us, statements)
+    finally:
+        if args.keep:
+            print(f"kept DEV tables {prefix}*")
+        else:
+            for name in names:
+                client.delete_table(f"{ds}.{prefix}{name}", not_found_ok=True)
+            print(f"dropped DEV tables {prefix}*")
+
+
+def _run(args, client, run, prefix, ds, rd, us, statements):
     client.query(f"CREATE TABLE `{rd}` LIKE `{PROJECT}.RESPONSES.response_data`").result()
     client.query(f"CREATE TABLE `{us}` LIKE `{PROJECT}.RESPONSES.users`").result()
-    for stmt in ddl("DEV", prefix):
+    for stmt in statements:
+        if not stmt.startswith("CREATE"):
+            bad = dry_run(client, [stmt])
+            if bad:
+                raise SystemExit("DDL INSERT does not validate: " + bad[0])
         client.query(stmt).result()
     print(f"DEV tables: {prefix}*")
 
@@ -199,15 +222,10 @@ def main_():
           h["backlog_calls"] == 0 and h["dead_letters_24h"] >= 1 and h["consecutive_failed_flushes"] == 0, h)
 
     print()
-    if args.keep:
-        print(f"kept DEV tables {prefix}*")
-    else:
-        for name in ("response_data", "users", "staging", "dead_letter", "flush_log", "flush_state"):
-            client.delete_table(f"{ds}.{prefix}{name}", not_found_ok=True)
-        print(f"dropped DEV tables {prefix}*")
     failed = sum(1 for _, ok, _ in results if not ok)
     print(f"{len(results) - failed} of {len(results)} scenarios passed")
-    sys.exit(1 if failed else 0)
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

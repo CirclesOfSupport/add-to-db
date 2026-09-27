@@ -7,7 +7,12 @@ its own SessionID (within 5 s) and not that time in UTC. Its checkinDateTime
 moves to UTC by the SessionID's own offset. checkinReplyDateTime and
 resourceOfferReplyDatetime move only when the stored value equals the LOCAL
 form of a value some logged call carried for that session and not the UTC
-form (otherwise they are left as they are, and the list says why).
+form, or -- when no logged call carries the column -- when the stored value is
+earlier than the corrected check-in time but its UTC form is not (a reply
+cannot precede its check-in, so only the local reading is possible).
+Otherwise they are left as they are, and the list says why. Each row is also
+marked with whether its session appears in add-to-db's own logged request
+bodies (the log starts 2026-08-25).
 
 Three steps, each run on purpose:
 
@@ -64,12 +69,16 @@ def parse_aware(text):
 
 
 def logged_values(client, sessions):
-    """{(SessionID, column): {(local naive, utc naive)}} from every logged call body since 2026-08-24."""
+    """
+    ({(SessionID, column): {(local naive, utc naive)}}, {SessionIDs seen in add-to-db's own bodies})
+    from every logged call body since 2026-08-24.
+    """
     uuids = sorted({s[:36] for s in sessions})
     sql = (f"SELECT request_body FROM `{LOG}` WHERE fired_at >= TIMESTAMP('2026-08-24') "
            f"AND REGEXP_CONTAINS(request_body, @pat)")
     pat = "|".join(re.escape(u) for u in uuids)
     out = defaultdict(set)
+    in_addtodb = set()
     cfg = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("pat", "STRING", pat)])
     for r in client.query(sql, job_config=cfg).result():
         try:
@@ -78,33 +87,38 @@ def logged_values(client, sessions):
             continue
         datas = []
         if isinstance(body.get("Responses"), dict):
-            datas.append(body["Responses"])
+            datas.append((body["Responses"], False))
         for t in body.get("tables") or []:
             if isinstance(t, dict) and t.get("table") == "responses" and isinstance(t.get("data"), dict):
-                datas.append(t["data"])
+                datas.append((t["data"], True))
         if body.get("table") == "responses" and isinstance(body.get("data"), dict):
-            datas.append(body["data"])
-        for d in datas:
+            datas.append((body["data"], True))
+        for d, addtodb in datas:
             sid = unquote(str(d.get("sessionID") or d.get("SessionID") or ""))
             if sid not in sessions:
                 continue
+            if addtodb:
+                in_addtodb.add(sid)
             for col in REPLY_COLS:
                 v = parse_aware(d.get(col)) if d.get(col) else None
                 if v:
                     out[(sid, col)].add((v.replace(tzinfo=None), v.astimezone(timezone.utc).replace(tzinfo=None)))
-    return out
+    return out, in_addtodb
 
 
 def cmd_list(client):
     rows = [dict(r) for r in client.query(CANDIDATES).result()]
     sessions = {r["SessionID"] for r in rows}
-    logged = logged_values(client, sessions) if rows else {}
+    logged, in_addtodb = logged_values(client, sessions) if rows else ({}, set())
     changes = []
+    summary = defaultdict(int)
     print(f"{len(rows)} rows stored in local time ({len(sessions)} sessions)\n")
     print(f"{'#':>3}  {'SessionID':<70} {'contactType':<11} {'column':<27} {'stored':<27} proposed")
     for i, r in enumerate(rows, 1):
         off = timedelta(minutes=r["offset_min"])
         new = r["checkinDateTime"] - off
+        prov = "in add-to-db bodies" if r["SessionID"] in in_addtodb else "not in logged add-to-db bodies"
+        summary[(r["checkinDateTime"].strftime("%Y-%m"), prov)] += 1
         changes.append({"SessionID": r["SessionID"], "column": "checkinDateTime",
                         "old": r["checkinDateTime"].isoformat(), "new": new.isoformat()})
         print(f"{i:>3}  {r['SessionID']:<70} {str(r['contactType']):<11} {'checkinDateTime':<27} "
@@ -115,12 +129,17 @@ def cmd_list(client):
                 continue
             pairs = logged.get((r["SessionID"], col), set())
             locals_, utcs = {p[0] for p in pairs}, {p[1] for p in pairs}
+            target, why = None, None
             if v in locals_ and v not in utcs:
-                target = next(p[1] for p in pairs if p[0] == v)
+                target, why = next(p[1] for p in pairs if p[0] == v), "local form of a logged value"
+            elif not pairs and v < new <= v - off:
+                target, why = v - off, "before the check-in unless read as local"
+            if target is not None:
                 changes.append({"SessionID": r["SessionID"], "column": col, "old": v.isoformat(), "new": target.isoformat()})
-                print(f"{'':>3}  {'':<70} {'':<11} {col:<27} {v.isoformat():<27} {target.isoformat()}")
+                print(f"{'':>3}  {'':<70} {'':<11} {col:<27} {v.isoformat():<27} {target.isoformat()}  ({why})")
             else:
-                why = "matches a logged UTC value" if v in utcs else "no logged call carries it"
+                why = ("matches a logged UTC value" if v in utcs else
+                       "logged values do not match it" if pairs else "no logged value; consistent either way")
                 print(f"{'':>3}  {'':<70} {'':<11} {col:<27} {v.isoformat():<27} unchanged ({why})")
     # a change applies to every row holding (SessionID, column, old): count them
     counts = defaultdict(int)
@@ -128,6 +147,9 @@ def cmd_list(client):
         counts[(c["SessionID"], c["column"], c["old"])] += 1
     plan = [dict(c, rows=n) for c, n in ((c, counts[(c["SessionID"], c["column"], c["old"])]) for c in changes)]
     uniq = {(c["SessionID"], c["column"], c["old"]): c for c in plan}
+    print("\nrows by check-in month and provenance:")
+    for (month, prov), n in sorted(summary.items()):
+        print(f"  {month}  {prov:<32} {n:>5}")
     path = f"eastern_fix_plan_{stamp()}.json"
     with open(path, "w") as f:
         json.dump({"table": TABLE, "changes": list(uniq.values())}, f, indent=2)

@@ -206,3 +206,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 replay_report_*.json
+regress_progress_*.json
+regress_done_*.json
+eastern_fix_plan_*.json
