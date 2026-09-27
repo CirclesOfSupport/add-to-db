@@ -32,6 +32,15 @@ ALLOWED_TARGETS: dict[str, str] = {
     "responses_copy": f"{PROJECT_ID}.COPY.response_data",
 }
 
+# Staging deployments only: TARGET_TABLES="responses=<project.dataset.table>;users=<...>" points
+# those targets at other tables (a DEV copy). Only DEV tables are accepted; unset in production.
+for _pair in filter(None, os.getenv("TARGET_TABLES", "").split(";")):
+    _target, _, _table = _pair.partition("=")
+    _target, _table = _target.strip(), _table.strip()
+    if _target not in ALLOWED_TARGETS or not _table.startswith(f"{PROJECT_ID}.DEV."):
+        raise RuntimeError(f"TARGET_TABLES: '{_pair}' must name a known target and a {PROJECT_ID}.DEV table")
+    ALLOWED_TARGETS[_target] = _table
+
 UPSERT_KEYS: dict[str, list[str]] = {
     "users": ["uuid"],
     "responses": ["SessionID"],
