@@ -480,6 +480,16 @@ def report(client, svc, variant, runner, calls, prior, rd, us, billed, statement
         import config as cfg
         secs = [c["seconds"] for c in runner.cycles]
         dead = list(client.query(f"SELECT COUNT(*) n FROM `{cfg.DEAD_LETTER_TABLE}`").result())[0]["n"]
+        # receive -> committed, per call: the flush whose range covered its receive time committed it
+        lat = defaultdict(list)
+        for r in client.query(
+                f"SELECT s.target, s.received_at, l.finished_at FROM `{cfg.STAGING_TABLE}` s "
+                f"JOIN `{cfg.FLUSH_LOG_TABLE}` l ON l.target = s.target AND l.status = 'ok' "
+                f"AND s.received_at > l.from_wm AND s.received_at <= l.to_wm").result():
+            lat[r["target"]].append((r["finished_at"] - r["received_at"]).total_seconds())
+        latency = {t: {"calls": len(v), "p50_s": round(statistics.median(v), 1),
+                       "p95_s": round(sorted(v)[int(0.95 * (len(v) - 1))], 1), "max_s": round(max(v), 1)}
+                   for t, v in lat.items() if v}
         health = svc.flush_health()
         out["items_failed_after_all_attempts"] += dead + sum(t["backlog_calls"] for t in health["targets"].values())
         out["live"] = {
@@ -489,6 +499,7 @@ def report(client, svc, variant, runner, calls, prior, rd, us, billed, statement
             "cycles_failed": {t: sum(1 for c in runner.cycles if c[t] != "ok") for t in ("responses", "users")},
             "max_attempts": {t: max((c[f"attempts_{t}"] or 0) for c in runner.cycles) if runner.cycles else None
                              for t in ("responses", "users")},
+            "receive_to_committed": latency,
             "dead_letters": dead, "backlog_at_end": {t: v["backlog_calls"] for t, v in health["targets"].items()},
             "health_at_end": health["status"],
             "failures_seen": [c["failed"] for c in runner.cycles if c["failed"]][:5],

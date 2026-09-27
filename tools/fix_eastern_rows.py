@@ -17,8 +17,12 @@ bodies (the log starts 2026-08-25).
 Three steps, each run on purpose:
 
     python tools/fix_eastern_rows.py list
-        prints every row and every proposed change; writes eastern_fix_plan_<stamp>.json.
+        prints a summary; writes the full list (every row, every proposed change, the reason)
+        to eastern_fix_list_<stamp>.txt and the plan to eastern_fix_plan_<stamp>.json.
         Writes nothing to BigQuery.
+        A reply time that is still before its own check-in after conversion is stale carry-over
+        from an earlier session: its format is converted like the rest, but the change is
+        flagged "stale reply, value to the repair unit" in the list and the plan.
     python tools/fix_eastern_rows.py apply eastern_fix_plan_<stamp>.json
         copies the affected rows to DEV.adb_eastern_fix_backup_<stamp>, then makes every
         change in ONE transaction; each UPDATE only touches a row still holding the old
@@ -106,14 +110,16 @@ def logged_values(client, sessions):
     return out, in_addtodb
 
 
-def cmd_list(client):
+def cmd_list(client, out=None):
     rows = [dict(r) for r in client.query(CANDIDATES).result()]
     sessions = {r["SessionID"] for r in rows}
     logged, in_addtodb = logged_values(client, sessions) if rows else ({}, set())
-    changes = []
-    summary = defaultdict(int)
-    print(f"{len(rows)} rows stored in local time ({len(sessions)} sessions)\n")
-    print(f"{'#':>3}  {'SessionID':<70} {'contactType':<11} {'column':<27} {'stored':<27} proposed")
+    changes, lines = [], []
+    summary, stale_rows = defaultdict(int), 0
+    run = stamp()
+    list_path, plan_path = f"eastern_fix_list_{run}.txt", f"eastern_fix_plan_{run}.json"
+    lines.append(f"{len(rows)} rows stored in local time ({len(sessions)} sessions)\n")
+    lines.append(f"{'#':>4}  {'SessionID':<70} {'contactType':<11} {'column':<27} {'stored':<27} proposed")
     for i, r in enumerate(rows, 1):
         off = timedelta(minutes=r["offset_min"])
         new = r["checkinDateTime"] - off
@@ -121,8 +127,9 @@ def cmd_list(client):
         summary[(r["checkinDateTime"].strftime("%Y-%m"), prov)] += 1
         changes.append({"SessionID": r["SessionID"], "column": "checkinDateTime",
                         "old": r["checkinDateTime"].isoformat(), "new": new.isoformat()})
-        print(f"{i:>3}  {r['SessionID']:<70} {str(r['contactType']):<11} {'checkinDateTime':<27} "
-              f"{r['checkinDateTime'].isoformat():<27} {new.isoformat()}")
+        lines.append(f"{i:>4}  {r['SessionID']:<70} {str(r['contactType']):<11} {'checkinDateTime':<27} "
+                     f"{r['checkinDateTime'].isoformat():<27} {new.isoformat()}")
+        row_stale = False
         for col in REPLY_COLS:
             v = r[col]
             if v is None:
@@ -135,25 +142,39 @@ def cmd_list(client):
             elif not pairs and v < new <= v - off:
                 target, why = v - off, "before the check-in unless read as local"
             if target is not None:
-                changes.append({"SessionID": r["SessionID"], "column": col, "old": v.isoformat(), "new": target.isoformat()})
-                print(f"{'':>3}  {'':<70} {'':<11} {col:<27} {v.isoformat():<27} {target.isoformat()}  ({why})")
+                change = {"SessionID": r["SessionID"], "column": col, "old": v.isoformat(), "new": target.isoformat()}
+                if target < new:        # still before its own check-in once converted: an earlier session's reply
+                    change["flag"] = "stale reply, value to the repair unit"
+                    why += "; STALE REPLY, value to the repair unit"
+                    row_stale = True
+                changes.append(change)
+                lines.append(f"{'':>4}  {'':<70} {'':<11} {col:<27} {v.isoformat():<27} {target.isoformat()}  ({why})")
             else:
                 why = ("matches a logged UTC value" if v in utcs else
                        "logged values do not match it" if pairs else "no logged value; consistent either way")
-                print(f"{'':>3}  {'':<70} {'':<11} {col:<27} {v.isoformat():<27} unchanged ({why})")
-    # a change applies to every row holding (SessionID, column, old): count them
+                if v < r["checkinDateTime"] - off and v in utcs:
+                    why += "; STALE REPLY, value to the repair unit"
+                    row_stale = True
+                lines.append(f"{'':>4}  {'':<70} {'':<11} {col:<27} {v.isoformat():<27} unchanged ({why})")
+        stale_rows += row_stale
     counts = defaultdict(int)
     for c in changes:
         counts[(c["SessionID"], c["column"], c["old"])] += 1
-    plan = [dict(c, rows=n) for c, n in ((c, counts[(c["SessionID"], c["column"], c["old"])]) for c in changes)]
-    uniq = {(c["SessionID"], c["column"], c["old"]): c for c in plan}
-    print("\nrows by check-in month and provenance:")
-    for (month, prov), n in sorted(summary.items()):
-        print(f"  {month}  {prov:<32} {n:>5}")
-    path = f"eastern_fix_plan_{stamp()}.json"
-    with open(path, "w") as f:
+    uniq = {}
+    for c in changes:
+        uniq[(c["SessionID"], c["column"], c["old"])] = dict(c, rows=counts[(c["SessionID"], c["column"], c["old"])])
+    flagged = sum(1 for c in uniq.values() if c.get("flag"))
+    summary_lines = [f"{len(rows)} rows stored in local time ({len(sessions)} sessions)", "",
+                     "rows by check-in month and provenance:"]
+    summary_lines += [f"  {month}  {prov:<32} {n:>5}" for (month, prov), n in sorted(summary.items())]
+    summary_lines += ["", f"{len(uniq)} changes on {len(rows)} rows; {flagged} reply-time changes on {stale_rows} rows are "
+                      f"flagged 'stale reply, value to the repair unit' (format converted, value not trusted)",
+                      f"full list: {list_path}", f"plan:      {plan_path}", "Nothing was written to BigQuery."]
+    with open(list_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines + [""] + summary_lines) + "\n")
+    with open(plan_path, "w") as f:
         json.dump({"table": TABLE, "changes": list(uniq.values())}, f, indent=2)
-    print(f"\n{len(uniq)} changes on {len(rows)} rows; plan written to {path}. Nothing was written to BigQuery.")
+    print("\n".join(summary_lines), file=out)
 
 
 def run_changes(client, changes, forward: bool):

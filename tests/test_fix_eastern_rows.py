@@ -46,3 +46,28 @@ def test_list_proposals(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "2026-05  not in logged add-to-db bodies" in out and "2026-08  in add-to-db bodies" in out
     assert "Nothing was written to BigQuery" in out
+    assert A not in out and B not in out                              # console: summary only
+    listing = next(tmp_path.glob("eastern_fix_list_*.txt")).read_text()
+    assert A in listing and B in listing and "18:00:00" in listing     # full list in the file
+
+
+class _StaleClient(_Client):
+    """A row whose logged reply (from an earlier session) is days before its own check-in."""
+
+    def query(self, sql, job_config=None):
+        if "WITH r AS" in sql:
+            return _Job([{"SessionID": A, "uuid": "a", "contactType": "CheckIn",
+                          "checkinDateTime": datetime(2026, 8, 28, 17, 3, 18), "offset_min": -240,
+                          "checkinReplyDateTime": datetime(2026, 8, 20, 12, 46, 35), "resourceOfferReplyDatetime": None}])
+        body = {"tables": [{"table": "responses", "data": {"sessionID": A, "checkinReplyDateTime": "2026-08-20T12:46:35-04:00"}}]}
+        return _Job([{"request_body": json.dumps(body)}])
+
+
+def test_stale_reply_is_converted_but_flagged(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    F.cmd_list(_StaleClient())
+    plan = json.load(open(next(tmp_path.glob("eastern_fix_plan_*.json"))))
+    reply = next(c for c in plan["changes"] if c["column"] == "checkinReplyDateTime")
+    assert reply["new"] == "2026-08-20T16:46:35" and reply["flag"] == "stale reply, value to the repair unit"
+    assert "flag" not in next(c for c in plan["changes"] if c["column"] == "checkinDateTime")
+    assert "1 reply-time changes on 1 rows are flagged" in capsys.readouterr().out
