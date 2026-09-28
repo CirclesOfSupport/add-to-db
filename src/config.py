@@ -123,7 +123,7 @@ STAGED_TARGETS: set[str] = {t.strip() for t in os.getenv("STAGED_TARGETS", "").s
 # The single writer's own tables live in OPS (operational objects serving backend jobs), never in
 # RESPONSES. An override may point them at DEV (staging deployments and proofs) or OPS, nothing else.
 STAGING_TABLE = os.getenv("STAGING_TABLE", f"{PROJECT_ID}.OPS.adb_staging")
-DEAD_LETTER_TABLE = os.getenv("DEAD_LETTER_TABLE", f"{PROJECT_ID}.OPS.adb_dead_letter")
+DEAD_LETTER_TABLE = os.getenv("DEAD_LETTER_TABLE", f"{PROJECT_ID}.OPS.adb_set_aside")  # calls set aside, not written
 FLUSH_LOG_TABLE = os.getenv("FLUSH_LOG_TABLE", f"{PROJECT_ID}.OPS.adb_flush_log")
 FLUSH_STATE_TABLE = os.getenv("FLUSH_STATE_TABLE", f"{PROJECT_ID}.OPS.adb_flush_state")
 for _name, _table in (("STAGING_TABLE", STAGING_TABLE), ("DEAD_LETTER_TABLE", DEAD_LETTER_TABLE),

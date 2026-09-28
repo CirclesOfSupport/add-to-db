@@ -20,7 +20,7 @@ from __future__ import annotations
 import sys
 
 PROJECT = "early-alert-responses"
-TABLES = ("staging", "dead_letter", "flush_log", "flush_state")
+TABLES = ("staging", "set_aside", "flush_log", "flush_state")
 STATE_IDS = ("flush:responses", "flush:users")
 DATASETS = ("OPS", "DEV")   # OPS = production, DEV = staging and proofs; RESPONSES is refused
 
@@ -29,7 +29,7 @@ REQUIRED_COLUMNS = {
     "staging": {"request_id": ("STRING", "REQUIRED"), "item_index": ("INTEGER", "REQUIRED"),
                 "target": ("STRING", "REQUIRED"), "received_at": ("TIMESTAMP", "REQUIRED"),
                 "payload": ("STRING", "REQUIRED")},
-    "dead_letter": {"recorded_at": ("TIMESTAMP", "NULLABLE"), "received_at": ("TIMESTAMP", "NULLABLE"),
+    "set_aside": {"recorded_at": ("TIMESTAMP", "NULLABLE"), "received_at": ("TIMESTAMP", "NULLABLE"),
                     "request_id": ("STRING", "NULLABLE"), "item_index": ("INTEGER", "NULLABLE"),
                     "target": ("STRING", "NULLABLE"), "stage": ("STRING", "NULLABLE"),
                     "errors": ("STRING", "NULLABLE"), "payload": ("STRING", "NULLABLE")},
@@ -62,7 +62,7 @@ def ddl(dataset: str, prefix: str = "adb_") -> list[str]:
 PARTITION BY DATE(received_at)
 OPTIONS (partition_expiration_days = 30,
   description = 'add-to-db: calls held for the single writer, in receive order. Append-only.')""",
-        f"""CREATE TABLE {t('dead_letter')} (
+        f"""CREATE TABLE {t('set_aside')} (
   recorded_at TIMESTAMP, received_at TIMESTAMP, request_id STRING, item_index INT64,
   target STRING, stage STRING, errors STRING, payload STRING)
 PARTITION BY DATE(recorded_at)
@@ -162,7 +162,7 @@ if __name__ == "__main__":
             print("FAIL", p)
         if problems:
             sys.exit(1)
-        print(f"OK: {PROJECT}.{dataset} has adb_staging, adb_dead_letter, adb_flush_log, adb_flush_state with every "
+        print(f"OK: {PROJECT}.{dataset} has adb_staging, adb_set_aside, adb_flush_log, adb_flush_state with every "
               f"required column, and exactly the state rows {', '.join(STATE_IDS)}, neither paused")
         sys.exit(0)
     print(";\n\n".join(statements) + ";")

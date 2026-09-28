@@ -264,11 +264,11 @@ def test_health_sees_a_call_that_arrived_after_its_flush(staged):
     staged.run_flush_cycle(now=now)
     stage(staged, [("users", {"uuid": UUID, "orgID": "9"})], now - timedelta(seconds=90))   # late, inside the flushed range
     h = staged.flush_health(now=now)
-    assert h["targets"]["users"]["late_calls_not_dead_lettered"] == 1 and h["status"] == "alert"
-    assert h["targets"]["responses"]["late_calls_not_dead_lettered"] == 0
+    assert h["targets"]["users"]["late_calls_not_set_aside"] == 1 and h["status"] == "alert"
+    assert h["targets"]["responses"]["late_calls_not_set_aside"] == 0
     staged.run_flush_cycle(now=now, late_check=True)            # the sweep's flush dead-letters it
     h = staged.flush_health(now=now)
-    assert h["targets"]["users"]["late_calls_not_dead_lettered"] == 0 and h["status"] == "ok", h
+    assert h["targets"]["users"]["late_calls_not_set_aside"] == 0 and h["status"] == "ok", h
 
 
 def test_flush_endpoint_returns_500_for_a_retry(staged):

@@ -138,7 +138,7 @@ def test_consecutive_failed_flushes_alert(staged, caplog):
 def test_a_dead_letter_at_upsert_alerts(staged, caplog):
     with caplog.at_level(logging.WARNING):
         r = staged.app.test_client().post("/upsert", json={"table": "users", "data": {"uuid": UUID, "userWeek": "abc"}})
-    assert r.status_code == 400 and alerts(caplog, "DEAD_LETTER")
+    assert r.status_code == 400 and alerts(caplog, "SET_ASIDE")
 
 
 def test_a_dead_letter_at_flush_alerts(staged, caplog):
@@ -146,7 +146,15 @@ def test_a_dead_letter_at_flush_alerts(staged, caplog):
     stage(staged, [("responses", body(CHECKIN, "Yes", userWeek="not-a-number"))], now - timedelta(seconds=100))
     with caplog.at_level(logging.WARNING):
         staged.run_flush_cycle(now=now)
-    assert alerts(caplog, "DEAD_LETTER") and len(staged.fake.rows(config.DEAD_LETTER_TABLE)) == 1
+    assert alerts(caplog, "SET_ASIDE") and len(staged.fake.rows(config.DEAD_LETTER_TABLE)) == 1
+    # the words read by a person: the alert line and the health field say "set aside", never "dead letter"
+    assert not [x for x in alerts(caplog) if "dead" in x.lower()]
+    h = staged.flush_health(now=now)
+    assert h["set_aside_24h"] == 1 and "dead_letters_24h" not in h
+
+
+def test_the_set_aside_table_is_adb_set_aside():
+    assert config.DEAD_LETTER_TABLE.endswith(".adb_set_aside")
 
 
 def test_an_old_backlog_alerts_from_the_sweep(staged, caplog):

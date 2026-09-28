@@ -571,7 +571,7 @@ def main_():
                     raise SystemExit("DDL does not validate: " + "; ".join(bad))
                 for x in stmts:
                     client.query(x).result()
-                live_tables = [f"{PROJECT}.DEV.{prefix}{n}" for n in ("staging", "dead_letter", "flush_log", "flush_state")]
+                live_tables = [f"{PROJECT}.DEV.{prefix}{n}" for n in ("staging", "set_aside", "flush_log", "flush_state")]
                 config.STAGING_TABLE, config.DEAD_LETTER_TABLE, config.FLUSH_LOG_TABLE, config.FLUSH_STATE_TABLE = live_tables
                 config.STAGED_TARGETS = {"users", "responses"}
                 config.FLUSH_BUCKET_S = max(1, round(30 / args.speed))

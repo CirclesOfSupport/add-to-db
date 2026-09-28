@@ -31,7 +31,7 @@ def test_defaults_are_ops_with_no_env(monkeypatch):
         monkeypatch.delenv(n, raising=False)
     c = _load(monkeypatch, {})
     assert (c.STAGING_TABLE, c.DEAD_LETTER_TABLE, c.FLUSH_LOG_TABLE, c.FLUSH_STATE_TABLE) == (
-        "early-alert-responses.OPS.adb_staging", "early-alert-responses.OPS.adb_dead_letter",
+        "early-alert-responses.OPS.adb_staging", "early-alert-responses.OPS.adb_set_aside",
         "early-alert-responses.OPS.adb_flush_log", "early-alert-responses.OPS.adb_flush_state")
 
 

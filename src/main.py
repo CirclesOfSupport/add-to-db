@@ -464,8 +464,8 @@ def upsert():
                                       "errors": json.dumps(errors, default=str)[:4000],
                                       "payload": json.dumps(data, default=str)}])
             except Exception as exc:
-                raise_alert("DEAD_LETTER", f"{target}: a rejected call (answered 400) could not be recorded "
-                                           f"as a dead letter: {_reason(exc)}")
+                raise_alert("SET_ASIDE", f"{target}: a rejected call (answered 400) could not be set aside: "
+                                         f"{_reason(exc)}")
 
     def staging_failed(exc):
         if isinstance(exc, StagingTooSlow):
@@ -815,8 +815,8 @@ def raise_alert(kind: str, text: str) -> None:
     """
     One log line carrying the token ADB_ALERT. The Cloud Monitoring log-match alert policy on that
     token emails us, so every condition that needs a person goes through here:
-    FLUSH_ALERT (consecutive failed flushes), DEAD_LETTER (any call recorded as a dead letter),
-    LATE (a call that arrived behind its flush; dead-lettered), STAGING (a call answered 500 because
+    FLUSH_ALERT (consecutive failed flushes), SET_ASIDE (any call set aside, not written),
+    LATE (a call that arrived behind its flush; set aside), STAGING (a call answered 500 because
     it could not be staged in time), BACKLOG (unflushed calls older than BACKLOG_ALERT_S while not
     paused), PAUSE (a maintenance pause older than PAUSE_ALERT_S), SWEEP (the sweep's own check failed).
     """
@@ -870,8 +870,8 @@ def record_dead_letters(entries: list[dict]) -> None:
         f"FROM UNNEST(@dl_rows)",
         job_config=bigquery.QueryJobConfig(query_parameters=[_dead_letter_param(entries)])).result()
     for (target, stage), n in sorted(_count_by(entries, ("target", "stage")).items()):
-        raise_alert("LATE" if stage == "late" else "DEAD_LETTER",
-                    f"{n} {target} call(s) recorded as dead letters (stage {stage}); first reason: "
+        raise_alert("LATE" if stage == "late" else "SET_ASIDE",
+                    f"{n} {target} call(s) set aside, not written (stage {stage}); first reason: "
                     f"{next(e['errors'] for e in entries if e['target'] == target and e['stage'] == stage)[:300]}")
 
 
@@ -1077,8 +1077,8 @@ def _flush_target_once(target: str, now, flush_id: str, started, attempt: int) -
     ]
     client.query(";\n".join(script) + ";", job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
     if dead:
-        raise_alert("DEAD_LETTER", f"{len(dead)} {target} call(s) recorded as dead letters at flush {flush_id}; "
-                                   f"first reason: {str(dead[0]['errors'])[:300]}")
+        raise_alert("SET_ASIDE", f"{len(dead)} {target} call(s) set aside, not written, at flush {flush_id}; "
+                                 f"first reason: {str(dead[0]['errors'])[:300]}")
     return {"status": "ok", "items": len(staged), "statements": len(statements), "dead_letters": len(dead),
             "rows": plan["rows"], "keys": plan["keys"], "keyless": plan["keyless"],
             "watermark": watermark, "cutoff": cutoff, "more": more}
@@ -1267,9 +1267,9 @@ def sweep_check(now=None) -> list[str]:
 def flush_health(now=None) -> dict:
     """
     Per staged target: backlog, oldest backlog age, last successful flush, consecutive failed flushes,
-    late calls not yet dead-lettered and the maintenance pause; plus dead letters in 24 h.
+    late calls not yet set aside and the maintenance pause; plus calls set aside in 24 h.
     "alert" while any target has failed FLUSH_ALERT_AFTER times in a row, has a late call not yet
-    dead-lettered, has a backlog older than BACKLOG_ALERT_S while not paused, or has been paused longer
+    set aside, has a backlog older than BACKLOG_ALERT_S while not paused, or has been paused longer
     than PAUSE_ALERT_S; otherwise "paused" while a maintenance pause is set, else "ok".
     """
     q = lambda sql, p=(): list(client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=list(p))).result())
@@ -1296,11 +1296,11 @@ def flush_health(now=None) -> dict:
                            "oldest_backlog_age_s": round(age, 1),
                            "paused_since": state["paused_since"].isoformat() if is_paused else None,
                            "last_ok_flush": last_ok.isoformat() if last_ok else None,
-                           "consecutive_failed_flushes": failures, "late_calls_not_dead_lettered": late}
+                           "consecutive_failed_flushes": failures, "late_calls_not_set_aside": late}
     dead_24h = q(f"SELECT COUNT(*) n FROM {quote_identifier(config.DEAD_LETTER_TABLE)} "
                  f"WHERE recorded_at > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)")[0]["n"]
     return {"status": "alert" if alert else ("paused" if paused else "ok"), "targets": targets,
-            "dead_letters_24h": dead_24h}
+            "set_aside_24h": dead_24h}
 
 
 @app.post("/tasks/flush")

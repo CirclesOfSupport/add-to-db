@@ -60,7 +60,7 @@ def main_():
     if failed:
         raise SystemExit("DDL does not validate on BigQuery (nothing was created):\n  " + "\n  ".join(failed))
     print(f"DDL: {len(creates)} of {len(creates)} CREATE statements valid on BigQuery")
-    names = ("response_data", "users", "staging", "dead_letter", "flush_log", "flush_state",
+    names = ("response_data", "users", "staging", "set_aside", "flush_log", "flush_state",
              "night_users", "night_response_data")
     try:
         _run(args, client, run, prefix, ds, rd, us, statements)
@@ -87,7 +87,7 @@ def _run(args, client, run, prefix, ds, rd, us, statements):
 
     import config
     config.STAGING_TABLE = f"{ds}.{prefix}staging"
-    config.DEAD_LETTER_TABLE = f"{ds}.{prefix}dead_letter"
+    config.DEAD_LETTER_TABLE = f"{ds}.{prefix}set_aside"
     config.FLUSH_LOG_TABLE = f"{ds}.{prefix}flush_log"
     config.FLUSH_STATE_TABLE = f"{ds}.{prefix}flush_state"
     config.STAGED_TARGETS = {"users", "responses"}
@@ -263,7 +263,7 @@ def _run(args, client, run, prefix, ds, rd, us, statements):
     h = svc.flush_health()
     check("7 health ok when nothing is failing",
           h["status"] == "ok" and all(t["consecutive_failed_flushes"] == 0 and t["backlog_calls"] == 0
-                                      for t in h["targets"].values()) and h["dead_letters_24h"] >= 1, h)
+                                      for t in h["targets"].values()) and h["set_aside_24h"] >= 1, h)
 
     # 8. maintenance pause
     st_table = config.FLUSH_STATE_TABLE

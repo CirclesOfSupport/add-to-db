@@ -16,7 +16,7 @@ def test_no_doubled_quotes_inside_string_literals():
 def test_four_tables_and_the_state_row():
     stmts = ddl("DEV", "adb_x_")
     creates = [s for s in stmts if s.startswith("CREATE TABLE")]
-    assert [re.search(r"adb_x_(\w+)`", s).group(1) for s in creates] == ["staging", "dead_letter", "flush_log", "flush_state"]
+    assert [re.search(r"adb_x_(\w+)`", s).group(1) for s in creates] == ["staging", "set_aside", "flush_log", "flush_state"]
     assert stmts[-1].startswith("INSERT INTO `early-alert-responses.DEV.adb_x_flush_state`")
 
 
@@ -76,7 +76,7 @@ class _DdlClient:
 def test_apply_creates_four_tables_and_two_state_rows_and_verifies(capsys):
     c = _DdlClient()
     assert staged_ddl.apply(c, "DEV") == []
-    assert sorted(c.tables) == ["adb_dead_letter", "adb_flush_log", "adb_flush_state", "adb_staging"]
+    assert sorted(c.tables) == ["adb_flush_log", "adb_flush_state", "adb_set_aside", "adb_staging"]
     assert [r["id"] for r in c.state] == ["flush:responses", "flush:users"]
     refs = next(f for f in c.tables["adb_flush_log"] if f.name == "refs")
     assert (refs.field_type, refs.mode) == ("STRING", "REPEATED")
