@@ -93,6 +93,9 @@ Cloud Tasks (rather than, say, a background thread) is used deliberately for two
 | `TASKS_QUEUE` | `add-to-db-writes` | Name of the Cloud Tasks queue that `/ingest`/`/upsert` enqueue onto. |
 | `SERVICE_URL` | *(empty)* | Base URL of this Cloud Run service (e.g. `https://add-to-db-xxxx-ue.a.run.app`). Used both as the Cloud Tasks callback target and as the expected OIDC audience when verifying `/tasks/*` requests. **Must** be set for enqueueing to work. |
 | `TASKS_INVOKER_SERVICE_ACCOUNT` | *(empty)* | Service account email Cloud Tasks signs its OIDC callback token with. `/tasks/*` requests are rejected unless the token's email matches this. **Must** be set for `/tasks/*` to accept any requests. |
+| `TRIAGE_QUEUE` | *(empty)* | Queue for every write to `triage_data` (triage-message-data). Must run at max concurrency 1 and must not be `TASKS_QUEUE`. Empty = triage writes use `TASKS_QUEUE` as before. See "Triage writes on one queue" below. |
+| `TRIAGE_MAX_ATTEMPTS` | `0` | Required when `TRIAGE_QUEUE` is set: the queue's `maxAttempts`. The service refuses to start without it. |
+| `TRIAGE_WAIT_ALERT_S` | `300` | A triage task that starts this many seconds or more after it was queued logs `TRIAGE_ALERT BACKLOG`. |
 
 ---
 
@@ -493,3 +496,26 @@ curl -X POST http://localhost:8080/upsert \
 **Proof tools (real BigQuery, DEV dataset):** `tools/prove_staged.py` runs the single-writer path end to end against DEV copies (staging, flush, stale replies, calls set aside, two writers, a competing writer); `tools/replay_triage_testimonial.py` writes the logged triage and testimonial calls through the live revision's SQL and this branch's worker into DEV copies and compares them row for row; `tools/fix_eastern_rows.py` lists, rehearses on a DEV clone of today's table, applies (one guarded transaction, one UPDATE per column, with a DEV backup; production only with `--production`) and rolls back the correction of rows stored in local time; `tools/prove_unit1.py` runs the `responses` write scenarios against a fresh copy of `response_data` in `DEV` and dry-runs the MERGE against the live table; `tools/replay_webhook_log.py` replays logged check-in calls in-process (not through Cloud Tasks) against DEV copies at queue concurrency and reports ordering, duplicates and failures. Both authenticate as the active `gcloud` account.
 
 **A note on testing the async path locally:** hitting your local `/ingest` or `/upsert` still validates and enqueues a *real* Cloud Tasks task (assuming your ADC has `roles/cloudtasks.enqueuer` on the queue). But `SERVICE_URL` is the callback target Cloud Tasks actually calls — since Cloud Tasks reaches out over the public internet, it can't reach `localhost`. That means the task will always be delivered to the **deployed** Cloud Run service's `/tasks/ingest`/`/tasks/upsert`, not your local process, regardless of which instance enqueued it. To exercise the write logic itself locally, call `/tasks/ingest`/`/tasks/upsert` directly — but note `is_task_request_authorized` requires a real OIDC token whose signer matches `TASKS_INVOKER_SERVICE_ACCOUNT`, so you'll need to mint one (e.g. via `gcloud auth print-identity-token --audiences=$SERVICE_URL --impersonate-service-account=$TASKS_INVOKER_SERVICE_ACCOUNT`) rather than calling it unauthenticated.
+
+
+## Triage writes on one queue
+
+A triage message is written in three calls, all keyed on `message_id`: the message (from Unrecognized
+Message), the triage request (from Initiate Triage Review, sent about 0.1 s before the message) and, later,
+the determination (from Triage Determination). When two of those MERGEs run at the same time, both find no
+row and both insert, so the message is split into a message row and a triage-request row. With
+`TRIAGE_QUEUE` set, every `triage_data` write is queued there instead of on `TASKS_QUEUE`; that queue runs one
+task at a time, so whichever write arrives second finds the first one's row, in any order. The webhook
+still answers `202` as soon as the task is queued.
+
+For tasks from that queue the worker logs one line containing `TRIAGE_ALERT` (its own token, separate from
+`ADB_ALERT`) when a task starts `TRIAGE_WAIT_ALERT_S` or more after it was queued (`BACKLOG`), when the final
+attempt (`TRIAGE_MAX_ATTEMPTS`) fails and the write will never land (`EXHAUSTED`), or when a write was
+acknowledged without landing because it failed validation (`DROPPED`). Alert lines carry the message_id and
+which write it was, never the message text.
+
+Proofs: `tests/test_triage_queue.py` (routing, all six arrival orders, the alerts);
+`python tools/prove_triage_queue.py` on a DEV copy of the table (the six orders one at a time, a control that
+reproduces the split with two concurrent writes, and the same instant through one worker);
+`python tools/check_identity.py` (the check-in path is unchanged from the cutover revision: source, and
+recorded calls replayed through both versions).

@@ -685,7 +685,71 @@ def tasks_upsert():
         return error_response
 
     body, status = perform_upsert(target, data)
+    if from_triage_queue(request.headers):
+        watch_triage_task(target, data, body, status, request.headers)
     return jsonify(body), status
+
+
+def from_triage_queue(headers) -> bool:
+    """True when TRIAGE_QUEUE is set and Cloud Tasks says this task came from it (short name or full path)."""
+    name = (headers.get("X-CloudTasks-QueueName") or "").strip()
+    q = config.TRIAGE_QUEUE
+    return bool(q) and (name == q or name.endswith(f"/queues/{q}"))
+
+
+def raise_triage_alert(kind: str, text: str) -> None:
+    """
+    One log line carrying the token TRIAGE_ALERT -- the triage queue's own token, so its log-match alert
+    policy is separate from ADB_ALERT's. Kinds: BACKLOG (a task started TRIAGE_WAIT_ALERT_S or more after it
+    was queued), EXHAUSTED (the final attempt failed: the write will never land), DROPPED (the write was
+    acknowledged without landing because it failed validation -- a retry cannot fix it).
+    """
+    app.logger.error("TRIAGE_ALERT %s: %s", kind, " ".join(str(text).split()))
+
+
+def triage_part(data: dict) -> str:
+    """Which of a triage message's three writes this is (for the alert line; never the message text)."""
+    if "message" in data or "message_time" in data:
+        return "message"
+    if "triage_request_id" in data:
+        return "triage request"
+    if "determination" in data:
+        return "determination"
+    return "other"
+
+
+def watch_triage_task(target: str, data: dict, body: dict, status: int, headers, now: float | None = None) -> list[str]:
+    """
+    Alerts for one task from the triage queue, read from the Cloud Tasks request headers
+    (X-CloudTasks-TaskETA: the time the task was due, seconds since the epoch; X-CloudTasks-TaskRetryCount:
+    0 on the first attempt). Returns the kinds raised.
+    """
+    raised = []
+    who = f"{target} {triage_part(data)} write, message_id {str(data.get('message_id', ''))[:40]!r}"
+    try:
+        retry_count = int(headers.get("X-CloudTasks-TaskRetryCount") or 0)
+    except ValueError:
+        retry_count = 0
+    attempt = retry_count + 1
+    try:
+        eta = float(headers.get("X-CloudTasks-TaskETA") or "nan")
+    except ValueError:
+        eta = float("nan")
+    waited = (time_module.time() if now is None else now) - eta
+    if retry_count == 0 and waited == waited and waited >= config.TRIAGE_WAIT_ALERT_S:
+        raise_triage_alert("BACKLOG", f"{who} started {waited:.0f} s after it was queued "
+                                      f"(threshold {config.TRIAGE_WAIT_ALERT_S} s)")
+        raised.append("BACKLOG")
+    if status >= 300 and attempt >= config.TRIAGE_MAX_ATTEMPTS:
+        raise_triage_alert("EXHAUSTED", f"{who} failed on its final attempt ({attempt} of "
+                                        f"{config.TRIAGE_MAX_ATTEMPTS}); it will not be retried: "
+                                        f"{body.get('error', '')} {str(body.get('details', ''))[:300]}")
+        raised.append("EXHAUSTED")
+    elif 200 <= status < 300 and body.get("status") == "error":
+        raise_triage_alert("DROPPED", f"{who} was not written and will not be retried: "
+                                      f"{str(body.get('errors', ''))[:300]}")
+        raised.append("DROPPED")
+    return raised
 
 
 def _flush_dead(target: str, error: str, details: str) -> str:

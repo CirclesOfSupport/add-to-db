@@ -180,3 +180,22 @@ STALE_REPLY_FIELDS: dict[str, list[str]] = {
     "responses": ["checkinReply", "checkinReplyText", "checkinReplyNumerical",
                   "checkinReplyDateTime", "checkinReplyDistressed"],
 }
+
+# --- Triage writes on one queue ----------------------------------------------
+# A triage message is written in three calls keyed on message_id -- the message (Unrecognized Message), the
+# triage request (Initiate Triage Review, sent ~0.1 s earlier) and later the determination (Triage
+# Determination). Run concurrently, the first two MERGEs both miss and both INSERT, splitting the message
+# into two rows. With TRIAGE_QUEUE set, every write to these targets goes to that queue, which runs at max
+# concurrency 1: no two of these MERGEs overlap, so whichever part arrives second finds the first's row, in
+# any arrival order. Empty = these targets use TASKS_QUEUE exactly as before.
+SERIALIZED_TARGETS: frozenset[str] = frozenset({"triage_data"})
+TRIAGE_QUEUE = os.getenv("TRIAGE_QUEUE", "").strip()
+# Must equal the queue's maxAttempts: the worker raises TRIAGE_ALERT EXHAUSTED when the final attempt fails.
+TRIAGE_MAX_ATTEMPTS = int(os.getenv("TRIAGE_MAX_ATTEMPTS", "0"))
+# A task that starts this long after it was queued raises TRIAGE_ALERT BACKLOG (the queue is not keeping up).
+TRIAGE_WAIT_ALERT_S = int(os.getenv("TRIAGE_WAIT_ALERT_S", "300"))
+if TRIAGE_QUEUE:
+    if TRIAGE_QUEUE == TASKS_QUEUE:
+        raise RuntimeError("TRIAGE_QUEUE must be its own queue, not TASKS_QUEUE")
+    if TRIAGE_MAX_ATTEMPTS < 1:
+        raise RuntimeError("TRIAGE_QUEUE is set: TRIAGE_MAX_ATTEMPTS must be set to the queue's maxAttempts")

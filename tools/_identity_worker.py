@@ -1,5 +1,5 @@
 """
-Worker for check_triage_identity.py: loads ONE version of the service from a source
+Worker for check_identity.py: loads ONE version of the service from a source
 directory with BigQuery and Cloud Tasks replaced by recorders, sends every recorded
 webhook body through /upsert and each queued item through /tasks/upsert, and writes
 what the service would have sent (SQL text, parameters, responses) as JSON lines.

@@ -14,6 +14,13 @@ def _get_client() -> tasks_v2.CloudTasksClient:
     return _client
 
 
+def queue_for(target: str) -> str:
+    """The queue a write to `target` goes to: TRIAGE_QUEUE for the serialized targets when it is set."""
+    if target in config.SERIALIZED_TARGETS and config.TRIAGE_QUEUE:
+        return config.TRIAGE_QUEUE
+    return config.TASKS_QUEUE
+
+
 def enqueue_write(path: str, target: str, data: dict) -> str:
     """
     Durably enqueues a BigQuery write (insert or upsert) to be performed by
@@ -24,7 +31,7 @@ def enqueue_write(path: str, target: str, data: dict) -> str:
     if this instance dies before the worker request completes).
     """
     client = _get_client()
-    parent = client.queue_path(config.TASKS_PROJECT, config.TASKS_LOCATION, config.TASKS_QUEUE)
+    parent = client.queue_path(config.TASKS_PROJECT, config.TASKS_LOCATION, queue_for(target))
 
     task = tasks_v2.Task(
         http_request=tasks_v2.HttpRequest(
