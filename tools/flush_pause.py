@@ -1,9 +1,11 @@
 """
 Maintenance pause for the single-writer flush (the cutover's switch window).
 
-    python tools/flush_pause.py on     [--dataset RESPONSES|DEV]
-    python tools/flush_pause.py off    [--dataset RESPONSES|DEV]
-    python tools/flush_pause.py status [--dataset RESPONSES|DEV]
+    python tools/flush_pause.py on     [--dataset OPS|DEV]
+    python tools/flush_pause.py off    [--dataset OPS|DEV]
+    python tools/flush_pause.py status [--dataset OPS|DEV]
+
+OPS (the default) is production; DEV is staging and proofs. The single-writer tables are never in RESPONSES.
 
 on:  sets paused_since on both flush-state rows. While it is set the flush writes nothing (a flush
      already under way cannot commit either: its watermark update requires paused_since IS NULL),
@@ -61,7 +63,7 @@ def set_pause(client, table, on: bool, attempts: int = 6) -> None:
 def main_(argv=None, client=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=("on", "off", "status"))
-    ap.add_argument("--dataset", default="RESPONSES", choices=("RESPONSES", "DEV"))
+    ap.add_argument("--dataset", default="OPS", choices=("OPS", "DEV"))
     args = ap.parse_args(argv)
     client = client or make_client()
     table = f"{PROJECT}.{args.dataset}.adb_flush_state"

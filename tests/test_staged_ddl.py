@@ -9,7 +9,7 @@ from staged_ddl import ddl  # noqa: E402
 
 def test_no_doubled_quotes_inside_string_literals():
     # BigQuery reads 'a''b' as two adjacent literals ("concatenated string literals")
-    for stmt in ddl("RESPONSES"):
+    for stmt in ddl("OPS"):
         assert "''" not in stmt, stmt.splitlines()[0]
 
 

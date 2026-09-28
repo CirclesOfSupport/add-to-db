@@ -1,12 +1,15 @@
 """
 DDL for the single-writer tables, and the step that creates and checks them.
 
-    python tools/staged_ddl.py RESPONSES              print the statements (to read them)
-    python tools/staged_ddl.py --dry-run RESPONSES    ask BigQuery to validate every CREATE (writes nothing)
-    python tools/staged_ddl.py --apply RESPONSES      validate, create the four tables and the two state
+    python tools/staged_ddl.py OPS                    print the statements (to read them)
+    python tools/staged_ddl.py --dry-run OPS          ask BigQuery to validate every CREATE (writes nothing)
+    python tools/staged_ddl.py --apply OPS            validate, create the four tables and the two state
                                                       rows, then verify them; exit 0 only if all is right
-    python tools/staged_ddl.py --verify RESPONSES     verify only (read-only): the four tables, their
+    python tools/staged_ddl.py --verify OPS           verify only (read-only): the four tables, their
                                                       columns, and exactly the two state rows
+
+OPS (the default) is production; DEV is staging and proofs. Any other dataset, RESPONSES included, is
+refused: the single-writer tables are operational objects and never live beside the data they write.
 
 --apply runs each statement itself through the BigQuery client (never through a shell argument, so
 there is no line-joining step to get wrong). A table that already exists stops it before anything
@@ -19,6 +22,7 @@ import sys
 PROJECT = "early-alert-responses"
 TABLES = ("staging", "dead_letter", "flush_log", "flush_state")
 STATE_IDS = ("flush:responses", "flush:users")
+DATASETS = ("OPS", "DEV")   # OPS = production, DEV = staging and proofs; RESPONSES is refused
 
 # column -> (type, mode) the flush code relies on; --verify checks each one
 REQUIRED_COLUMNS = {
@@ -42,7 +46,14 @@ REQUIRED_COLUMNS = {
 }
 
 
+def _dataset(dataset: str) -> str:
+    if dataset not in DATASETS:
+        raise ValueError(f"dataset {dataset!r} refused: the single-writer tables go in OPS (production) or DEV")
+    return dataset
+
+
 def ddl(dataset: str, prefix: str = "adb_") -> list[str]:
+    _dataset(dataset)
     t = lambda name: f"`{PROJECT}.{dataset}.{prefix}{name}`"
     return [
         f"""CREATE TABLE {t('staging')} (
@@ -86,6 +97,7 @@ def dry_run(client, statements) -> list[str]:
 
 def verify(client, dataset: str, prefix: str = "adb_") -> list[str]:
     """Read-only: every table and required column present, and exactly the two state rows, unpaused. Returns problems."""
+    _dataset(dataset)
     problems = []
     for name in TABLES:
         table_id = f"{PROJECT}.{dataset}.{prefix}{name}"
@@ -112,6 +124,7 @@ def verify(client, dataset: str, prefix: str = "adb_") -> list[str]:
 
 def apply(client, dataset: str, prefix: str = "adb_", out=print) -> list[str]:
     """Validate, create and verify. Stops at the first failure; never replaces an existing table."""
+    _dataset(dataset)
     statements = ddl(dataset, prefix)
     creates = [s for s in statements if s.startswith("CREATE")]
     failed = dry_run(client, creates)
@@ -129,7 +142,10 @@ def apply(client, dataset: str, prefix: str = "adb_", out=print) -> list[str]:
 
 if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    dataset = args[0] if args else "RESPONSES"
+    dataset = args[0] if args else "OPS"
+    if dataset not in DATASETS:
+        print(f"FAIL dataset {dataset!r} refused: the single-writer tables go in OPS (production) or DEV")
+        sys.exit(2)
     statements = ddl(dataset)
     if "--dry-run" in sys.argv or "--apply" in sys.argv or "--verify" in sys.argv:
         from _harness import make_client

@@ -120,10 +120,16 @@ TYPE_CHECKERS = {
 # the writes) folds everything received up to (now - FLUSH_SAFETY_S) into one
 # MERGE per target. Empty = every target keeps the per-call path.
 STAGED_TARGETS: set[str] = {t.strip() for t in os.getenv("STAGED_TARGETS", "").split(",") if t.strip()}
-STAGING_TABLE = os.getenv("STAGING_TABLE", f"{PROJECT_ID}.RESPONSES.adb_staging")
-DEAD_LETTER_TABLE = os.getenv("DEAD_LETTER_TABLE", f"{PROJECT_ID}.RESPONSES.adb_dead_letter")
-FLUSH_LOG_TABLE = os.getenv("FLUSH_LOG_TABLE", f"{PROJECT_ID}.RESPONSES.adb_flush_log")
-FLUSH_STATE_TABLE = os.getenv("FLUSH_STATE_TABLE", f"{PROJECT_ID}.RESPONSES.adb_flush_state")
+# The single writer's own tables live in OPS (operational objects serving backend jobs), never in
+# RESPONSES. An override may point them at DEV (staging deployments and proofs) or OPS, nothing else.
+STAGING_TABLE = os.getenv("STAGING_TABLE", f"{PROJECT_ID}.OPS.adb_staging")
+DEAD_LETTER_TABLE = os.getenv("DEAD_LETTER_TABLE", f"{PROJECT_ID}.OPS.adb_dead_letter")
+FLUSH_LOG_TABLE = os.getenv("FLUSH_LOG_TABLE", f"{PROJECT_ID}.OPS.adb_flush_log")
+FLUSH_STATE_TABLE = os.getenv("FLUSH_STATE_TABLE", f"{PROJECT_ID}.OPS.adb_flush_state")
+for _name, _table in (("STAGING_TABLE", STAGING_TABLE), ("DEAD_LETTER_TABLE", DEAD_LETTER_TABLE),
+                      ("FLUSH_LOG_TABLE", FLUSH_LOG_TABLE), ("FLUSH_STATE_TABLE", FLUSH_STATE_TABLE)):
+    if not _table.startswith((f"{PROJECT_ID}.OPS.", f"{PROJECT_ID}.DEV.")):
+        raise RuntimeError(f"{_name}: '{_table}' must be a {PROJECT_ID}.OPS or {PROJECT_ID}.DEV table")
 FLUSH_QUEUE = os.getenv("FLUSH_QUEUE", "add-to-db-flush")
 FLUSH_BUCKET_S = int(os.getenv("FLUSH_BUCKET_S", "30"))      # one flush per this many seconds of traffic
 FLUSH_SAFETY_S = int(os.getenv("FLUSH_SAFETY_S", "20"))      # only calls received this long ago are flushed
