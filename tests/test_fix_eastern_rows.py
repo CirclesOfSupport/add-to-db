@@ -71,3 +71,91 @@ def test_stale_reply_is_converted_but_flagged(tmp_path, monkeypatch, capsys):
     assert reply["new"] == "2026-08-20T16:46:35" and reply["flag"] == "stale reply, value to the repair unit"
     assert "flag" not in next(c for c in plan["changes"] if c["column"] == "checkinDateTime")
     assert "1 reply-time changes on 1 rows are flagged" in capsys.readouterr().out
+
+
+# --- the apply: one transaction, set-based, every guard kept (run on the DuckDB stand-in) ---------
+
+import pytest  # noqa: E402
+from google.cloud import bigquery  # noqa: E402
+from fake_bq import FakeClient  # noqa: E402
+
+CLONE = "early-alert-responses.DEV.adb_eastern_rehearsal_x"
+C = "cccccccc-0000-0000-0000-0000000000032026-08-28T13:03:18-04:00"
+
+
+def _table():
+    c = FakeClient()
+    Fd = bigquery.SchemaField
+    c.create(CLONE, [Fd("SessionID", "STRING"), Fd("checkinDateTime", "DATETIME"),
+                     Fd("checkinReplyDateTime", "DATETIME"), Fd("resourceOfferReplyDatetime", "DATETIME")])
+    c.insert_raw(CLONE, {"SessionID": A, "checkinDateTime": datetime(2026, 8, 24, 13, 1, 49),
+                         "checkinReplyDateTime": datetime(2026, 8, 24, 13, 30)})
+    for _ in range(2):   # an old-writer duplicate: two rows of one session, both listed
+        c.insert_raw(CLONE, {"SessionID": C, "checkinDateTime": datetime(2026, 8, 28, 13, 3, 18)})
+    c.insert_raw(CLONE, {"SessionID": B, "checkinDateTime": datetime(2026, 5, 20, 14, 0)})   # not in the plan
+    return c
+
+
+PLAN = {"table": CLONE, "changes": [
+    {"SessionID": A, "column": "checkinDateTime", "old": "2026-08-24T13:01:49", "new": "2026-08-24T17:01:49", "rows": 1},
+    {"SessionID": A, "column": "checkinReplyDateTime", "old": "2026-08-24T13:30:00", "new": "2026-08-24T17:30:00", "rows": 1},
+    {"SessionID": C, "column": "checkinDateTime", "old": "2026-08-28T13:03:18", "new": "2026-08-28T17:03:18", "rows": 2}]}
+
+
+def _state(c):
+    return sorted((r["SessionID"][:8], r["checkinDateTime"], r["checkinReplyDateTime"]) for r in c.rows(CLONE))
+
+
+def test_apply_and_rollback_are_one_set_based_transaction_each():
+    c = _table()
+    before = _state(c)
+    F.run_changes(c, PLAN["changes"], forward=True, table=CLONE)
+    after = _state(c)
+    assert ("aaaaaaaa", datetime(2026, 8, 24, 17, 1, 49), datetime(2026, 8, 24, 17, 30)) in after
+    assert after.count(("cccccccc", datetime(2026, 8, 28, 17, 3, 18), None)) == 2
+    assert ("bbbbbbbb", datetime(2026, 5, 20, 14, 0), None) in after                  # untouched
+    sql = c.statements[-1].sql
+    assert sql.count("UPDATE ") == 2 and sql.startswith("BEGIN TRANSACTION")       # one UPDATE per column
+    F.run_changes(c, PLAN["changes"], forward=False, table=CLONE)
+    assert _state(c) == before
+
+
+def test_a_row_changed_since_the_list_aborts_everything():
+    c = _table()
+    c.duck.execute(f"UPDATE {c._name(CLONE)} SET checkinReplyDateTime = TIMESTAMP '2026-08-24 18:00:00'")   # another writer
+    before = _state(c)
+    with pytest.raises(RuntimeError, match="Assertion failed"):
+        F.run_changes(c, PLAN["changes"], forward=True, table=CLONE)
+    assert _state(c) == before                                                       # nothing half-done
+
+
+def test_an_extra_row_with_the_listed_value_aborts_everything():
+    c = _table()
+    c.insert_raw(CLONE, {"SessionID": C, "checkinDateTime": datetime(2026, 8, 28, 13, 3, 18)})   # a third row appeared
+    before = _state(c)
+    with pytest.raises(RuntimeError, match="Assertion failed"):
+        F.run_changes(c, PLAN["changes"], forward=True, table=CLONE)
+    assert _state(c) == before
+
+
+def test_a_production_plan_is_refused_without_the_flag(tmp_path):
+    plan = tmp_path / "p.json"
+    plan.write_text(json.dumps({"table": "early-alert-responses.RESPONSES.response_data", "changes": []}))
+    for action in ("apply", "rollback"):
+        with pytest.raises(SystemExit, match="not a DEV table"):
+            F.main_([action, str(plan)])
+    F.refuse_unless_allowed("early-alert-responses.RESPONSES.response_data", production=True)   # the one allowed run
+    F.refuse_unless_allowed(CLONE, production=False)
+
+
+def test_the_list_reads_the_table_it_is_given(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    seen = []
+
+    class _C(_Client):
+        def query(self, sql, job_config=None):
+            seen.append(sql)
+            return super().query(sql, job_config)
+    plan = json.load(open(F.cmd_list(_C(), table=CLONE)))
+    assert plan["table"] == CLONE and f"`{CLONE}`" in seen[0]
+    assert any(c.get("flag") is None for c in plan["changes"])

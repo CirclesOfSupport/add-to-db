@@ -1,4 +1,5 @@
 from __future__ import annotations
+import hashlib
 import json
 from google.cloud import tasks_v2
 import config
@@ -42,12 +43,27 @@ def enqueue_write(path: str, target: str, data: dict) -> str:
     return created.name
 
 
-def enqueue_flush(bucket: int, schedule_epoch_s: int) -> str | None:
+def flush_task_id(kind: str, key) -> str:
     """
-    Ask for one flush of receive bucket `bucket`, run at `schedule_epoch_s`, on
-    the flush queue (max concurrency 1). The task is named after the bucket,
-    so every call in the bucket asking again is a no-op. Returns the task name,
-    or None when the bucket's flush was already requested.
+    Task ID for a flush-queue task. Cloud Tasks' CreateTask reference warns that sequential task IDs
+    (or sequential prefixes) increase latency and error rates, and recommends a well-distributed
+    prefix such as a hash; the readable part follows it: "<12 hex>-<kind>-<key>".
+    """
+    readable = f"{kind}-{key}"
+    return f"{hashlib.sha256(readable.encode()).hexdigest()[:12]}-{readable}"
+
+
+def enqueue_flush(bucket, schedule_epoch_s: int, kind: str = "flush", body: dict | None = None) -> str | None:
+    """
+    Ask for one flush on the flush queue (max concurrency 1), run at `schedule_epoch_s`.
+
+    kind "flush": the flush of receive bucket `bucket`, requested by every staged call in it; the
+                  task is named after the bucket, so every later call in the bucket is a no-op.
+    kind "sweep": the 5-minute scheduler sweep's flush (named per sweep bucket, so it never takes
+                  the name a call in the same bucket would ask for); carries {"late_check": true}.
+    kind "drain": the next flush of a backlog the previous flush could not finish (named after the
+                  watermark it reached, so a retried flush does not ask twice).
+    Returns the task name, or None when a task of that name already exists.
     """
     from google.api_core import exceptions as gexc
     from google.protobuf import timestamp_pb2
@@ -56,13 +72,13 @@ def enqueue_flush(bucket: int, schedule_epoch_s: int) -> str | None:
     parent = client.queue_path(config.TASKS_PROJECT, config.TASKS_LOCATION, config.FLUSH_QUEUE)
     when = timestamp_pb2.Timestamp(seconds=int(schedule_epoch_s))
     task = tasks_v2.Task(
-        name=f"{parent}/tasks/flush-{bucket}",
+        name=f"{parent}/tasks/{flush_task_id(kind, bucket)}",
         schedule_time=when,
         http_request=tasks_v2.HttpRequest(
             http_method=tasks_v2.HttpMethod.POST,
             url=f"{config.SERVICE_URL}/tasks/flush",
             headers={"Content-Type": "application/json"},
-            body=b"{}",
+            body=json.dumps(body or {}).encode(),
             oidc_token=tasks_v2.OidcToken(
                 service_account_email=config.TASKS_INVOKER_SERVICE_ACCOUNT,
                 audience=config.SERVICE_URL,

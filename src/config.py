@@ -127,7 +127,11 @@ FLUSH_STATE_TABLE = os.getenv("FLUSH_STATE_TABLE", f"{PROJECT_ID}.RESPONSES.adb_
 FLUSH_QUEUE = os.getenv("FLUSH_QUEUE", "add-to-db-flush")
 FLUSH_BUCKET_S = int(os.getenv("FLUSH_BUCKET_S", "30"))      # one flush per this many seconds of traffic
 FLUSH_SAFETY_S = int(os.getenv("FLUSH_SAFETY_S", "20"))      # only calls received this long ago are flushed
-FLUSH_MAX_ITEMS = int(os.getenv("FLUSH_MAX_ITEMS", "3000"))
+# Items per target per flush. The 2026-09-28 staging walk measured a flush at ~0.19 s per item (44 s for
+# 238 items) and both targets run in one request, so 300 per target keeps one flush request within
+# ~120 s at that cost (2 x 300 x 0.19 s + ~4 s fixed). A flush that leaves backlog schedules the next
+# one at once (a drain task), so a multi-hour backlog drains in a chain of bounded flushes.
+FLUSH_MAX_ITEMS = int(os.getenv("FLUSH_MAX_ITEMS", "300"))
 FLUSH_ALERT_AFTER = int(os.getenv("FLUSH_ALERT_AFTER", "3"))  # consecutive failed flushes before FLUSH_ALERT
 FLUSH_TARGET_ORDER = ["responses", "users"]   # check-in rows first; each target is its own transaction
 # Per target, per cycle: how long a contended flush keeps retrying before the cycle moves on
@@ -140,6 +144,30 @@ FLUSH_RETRY_BUDGET_S: dict[str, float] = {
 }
 FLUSH_BACKOFF_BASE_S = float(os.getenv("FLUSH_BACKOFF_BASE_S", "1"))
 FLUSH_BACKOFF_CAP_S = float(os.getenv("FLUSH_BACKOFF_CAP_S", "15"))
+
+# The staging append must finish well inside FLUSH_SAFETY_S of the call's receive stamp: a flush only
+# reads calls received at least FLUSH_SAFETY_S ago, so an append that becomes visible later than that
+# can land behind a flush that already covered its receive time. The whole /upsert, from the receive
+# stamp to the end of the append, gets this budget; past it the call is answered 500 (not 202) and
+# an ADB_ALERT line is logged. Each append attempt is capped at STAGING_APPEND_ATTEMPT_S.
+STAGING_APPEND_BUDGET_S = float(os.getenv("STAGING_APPEND_BUDGET_S", "12"))
+STAGING_APPEND_ATTEMPT_S = float(os.getenv("STAGING_APPEND_ATTEMPT_S", "5"))
+if STAGING_APPEND_BUDGET_S + 5 > FLUSH_SAFETY_S:
+    raise RuntimeError("STAGING_APPEND_BUDGET_S must be at least 5 s shorter than FLUSH_SAFETY_S")
+
+# A staged call that became visible after the flush covering its receive time is found by the late
+# check (run by the 5-minute sweep, looking back this far), dead-lettered and alerted -- never
+# written late, where it could overwrite a newer call's values.
+LATE_CHECK_LOOKBACK_S = int(os.getenv("LATE_CHECK_LOOKBACK_S", str(6 * 3600)))
+
+# Alerting. Every condition that needs a person is logged as one line containing ADB_ALERT; a Cloud
+# Monitoring log-match alert policy on that token emails us. The sweep (/tasks/flush-kick, every
+# 5 minutes) raises BACKLOG when a target's oldest unflushed call is older than BACKLOG_ALERT_S, unless
+# the flush is paused for maintenance (flush_state.paused_since set by tools/flush_pause.py), and
+# raises PAUSE when a maintenance pause has lasted longer than PAUSE_ALERT_S (a pause left on by
+# mistake). While paused, the flush writes nothing.
+BACKLOG_ALERT_S = int(os.getenv("BACKLOG_ALERT_S", str(10 * FLUSH_BUCKET_S)))
+PAUSE_ALERT_S = int(os.getenv("PAUSE_ALERT_S", str(4 * 3600)))
 
 # Reply fields a stale carry-over call must not write (see apply_stale_reply_guard).
 STALE_REPLY_FIELDS: dict[str, list[str]] = {

@@ -82,6 +82,9 @@ class FakeClient:
     fail_in_script: list = field(default_factory=list)  # substrings: the script statement containing it fails
     fail_always: set = field(default_factory=set)       # substrings: fail every time while present
     streamed: list = field(default_factory=list)      # rows appended with insert_rows_json
+    get_table_calls: list = field(default_factory=list)  # table ids, one per get_table call
+    append_calls: list = field(default_factory=list)     # kwargs of every insert_rows_json call (retry, timeout)
+    before_append: list = field(default_factory=list)    # callables run inside the next insert_rows_json calls
 
     # --- table management -------------------------------------------------
     def _name(self, table_id: str) -> str:
@@ -89,7 +92,8 @@ class FakeClient:
 
     def create(self, table_id: str, schema: list) -> None:
         self.tables[table_id] = list(schema)
-        cols = ", ".join(f'"{f.name}" {DUCK_TYPES[f.field_type.upper()]}' for f in schema)
+        cols = ", ".join(f'"{f.name}" {DUCK_TYPES[f.field_type.upper()]}{"[]" if f.mode == "REPEATED" else ""}'
+                         for f in schema)
         self.duck.execute(f"CREATE TABLE {self._name(table_id)} ({cols})")
 
     def rows(self, table_id: str) -> list[dict]:
@@ -105,6 +109,7 @@ class FakeClient:
 
     # --- the Client surface the service uses ------------------------------
     def get_table(self, table_id):
+        self.get_table_calls.append(table_id)
         return FakeTable(table_id, list(self.tables[table_id]))
 
     def update_table(self, table, fields):
@@ -148,15 +153,27 @@ class FakeClient:
             out = out.replace(m.group(0), f"FROM {self._rows_source(params, m.group(1))} AS S")
         for m in list(re.finditer(r"(UPDATE|FROM|JOIN)\s+`([^`]+)`", out)):
             out = out.replace(m.group(0), f"{m.group(1)} {self._name(m.group(2))}")
+        # x IN UNNEST(@array_param) / x IN UNNEST(alias.array_column) -> DuckDB list_contains
+        for m in list(re.finditer(r"([\w.]+) IN UNNEST\(@(\w+)\)", out)):
+            out = out.replace(m.group(0), f"list_contains({self._list_literal(params[m.group(2)])}, {m.group(1)})")
+        for m in list(re.finditer(r"([\w.]+) IN UNNEST\(([\w.]+)\)", out)):
+            out = out.replace(m.group(0), f"list_contains({m.group(2)}, {m.group(1)})")
         for name, p in sorted(params.items(), key=lambda kv: -len(kv[0])):
             if hasattr(p, "type_") and not hasattr(p, "array_type"):
                 out = re.sub(rf"@{name}\b", _literal(p.value, p.type_).replace("\\", "\\\\"), out)
+            elif hasattr(p, "array_type") and p.array_type not in ("RECORD", "STRUCT"):
+                out = re.sub(rf"@{name}\b", self._list_literal(p).replace("\\", "\\\\"), out)
         out = out.replace("CURRENT_TIMESTAMP()", "CAST(now() AS TIMESTAMPTZ)")
         out = re.sub(r"TIMESTAMP_SUB\(([^,]+), (INTERVAL \d+ \w+)\)", r"(\1 - \2)", out)
         out = out.replace("IFNULL(", "COALESCE(")
         return out.replace("`", '"')
 
-    # --- scripts (BEGIN TRANSACTION; ...; ASSERT @@row_count = 1 ...; COMMIT TRANSACTION;)
+    @staticmethod
+    def _list_literal(p) -> str:
+        duck = DUCK_TYPES.get(p.array_type.upper(), "VARCHAR")
+        return f"CAST([{', '.join(_literal(v, p.array_type) for v in p.values)}] AS {duck}[])"
+
+    # --- scripts (BEGIN TRANSACTION; ...; ASSERT @@row_count = N ...; ASSERT (<query>) AS ...; COMMIT TRANSACTION;)
     def _run_script(self, sql: str, params: dict) -> None:
         parts = [p.strip() for p in sql.split(";\n") if p.strip().rstrip(";").strip()]
         last_count = None
@@ -166,8 +183,14 @@ class FakeClient:
                 part = part.rstrip(";").strip()
                 if part in ("BEGIN TRANSACTION", "COMMIT TRANSACTION"):
                     continue
-                if part.startswith("ASSERT @@row_count = 1"):
-                    if last_count != 1:
+                m = re.match(r"ASSERT @@row_count = (\d+)", part)
+                if m:
+                    if last_count != int(m.group(1)):
+                        raise RuntimeError("Assertion failed: " + part)
+                    continue
+                if part.startswith("ASSERT "):
+                    expr = re.sub(r"\s+AS\s+'[^']*'\s*$", "", part[len("ASSERT "):])
+                    if not self.duck.execute("SELECT " + self._translate(expr, params)).fetchone()[0]:
                         raise RuntimeError("Assertion failed: " + part)
                     continue
                 if any(pat in part for pat in self.fail_always):
@@ -183,7 +206,10 @@ class FakeClient:
             self.duck.execute("ROLLBACK")
             raise
 
-    def insert_rows_json(self, table_id, rows, row_ids=None):
+    def insert_rows_json(self, table_id, rows, row_ids=None, retry=None, timeout=None):
+        self.append_calls.append({"table": table_id, "retry": retry, "timeout": timeout})
+        if self.before_append:
+            self.before_append.pop(0)()
         if self.fail_next:
             return [{"errors": [str(self.fail_next.pop(0))]}]
         for r in rows:

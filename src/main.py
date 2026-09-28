@@ -441,13 +441,14 @@ def upsert():
 
     queued = []
     received_at = _dt.now(_tz.utc)      # stamped on arrival: the order the flusher writes in
+    received_mono = time_module.monotonic()   # the staging append's budget runs from here
     staged: list[tuple[str, dict]] = []
 
     def stage_pending() -> str | None:
         """Make the validated staged calls durable (before any response goes back)."""
         if not staged:
             return None
-        request_id = stage_calls(staged, received_at)
+        request_id = stage_calls(staged, received_at, started=received_mono)
         for t, _ in staged:
             queued.append({"status": "queued", "operation": "upsert", "table": t,
                            "table_id": ALLOWED_TARGETS[t], "staged_request_id": request_id})
@@ -463,7 +464,15 @@ def upsert():
                                       "errors": json.dumps(errors, default=str)[:4000],
                                       "payload": json.dumps(data, default=str)}])
             except Exception as exc:
-                app.logger.error("upsert: could not record dead letter for '%s': %s", target, exc)
+                raise_alert("DEAD_LETTER", f"{target}: a rejected call (answered 400) could not be recorded "
+                                           f"as a dead letter: {_reason(exc)}")
+
+    def staging_failed(exc):
+        if isinstance(exc, StagingTooSlow):
+            raise_alert("STAGING", f"{exc} -- answered 500, not 202")
+        else:
+            raise_alert("STAGING", f"staging append failed, answered 500: {_reason(exc)}")
+        return err("Failed to stage upsert", 500, details=str(exc)[:2000], queued_results=queued)
 
     for item in target_requests:
         target, data = item["target"], item["data"]
@@ -484,7 +493,7 @@ def upsert():
             try:
                 stage_pending()
             except Exception as exc:
-                return err("Failed to stage upsert", 500, details=str(exc), queued_results=queued)
+                return staging_failed(exc)
             return precheck
 
         schema, coerced_data, errors, warnings = precheck
@@ -501,7 +510,7 @@ def upsert():
             try:
                 stage_pending()
             except Exception as exc:
-                return err("Failed to stage upsert", 500, details=str(exc), queued_results=queued)
+                return staging_failed(exc)
             return jsonify({
                 "status": "error",
                 "table": target,
@@ -531,7 +540,7 @@ def upsert():
     try:
         stage_pending()
     except Exception as exc:
-        return err("Failed to stage upsert", 500, details=str(exc), queued_results=queued)
+        return staging_failed(exc)
 
     if len(queued) == 1:
         return jsonify(queued[0]), 202
@@ -679,6 +688,10 @@ def tasks_upsert():
     return jsonify(body), status
 
 
+def _flush_dead(target: str, error: str, details: str) -> str:
+    return json.dumps({"status": "error", "error": error, "table": target, "details": details}, default=str)[:4000]
+
+
 def plan_target_writes(target: str, items: list[dict], prefix: str = "") -> dict:
     """
     Fold the queued calls for `target` (oldest first) into the statements that
@@ -686,18 +699,37 @@ def plan_target_writes(target: str, items: list[dict], prefix: str = "") -> dict
     key-only MERGE for rows without one, one INSERT for rows without a key.
     items: [{"data": payload, "ref": caller's reference}]. A call that fails
     pre-flight is returned in "dead" with its errors instead of being written.
+
+    The table's schema is read ONCE per call of this function (one flush of one
+    target), not once per item: the per-item read made a flush's duration grow
+    with its size (measured 2026-09-28). A payload key the table lacks still adds the
+    column, exactly as the per-call path does (add_missing_fields_to_table only
+    calls BigQuery when there is a column to add).
     """
     key_columns = UPSERT_KEYS[target]
     table_id = ALLOWED_TARGETS[target]
-    rows, dead, schema = [], [], None
+    rows, dead = [], []
     reply_fields = config.STALE_REPLY_FIELDS.get(target)
+    conventions = DATETIME_CONVENTIONS.get(target)
+    table = client.get_table(table_id)      # a failure here fails the flush attempt (retried), not the calls
+    schema = list(table.schema)
+    added_any: list[str] = []
     for item in items:
-        prepared = prepare_item(target, dict(item["data"]), [])
-        if isinstance(prepared[0], Response):
-            body = prepared[0].get_json(silent=True) or {}
-            dead.append({"ref": item.get("ref"), "errors": json.dumps(body, default=str)[:4000]})
+        data = dict(item["data"])
+        try:
+            table, added = add_missing_fields_to_table(client, table, data)
+        except ValueError as exc:
+            dead.append({"ref": item.get("ref"), "errors": _flush_dead(target, "Invalid new field name", str(exc))})
             continue
-        _table, schema, _added, errors, _warnings, coerced = prepared
+        except Exception as exc:
+            dead.append({"ref": item.get("ref"), "errors": _flush_dead(target, "Unable to update BigQuery schema", str(exc))})
+            continue
+        schema = list(table.schema)
+        added_any += added
+        normalized, normalize_errors = normalize_payload_to_schema(data, schema)
+        coerced, coerce_errors = coerce_payload_to_schema(normalized, schema, conventions)
+        errors, _warnings = validate_payload(coerced, schema)
+        errors = errors + normalize_errors + coerce_errors
         resolved, key_errors = resolve_key_columns(key_columns, schema)
         row = filter_to_schema(coerced, schema)
         keyless = target in KEYLESS_INSERT_TARGETS and is_keyless_row(resolved, row)
@@ -707,6 +739,11 @@ def plan_target_writes(target: str, items: list[dict], prefix: str = "") -> dict
             dead.append({"ref": item.get("ref"), "errors": "; ".join(errors)[:4000]})
             continue
         rows.append(apply_stale_reply_guard(row, reply_fields))
+
+    if added_any:
+        _SCHEMA_CACHE[table_id] = (schema, time_module.time())
+        if target in USERS_RESPONSES_TARGETS:
+            update_users_and_responses_view(client, PROJECT_ID, target)
 
     statements = []
     if not rows:
@@ -769,25 +806,61 @@ def perform_flush(target: str, items: list[dict]) -> dict:
 import random as random_module
 import uuid as uuid_module
 from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+from google.cloud.bigquery.retry import DEFAULT_RETRY as _BQ_DEFAULT_RETRY
 
 _last_kicked_bucket: int | None = None
 
 
-def stage_calls(items: list[tuple[str, dict]], received_at) -> str:
-    """Append validated calls to the staging table; durable once this returns."""
+def raise_alert(kind: str, text: str) -> None:
+    """
+    One log line carrying the token ADB_ALERT. The Cloud Monitoring log-match alert policy on that
+    token emails us, so every condition that needs a person goes through here:
+    FLUSH_ALERT (consecutive failed flushes), DEAD_LETTER (any call recorded as a dead letter),
+    LATE (a call that arrived behind its flush; dead-lettered), STAGING (a call answered 500 because
+    it could not be staged in time), BACKLOG (unflushed calls older than BACKLOG_ALERT_S while not
+    paused), PAUSE (a maintenance pause older than PAUSE_ALERT_S), SWEEP (the sweep's own check failed).
+    """
+    app.logger.error("ADB_ALERT %s: %s", kind, " ".join(str(text).split()))
+
+
+class StagingTooSlow(RuntimeError):
+    """The staging append ended too long after the call's receive stamp (a flush may already have passed it)."""
+
+
+def stage_calls(items: list[tuple[str, dict]], received_at, started: float | None = None) -> str:
+    """
+    Append validated calls to the staging table; durable once this returns.
+
+    Bounded: the append (every retry included) must end within STAGING_APPEND_BUDGET_S of `started`
+    (the monotonic clock at the call's receive stamp), which is at least 5 s inside FLUSH_SAFETY_S,
+    so a flush can never have covered this receive time before the rows became visible. Past the
+    budget it raises StagingTooSlow and the caller answers 500 -- never 202. If the rows did land
+    late all the same, the sweep's late check dead-letters and alerts them (never writes them).
+    """
+    started = time_module.monotonic() if started is None else started
     request_id = uuid_module.uuid4().hex
+    remaining = config.STAGING_APPEND_BUDGET_S - (time_module.monotonic() - started)
+    if remaining <= 0:
+        raise StagingTooSlow(f"request {request_id}: the append budget of {config.STAGING_APPEND_BUDGET_S:.0f} s "
+                             f"was spent before the append started")
     rows = [{"request_id": request_id, "item_index": i, "target": t,
              "received_at": received_at.isoformat(), "payload": json.dumps(d, default=str)}
             for i, (t, d) in enumerate(items)]
     errors = client.insert_rows_json(config.STAGING_TABLE, rows,
-                                     row_ids=[f"{request_id}-{i}" for i in range(len(rows))])
+                                     row_ids=[f"{request_id}-{i}" for i in range(len(rows))],
+                                     retry=_BQ_DEFAULT_RETRY.with_timeout(remaining),
+                                     timeout=min(config.STAGING_APPEND_ATTEMPT_S, remaining))
     if errors:
         raise RuntimeError(f"staging append failed: {errors}")
+    elapsed = time_module.monotonic() - started
+    if elapsed > config.STAGING_APPEND_BUDGET_S:
+        raise StagingTooSlow(f"request {request_id} ({len(rows)} calls) was staged {elapsed:.1f} s after its receive "
+                             f"stamp, over the {config.STAGING_APPEND_BUDGET_S:.0f} s budget")
     return request_id
 
 
 def record_dead_letters(entries: list[dict]) -> None:
-    """DML INSERT (not streaming) so the table never holds a streaming buffer."""
+    """DML INSERT (not streaming) so the table never holds a streaming buffer. Every dead letter alerts."""
     if not entries:
         return
     client.query(
@@ -796,6 +869,18 @@ def record_dead_letters(entries: list[dict]) -> None:
         f"SELECT CURRENT_TIMESTAMP(), received_at, request_id, item_index, target, stage, errors, payload "
         f"FROM UNNEST(@dl_rows)",
         job_config=bigquery.QueryJobConfig(query_parameters=[_dead_letter_param(entries)])).result()
+    for (target, stage), n in sorted(_count_by(entries, ("target", "stage")).items()):
+        raise_alert("LATE" if stage == "late" else "DEAD_LETTER",
+                    f"{n} {target} call(s) recorded as dead letters (stage {stage}); first reason: "
+                    f"{next(e['errors'] for e in entries if e['target'] == target and e['stage'] == stage)[:300]}")
+
+
+def _count_by(entries: list[dict], keys: tuple) -> dict:
+    out: dict = {}
+    for e in entries:
+        k = tuple(e.get(x) for x in keys)
+        out[k] = out.get(k, 0) + 1
+    return out
 
 
 def _dead_letter_param(entries: list[dict]) -> bigquery.ArrayQueryParameter:
@@ -821,7 +906,7 @@ def kick_flush(received_at) -> None:
     try:
         enqueue_flush(bucket, (bucket + 1) * config.FLUSH_BUCKET_S + config.FLUSH_SAFETY_S)
         _last_kicked_bucket = bucket
-    except Exception as exc:   # the calls are durable; the next call or a retry flushes them
+    except Exception as exc:   # the calls are durable; the next call or the sweep flushes them
         app.logger.error("kick_flush: could not enqueue flush for bucket %s: %s", bucket, exc)
 
 
@@ -856,24 +941,52 @@ def _state_id(target: str) -> str:
 
 def _read_flush_state(target: str) -> dict:
     rows = list(client.query(
-        f"SELECT watermark, version FROM {quote_identifier(config.FLUSH_STATE_TABLE)} WHERE id = @id",
+        f"SELECT watermark, version, paused_since FROM {quote_identifier(config.FLUSH_STATE_TABLE)} WHERE id = @id",
         job_config=bigquery.QueryJobConfig(query_parameters=[
             bigquery.ScalarQueryParameter("id", "STRING", _state_id(target))])).result())
     if len(rows) != 1:
         raise RuntimeError(f"flush state must hold exactly one row with id '{_state_id(target)}', found {len(rows)}")
-    return {"watermark": rows[0]["watermark"], "version": rows[0]["version"]}
+    return {"watermark": rows[0]["watermark"], "version": rows[0]["version"], "paused_since": rows[0]["paused_since"]}
 
 
-def _read_staged(target: str, watermark, cutoff) -> list[dict]:
+def _read_staged(target: str, watermark, cutoff, limit: int) -> list[dict]:
     sql = (f"SELECT request_id, item_index, target, received_at, payload "
            f"FROM {quote_identifier(config.STAGING_TABLE)} "
            f"WHERE target = @t AND received_at > @wm AND received_at <= @cutoff "
-           f"ORDER BY received_at, request_id, item_index LIMIT {config.FLUSH_MAX_ITEMS + 1}")
+           f"ORDER BY received_at, request_id, item_index LIMIT {int(limit)}")
     cfg = bigquery.QueryJobConfig(query_parameters=[
         bigquery.ScalarQueryParameter("t", "STRING", target),
         bigquery.ScalarQueryParameter("wm", "TIMESTAMP", watermark),
         bigquery.ScalarQueryParameter("cutoff", "TIMESTAMP", cutoff)])
     return [dict(r) for r in client.query(sql, job_config=cfg).result()]
+
+
+def _read_staged_at(target: str, at) -> list[dict]:
+    """Every staged call of `target` with exactly this receive time (one oversized request)."""
+    sql = (f"SELECT request_id, item_index, target, received_at, payload "
+           f"FROM {quote_identifier(config.STAGING_TABLE)} WHERE target = @t AND received_at = @at "
+           f"ORDER BY received_at, request_id, item_index")
+    cfg = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("t", "STRING", target),
+        bigquery.ScalarQueryParameter("at", "TIMESTAMP", at)])
+    return [dict(r) for r in client.query(sql, job_config=cfg).result()]
+
+
+def take_batch(target: str, watermark, cutoff) -> tuple[list[dict], object, bool]:
+    """
+    The calls one flush takes: at most FLUSH_MAX_ITEMS, oldest first, never splitting one receive
+    time across two flushes (the watermark is a receive time, so a split would strand the rest).
+    Returns (calls, the watermark this flush moves to, whether calls remain after it).
+    """
+    cap = config.FLUSH_MAX_ITEMS
+    staged = _read_staged(target, watermark, cutoff, cap + 1)
+    if len(staged) <= cap:
+        return staged, cutoff, False
+    boundary = staged[cap]["received_at"]                    # the first call NOT taken
+    kept = [r for r in staged[:cap] if r["received_at"] < boundary]
+    if kept:
+        return kept, kept[-1]["received_at"], True
+    return _read_staged_at(target, boundary), boundary, True  # the cap is all one receive time: take it whole
 
 
 def _record_flush_failure(target, flush_id, started, watermark, cutoff, items, attempts, error) -> None:
@@ -902,17 +1015,20 @@ def consecutive_flush_failures(target: str) -> int:
     return rows[0]["n"]
 
 
+def _ref(row: dict) -> str:
+    return f"{row['request_id']}:{row['item_index']}"
+
+
 def _flush_target_once(target: str, now, flush_id: str, started, attempt: int) -> dict:
     """One attempt: read, fold and write one target's calls in ONE transaction with its own watermark."""
     cutoff = (now or _dt.now(_tz.utc)) - _td(seconds=config.FLUSH_SAFETY_S)
     state = _read_flush_state(target)
     watermark = state["watermark"]
+    if state["paused_since"] is not None:          # maintenance pause (tools/flush_pause.py): write nothing
+        return {"status": "paused", "items": 0, "watermark": watermark, "paused_since": state["paused_since"]}
     if cutoff <= watermark:
         return {"status": "noop", "items": 0, "watermark": watermark, "cutoff": cutoff}
-    staged = _read_staged(target, watermark, cutoff)
-    if len(staged) > config.FLUSH_MAX_ITEMS:
-        cutoff = staged[config.FLUSH_MAX_ITEMS - 1]["received_at"]
-        staged = [r for r in staged if r["received_at"] <= cutoff]
+    staged, cutoff, more = take_batch(target, watermark, cutoff)
 
     items, dead = [], []
     for r in staged:
@@ -933,14 +1049,16 @@ def _flush_target_once(target: str, now, flush_id: str, started, attempt: int) -
             f"SELECT CURRENT_TIMESTAMP(), received_at, request_id, item_index, target, stage, errors, payload "
             f"FROM UNNEST(@dl_rows)")
         params.append(_dead_letter_param(dead))
+    # refs: every call this flush took (written or dead-lettered), so the late check can tell a call
+    # that became visible after its flush from one the flush handled.
     script.append(
         f"INSERT INTO {quote_identifier(config.FLUSH_LOG_TABLE)} "
-        f"(flush_id, target, started_at, finished_at, from_wm, to_wm, items, statements, dead_letters, attempts, status, error) "
-        f"VALUES (@flush_id, @target, @started, CURRENT_TIMESTAMP(), @wm, @cutoff, @n_items, @n_statements, @n_dead, @attempt, 'ok', NULL)")
+        f"(flush_id, target, started_at, finished_at, from_wm, to_wm, items, statements, dead_letters, attempts, status, error, refs) "
+        f"VALUES (@flush_id, @target, @started, CURRENT_TIMESTAMP(), @wm, @cutoff, @n_items, @n_statements, @n_dead, @attempt, 'ok', NULL, @refs)")
     script.append(
         f"UPDATE {quote_identifier(config.FLUSH_STATE_TABLE)} "
         f"SET watermark = @cutoff, version = version + 1, updated_at = CURRENT_TIMESTAMP() "
-        f"WHERE id = @state_id AND version = @version")
+        f"WHERE id = @state_id AND version = @version AND paused_since IS NULL")
     script.append("ASSERT @@row_count = 1 AS 'flush watermark was moved by another writer'")
     script.append("COMMIT TRANSACTION")
     params += [
@@ -955,11 +1073,15 @@ def _flush_target_once(target: str, now, flush_id: str, started, attempt: int) -
         bigquery.ScalarQueryParameter("attempt", "INT64", attempt),
         bigquery.ScalarQueryParameter("state_id", "STRING", _state_id(target)),
         bigquery.ScalarQueryParameter("version", "INT64", state["version"]),
+        bigquery.ArrayQueryParameter("refs", "STRING", [_ref(r) for r in staged]),
     ]
     client.query(";\n".join(script) + ";", job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
+    if dead:
+        raise_alert("DEAD_LETTER", f"{len(dead)} {target} call(s) recorded as dead letters at flush {flush_id}; "
+                                   f"first reason: {str(dead[0]['errors'])[:300]}")
     return {"status": "ok", "items": len(staged), "statements": len(statements), "dead_letters": len(dead),
             "rows": plan["rows"], "keys": plan["keys"], "keyless": plan["keyless"],
-            "watermark": watermark, "cutoff": cutoff}
+            "watermark": watermark, "cutoff": cutoff, "more": more}
 
 
 def flush_target(target: str, now=None, budget_s: float | None = None) -> dict:
@@ -997,77 +1119,197 @@ def flush_target(target: str, now=None, budget_s: float | None = None) -> dict:
         failures = None
         app.logger.error("flush %s: could not record the failure: %s", target, log_exc)
     if failures is None or failures >= config.FLUSH_ALERT_AFTER:
-        app.logger.error("FLUSH_ALERT: %s: %s consecutive failed flushes; last reason: %s", target, failures, _reason(last))
+        raise_alert("FLUSH_ALERT", f"{target}: {failures} consecutive failed flushes; last reason: {_reason(last)}")
     else:
         app.logger.warning("flush %s: failed after %s attempts (the queue retries). Reason: %s", target, attempt, _reason(last))
     raise last
 
 
-def run_flush_cycle(now=None) -> dict:
+def _schedule_drain(key) -> None:
+    """A flush left backlog: ask for the next one now (named after the watermark reached)."""
+    try:
+        enqueue_flush(key, int(_dt.now(_tz.utc).timestamp()), kind="drain")
+    except Exception as exc:   # the sweep picks the backlog up within 5 minutes
+        app.logger.error("drain: could not enqueue the next flush: %s", _reason(exc))
+
+
+def run_flush_cycle(now=None, late_check: bool = False) -> dict:
     """
     Flush every staged target, each in its own transaction with its own
     watermark (check-in responses first). Contention on one target -- the
-    nightly contacts sync on users, say -- delays only that target. Raises
-    FlushFailed if any target failed, after flushing the others.
+    nightly contacts sync on users, say -- delays only that target. A target
+    that could not take its whole backlog (FLUSH_MAX_ITEMS) makes the cycle
+    ask for the next flush at once. With late_check (the sweep's flush), calls
+    that became visible behind their flush are dead-lettered and alerted.
+    Raises FlushFailed if any target failed, after flushing the others.
     """
-    results, errors = {}, {}
+    results, errors, more = {}, {}, []
     for target in sorted(config.STAGED_TARGETS, key=lambda t: (config.FLUSH_TARGET_ORDER + [t]).index(t)):
         try:
             out = flush_target(target, now)
+            if out.get("more"):
+                more.append(out["cutoff"])
             results[target] = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in out.items()}
         except Exception as exc:
             errors[target] = _reason(exc)
+    if more:
+        _schedule_drain(int(max(more).timestamp() * 1000))
+    if late_check:
+        for target in sorted(config.STAGED_TARGETS):
+            try:
+                n = dead_letter_late_calls(target, now)
+                if target in results:
+                    results[target]["late_dead_lettered"] = n
+            except Exception as exc:
+                raise_alert("SWEEP", f"{target}: the late-call check failed: {_reason(exc)}")
     if errors:
         raise FlushFailed(results, errors)
     return {"status": "ok", "targets": results,
             "items": sum(r.get("items", 0) for r in results.values())}
 
 
-def flush_health() -> dict:
+def _late_sql(select: str) -> str:
+    """Staged calls received in the lookback, at or before the watermark, that no ok flush took and no dead letter holds."""
+    return (
+        f"SELECT {select} FROM ("
+        f"SELECT request_id, item_index, target, received_at, "
+        f"CONCAT(request_id, ':', CAST(item_index AS STRING)) AS ref "
+        f"FROM {quote_identifier(config.STAGING_TABLE)} "
+        f"WHERE target = @t AND received_at > @since AND received_at <= @wm) s "
+        f"WHERE NOT EXISTS (SELECT 1 FROM {quote_identifier(config.FLUSH_LOG_TABLE)} l "
+        f"WHERE l.target = s.target AND l.status = 'ok' AND s.received_at > l.from_wm "
+        f"AND s.received_at <= l.to_wm AND s.ref IN UNNEST(l.refs)) "
+        f"AND NOT EXISTS (SELECT 1 FROM {quote_identifier(config.DEAD_LETTER_TABLE)} d "
+        f"WHERE d.target = s.target AND d.request_id = s.request_id AND d.item_index = s.item_index)")
+
+
+def _late_params(target: str, watermark, now) -> list:
+    since = (now or _dt.now(_tz.utc)) - _td(seconds=config.LATE_CHECK_LOOKBACK_S)
+    return [bigquery.ScalarQueryParameter("t", "STRING", target),
+            bigquery.ScalarQueryParameter("since", "TIMESTAMP", since),
+            bigquery.ScalarQueryParameter("wm", "TIMESTAMP", watermark)]
+
+
+def count_late_calls(target: str, watermark, now=None) -> int:
+    rows = list(client.query(_late_sql("COUNT(*) n"), job_config=bigquery.QueryJobConfig(
+        query_parameters=_late_params(target, watermark, now))).result())
+    return rows[0]["n"]
+
+
+def dead_letter_late_calls(target: str, now=None) -> int:
     """
-    Per staged target: backlog, oldest backlog age, last successful flush,
-    consecutive failed flushes and flushes with late calls; plus dead letters.
-    "alert" while any target has failed FLUSH_ALERT_AFTER times in a row, a
-    backlog older than ten flush buckets, or a call written after its flush;
-    "ok" otherwise.
+    Find staged calls that became visible only after the flush covering their receive time had run
+    (so no flush took them), and record each as a dead letter (stage "late") -- which alerts. They
+    are not written: writing an older call now could overwrite a newer one's values.
+    """
+    state = _read_flush_state(target)
+    keys = [dict(r) for r in client.query(
+        _late_sql("request_id, item_index, received_at") + " ORDER BY received_at, request_id, item_index",
+        job_config=bigquery.QueryJobConfig(query_parameters=_late_params(target, state["watermark"], now))).result()]
+    if not keys:
+        return 0
+    payloads = {}
+    for r in client.query(
+            f"SELECT request_id, item_index, payload FROM {quote_identifier(config.STAGING_TABLE)} "
+            f"WHERE target = @t AND request_id IN UNNEST(@ids)",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("t", "STRING", target),
+                bigquery.ArrayQueryParameter("ids", "STRING", sorted({k["request_id"] for k in keys}))])).result():
+        payloads[(r["request_id"], r["item_index"])] = r["payload"]
+    record_dead_letters([{
+        "received_at": k["received_at"], "request_id": k["request_id"], "item_index": k["item_index"],
+        "target": target, "stage": "late",
+        "errors": (f"became visible in staging after the flush that covered its receive time "
+                   f"({k['received_at'].isoformat()}); not written, so it cannot overwrite a newer call"),
+        "payload": payloads.get((k["request_id"], k["item_index"]))} for k in keys])
+    return len(keys)
+
+
+def _backlog(target: str, watermark) -> dict:
+    rows = list(client.query(
+        f"SELECT COUNT(*) n, MIN(received_at) oldest FROM {quote_identifier(config.STAGING_TABLE)} "
+        f"WHERE target = @t AND received_at > @wm",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("t", "STRING", target),
+            bigquery.ScalarQueryParameter("wm", "TIMESTAMP", watermark)])).result())
+    return {"n": rows[0]["n"], "oldest": rows[0]["oldest"]}
+
+
+def _age_s(now, then) -> float:
+    return (now - then).total_seconds() if then is not None else 0.0
+
+
+def sweep_check(now=None) -> list[str]:
+    """
+    The 5-minute sweep's alerting: per staged target, BACKLOG when the oldest unflushed call is older
+    than BACKLOG_ALERT_S and the flush is not paused for maintenance; PAUSE when a maintenance pause
+    has lasted longer than PAUSE_ALERT_S. Each is raised as an ADB_ALERT line. Returns the alerts.
+    """
+    now = now or _dt.now(_tz.utc)
+    alerts = []
+    for target in sorted(config.STAGED_TARGETS):
+        state = _read_flush_state(target)
+        backlog = _backlog(target, state["watermark"])
+        age = _age_s(now, backlog["oldest"])
+        if state["paused_since"] is not None:
+            paused_for = _age_s(now, state["paused_since"])
+            if paused_for > config.PAUSE_ALERT_S:
+                alerts.append(("PAUSE", f"{target}: the flush has been paused for maintenance for {paused_for / 60:.0f} "
+                                        f"minutes (since {state['paused_since'].isoformat()}); {backlog['n']} calls waiting"))
+        elif age > config.BACKLOG_ALERT_S:
+            alerts.append(("BACKLOG", f"{target}: {backlog['n']} unflushed calls, the oldest {age:.0f} s old "
+                                      f"(alert above {config.BACKLOG_ALERT_S} s); the flush is not paused"))
+    for kind, text in alerts:
+        raise_alert(kind, text)
+    return [f"{k}: {t}" for k, t in alerts]
+
+
+def flush_health(now=None) -> dict:
+    """
+    Per staged target: backlog, oldest backlog age, last successful flush, consecutive failed flushes,
+    late calls not yet dead-lettered and the maintenance pause; plus dead letters in 24 h.
+    "alert" while any target has failed FLUSH_ALERT_AFTER times in a row, has a late call not yet
+    dead-lettered, has a backlog older than BACKLOG_ALERT_S while not paused, or has been paused longer
+    than PAUSE_ALERT_S; otherwise "paused" while a maintenance pause is set, else "ok".
     """
     q = lambda sql, p=(): list(client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=list(p))).result())
-    now = _dt.now(_tz.utc)
-    targets, alert = {}, False
+    now = now or _dt.now(_tz.utc)
+    targets, alert, paused = {}, False, False
     for target in sorted(config.STAGED_TARGETS):
         state = _read_flush_state(target)
         t = bigquery.ScalarQueryParameter("t", "STRING", target)
-        wm = bigquery.ScalarQueryParameter("wm", "TIMESTAMP", state["watermark"])
-        backlog = q(f"SELECT COUNT(*) n, MIN(received_at) oldest FROM {quote_identifier(config.STAGING_TABLE)} "
-                    f"WHERE target = @t AND received_at > @wm", [t, wm])[0]
+        backlog = _backlog(target, state["watermark"])
         last_ok = q(f"SELECT MAX(finished_at) x FROM {quote_identifier(config.FLUSH_LOG_TABLE)} "
                     f"WHERE target = @t AND status = 'ok'", [t])[0]["x"]
-        late = q(f"SELECT COUNT(*) n FROM (SELECT l.flush_id, l.items, COUNT(s.request_id) staged_now "
-                 f"FROM {quote_identifier(config.FLUSH_LOG_TABLE)} l LEFT JOIN {quote_identifier(config.STAGING_TABLE)} s "
-                 f"ON s.target = l.target AND s.received_at > l.from_wm AND s.received_at <= l.to_wm "
-                 f"WHERE l.target = @t AND l.status = 'ok' "
-                 f"AND l.finished_at > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR) "
-                 f"GROUP BY 1, 2) WHERE staged_now > items", [t])[0]["n"]
+        late = count_late_calls(target, state["watermark"], now)
         failures = consecutive_flush_failures(target)
-        age = (now - backlog["oldest"]).total_seconds() if backlog["oldest"] else 0.0
-        target_alert = failures >= config.FLUSH_ALERT_AFTER or late > 0 or age > 10 * config.FLUSH_BUCKET_S
+        age = _age_s(now, backlog["oldest"])
+        is_paused = state["paused_since"] is not None
+        paused_for = _age_s(now, state["paused_since"]) if is_paused else 0.0
+        target_alert = (failures >= config.FLUSH_ALERT_AFTER or late > 0
+                        or (not is_paused and age > config.BACKLOG_ALERT_S)
+                        or (is_paused and paused_for > config.PAUSE_ALERT_S))
         alert |= target_alert
-        targets[target] = {"status": "alert" if target_alert else "ok",
+        paused |= is_paused
+        targets[target] = {"status": "alert" if target_alert else ("paused" if is_paused else "ok"),
                            "watermark": state["watermark"].isoformat(), "backlog_calls": backlog["n"],
                            "oldest_backlog_age_s": round(age, 1),
+                           "paused_since": state["paused_since"].isoformat() if is_paused else None,
                            "last_ok_flush": last_ok.isoformat() if last_ok else None,
-                           "consecutive_failed_flushes": failures, "flushes_with_late_calls_24h": late}
+                           "consecutive_failed_flushes": failures, "late_calls_not_dead_lettered": late}
     dead_24h = q(f"SELECT COUNT(*) n FROM {quote_identifier(config.DEAD_LETTER_TABLE)} "
                  f"WHERE recorded_at > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)")[0]["n"]
-    return {"status": "alert" if alert else "ok", "targets": targets, "dead_letters_24h": dead_24h}
+    return {"status": "alert" if alert else ("paused" if paused else "ok"), "targets": targets,
+            "dead_letters_24h": dead_24h}
 
 
 @app.post("/tasks/flush")
 def tasks_flush():
     if not is_task_request_authorized(request):
         return jsonify({"error": "Unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
     try:
-        return jsonify(run_flush_cycle()), 200
+        return jsonify(run_flush_cycle(late_check=bool(body.get("late_check")))), 200
     except FlushFailed as exc:   # 500: the flush queue retries; the targets that did flush stay flushed
         return jsonify({"status": "error", "flushed": exc.results, "failed": exc.errors}), 500
     except Exception as exc:
@@ -1077,19 +1319,26 @@ def tasks_flush():
 @app.post("/tasks/flush-kick")
 def tasks_flush_kick():
     """
-    Safety sweep for a scheduler: request the flush of the current bucket on the flush
-    queue (the same named task a call would create), so a backlog left by an exhausted
-    flush task is picked up even when no new calls arrive. Never flushes inline.
+    The 5-minute sweep (Cloud Scheduler): raise the backlog and pause alerts (sweep_check), then
+    request a flush on the flush queue under the sweep's own task name, carrying the late-call
+    check. Never flushes inline. Any failure here answers 500, which the scheduler logs as a failed
+    attempt -- and the alert policy watches for that too.
     """
     if not is_task_request_authorized(request):
         return jsonify({"error": "Unauthorized"}), 401
     now = _dt.now(_tz.utc)
     bucket = int(now.timestamp()) // config.FLUSH_BUCKET_S
     try:
-        name = enqueue_flush(bucket, int(now.timestamp()))
+        alerts = sweep_check(now)
     except Exception as exc:
+        raise_alert("SWEEP", f"the sweep's check failed: {_reason(exc)}")
         return jsonify({"status": "error", "details": _reason(exc)}), 500
-    return jsonify({"status": "ok", "task": name, "bucket": bucket}), 200
+    try:
+        name = enqueue_flush(bucket, int(now.timestamp()), kind="sweep", body={"late_check": True})
+    except Exception as exc:
+        raise_alert("SWEEP", f"the sweep could not enqueue its flush: {_reason(exc)}")
+        return jsonify({"status": "error", "details": _reason(exc)}), 500
+    return jsonify({"status": "ok", "task": name, "bucket": bucket, "alerts": alerts}), 200
 
 
 @app.get("/health/flush")
@@ -1100,4 +1349,4 @@ def health_flush():
         body = flush_health()
     except Exception as exc:
         return jsonify({"status": "error", "details": str(exc)[:2000]}), 500
-    return jsonify(body), (200 if body["status"] == "ok" else 503)
+    return jsonify(body), (503 if body["status"] == "alert" else 200)

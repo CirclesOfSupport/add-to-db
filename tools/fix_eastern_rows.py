@@ -14,24 +14,31 @@ Otherwise they are left as they are, and the list says why. Each row is also
 marked with whether its session appears in add-to-db's own logged request
 bodies (the log starts 2026-08-25).
 
-Three steps, each run on purpose:
+    python tools/fix_eastern_rows.py list [--table T]
+        read-only. Prints a summary; writes the full list (every row, every proposed change, the
+        reason) to eastern_fix_list_<stamp>.txt and the plan (which names its table) to
+        eastern_fix_plan_<stamp>.json. A reply time still before its own check-in after conversion
+        is stale carry-over from an earlier session: converted like the rest, but flagged
+        "stale reply, value to the repair unit" in the list and the plan.
+    python tools/fix_eastern_rows.py rehearse
+        the whole correction on a DEV clone of today's RESPONSES.response_data: clone, list, apply
+        (timed, bytes billed, committed), check that no local-time row is left, roll back (timed),
+        check they are all back; then drops the clone and its backup (--keep keeps them). Writes
+        nothing outside DEV.
+    python tools/fix_eastern_rows.py apply PLAN [--production]
+        copies the plan's rows to DEV.adb_eastern_fix_backup_<stamp>, then makes every change in ONE
+        transaction. Per column: an ASSERT that every change still matches exactly its listed row
+        count on its old value, then one UPDATE (only rows still holding the old value), then an
+        ASSERT that the UPDATE touched exactly the listed total. Any mismatch aborts everything.
+    python tools/fix_eastern_rows.py rollback PLAN [--production]
+        the reverse, the same way, for rows still holding the new value.
 
-    python tools/fix_eastern_rows.py list
-        prints a summary; writes the full list (every row, every proposed change, the reason)
-        to eastern_fix_list_<stamp>.txt and the plan to eastern_fix_plan_<stamp>.json.
-        Writes nothing to BigQuery.
-        A reply time that is still before its own check-in after conversion is stale carry-over
-        from an earlier session: its format is converted like the rest, but the change is
-        flagged "stale reply, value to the repair unit" in the list and the plan.
-    python tools/fix_eastern_rows.py apply eastern_fix_plan_<stamp>.json
-        copies the affected rows to DEV.adb_eastern_fix_backup_<stamp>, then makes every
-        change in ONE transaction; each UPDATE only touches a row still holding the old
-        value, and the transaction aborts unless every change hits exactly the rows listed.
-    python tools/fix_eastern_rows.py rollback eastern_fix_plan_<stamp>.json
-        the reverse, in one transaction, for rows still holding the new value.
+apply and rollback refuse a plan whose table is not in DEV unless --production is given (the
+cutover's correction step on RESPONSES.response_data is the one run that passes it).
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
@@ -43,16 +50,17 @@ from _harness import PROJECT, make_client, stamp
 
 from google.cloud import bigquery
 
-TABLE = f"{PROJECT}.RESPONSES.response_data"
+TABLE = f"{PROJECT}.RESPONSES.response_data"          # the production table; list's default
+DEV_PREFIX = f"{PROJECT}.DEV."
 LOG = f"{PROJECT}.OPS.webhook_log_detail"
 REPLY_COLS = ["checkinReplyDateTime", "resourceOfferReplyDatetime"]
 
-CANDIDATES = f"""
+CANDIDATES_SQL = """
 WITH r AS (
   SELECT SessionID, uuid, contactType, checkinDateTime, checkinReplyDateTime, resourceOfferReplyDatetime,
     SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez', SUBSTR(SessionID, 37)) sid_ts,
     SAFE.PARSE_DATETIME('%Y-%m-%dT%H:%M:%E*S', REGEXP_EXTRACT(SUBSTR(SessionID, 37), r'^([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T[0-9:.]+)')) sid_local
-  FROM `{TABLE}` WHERE SessionID IS NOT NULL AND checkinDateTime IS NOT NULL
+  FROM `{table}` WHERE SessionID IS NOT NULL AND checkinDateTime IS NOT NULL
 )
 SELECT SessionID, uuid, contactType, checkinDateTime, checkinReplyDateTime, resourceOfferReplyDatetime,
   DATETIME_DIFF(sid_local, DATETIME(sid_ts, 'UTC'), MINUTE) offset_min
@@ -62,6 +70,13 @@ WHERE sid_ts IS NOT NULL AND sid_local IS NOT NULL
   AND ABS(DATETIME_DIFF(checkinDateTime, DATETIME(sid_ts, 'UTC'), SECOND)) > 60
 ORDER BY checkinDateTime, SessionID
 """
+
+
+def candidates_sql(table: str) -> str:
+    return CANDIDATES_SQL.format(table=table)
+
+
+CANDIDATES = candidates_sql(TABLE)
 
 
 def parse_aware(text):
@@ -110,8 +125,9 @@ def logged_values(client, sessions):
     return out, in_addtodb
 
 
-def cmd_list(client, out=None):
-    rows = [dict(r) for r in client.query(CANDIDATES).result()]
+def cmd_list(client, out=None, table: str = TABLE) -> str:
+    """Read-only. Writes the list and the plan; returns the plan's path."""
+    rows = [dict(r) for r in client.query(candidates_sql(table)).result()]
     sessions = {r["SessionID"] for r in rows}
     logged, in_addtodb = logged_values(client, sessions) if rows else ({}, set())
     changes, lines = [], []
@@ -173,50 +189,164 @@ def cmd_list(client, out=None):
     with open(list_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines + [""] + summary_lines) + "\n")
     with open(plan_path, "w") as f:
-        json.dump({"table": TABLE, "changes": list(uniq.values())}, f, indent=2)
+        json.dump({"table": table, "changes": list(uniq.values())}, f, indent=2)
     print("\n".join(summary_lines), file=out)
+    return plan_path
 
 
-def run_changes(client, changes, forward: bool):
-    script, params = ["BEGIN TRANSACTION"], []
-    for i, c in enumerate(changes):
-        col = c["column"]
-        if col not in ("checkinDateTime", *REPLY_COLS):
-            raise SystemExit(f"unexpected column {col}")
+def _map_param(name: str, changes: list[dict], forward: bool) -> "bigquery.ArrayQueryParameter":
+    structs = []
+    for c in changes:
         old, new = (c["old"], c["new"]) if forward else (c["new"], c["old"])
-        script.append(f"UPDATE `{TABLE}` SET `{col}` = @n{i} WHERE SessionID = @s{i} AND `{col}` = @o{i}")
-        script.append(f"ASSERT @@row_count = {int(c['rows'])} AS 'change {i + 1} ({c['SessionID']} {col}) did not match {c['rows']} row(s)'")
-        params += [bigquery.ScalarQueryParameter(f"s{i}", "STRING", c["SessionID"]),
-                   bigquery.ScalarQueryParameter(f"o{i}", "DATETIME", datetime.fromisoformat(old)),
-                   bigquery.ScalarQueryParameter(f"n{i}", "DATETIME", datetime.fromisoformat(new))]
+        structs.append(bigquery.StructQueryParameter(
+            "placeholder",
+            bigquery.ScalarQueryParameter("fix_sid", "STRING", c["SessionID"]),
+            bigquery.ScalarQueryParameter("fix_old", "DATETIME", datetime.fromisoformat(old)),
+            bigquery.ScalarQueryParameter("fix_new", "DATETIME", datetime.fromisoformat(new)),
+            bigquery.ScalarQueryParameter("fix_rows", "INT64", int(c["rows"]))))
+    return bigquery.ArrayQueryParameter(name, "RECORD", structs)
+
+
+def build_script(table: str, changes: list[dict], forward: bool) -> tuple[str, list]:
+    """
+    One transaction. Per column, three statements:
+      ASSERT every change matches exactly its listed row count on its old value (nothing changed since
+             the list; no extra row carries the value);
+      UPDATE only the rows still holding the old value (set-based: one statement per column, not per row);
+      ASSERT the UPDATE touched exactly the listed total.
+    Any failed ASSERT aborts the whole transaction: nothing is half-done.
+    """
+    by_col: dict[str, list[dict]] = {}
+    for c in changes:
+        if c["column"] not in ("checkinDateTime", *REPLY_COLS):
+            raise SystemExit(f"unexpected column {c['column']}")
+        by_col.setdefault(c["column"], []).append(c)
+    script, params = ["BEGIN TRANSACTION"], []
+    for col, cs in by_col.items():
+        m, sids = f"m_{col}", f"sids_{col}"
+        total = sum(int(c["rows"]) for c in cs)
+        params += [_map_param(m, cs, forward),
+                   bigquery.ArrayQueryParameter(sids, "STRING", sorted({c["SessionID"] for c in cs}))]
+        script.append(
+            f"ASSERT (SELECT COUNT(*) FROM UNNEST(@{m}) LEFT JOIN "
+            f"(SELECT SessionID, `{col}` AS v, COUNT(*) AS n FROM `{table}` WHERE SessionID IN UNNEST(@{sids}) GROUP BY 1, 2) t "
+            f"ON t.SessionID = fix_sid AND t.v = fix_old WHERE IFNULL(t.n, 0) != fix_rows) = 0 "
+            f"AS '{col}: a listed row no longer holds its listed value, or the row count differs from the list'")
+        script.append(
+            f"UPDATE `{table}` AS tgt SET `{col}` = fix_new FROM UNNEST(@{m}) "
+            f"WHERE tgt.SessionID = fix_sid AND tgt.`{col}` = fix_old AND tgt.SessionID IN UNNEST(@{sids})")
+        script.append(f"ASSERT @@row_count = {total} AS '{col}: the update did not touch exactly {total} row(s)'")
     script.append("COMMIT TRANSACTION")
-    client.query(";\n".join(script) + ";", job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
+    return ";\n".join(script) + ";", params
 
 
-def main_():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("list", "apply", "rollback"):
-        raise SystemExit(__doc__)
-    client = make_client()
-    if sys.argv[1] == "list":
-        return cmd_list(client)
-    with open(sys.argv[2]) as f:
-        plan = json.load(f)
+def run_changes(client, changes, forward: bool, table: str = TABLE):
+    """Runs the transaction; returns the finished job (for duration and bytes billed)."""
+    sql, params = build_script(table, changes, forward)
+    job = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params))
+    job.result()
+    return job
+
+
+def refuse_unless_allowed(table: str, production: bool) -> None:
+    if not table.startswith(DEV_PREFIX) and not production:
+        raise SystemExit(f"refusing to write {table}: it is not a DEV table. The cutover's correction step on "
+                         f"production passes --production; anything else runs on a DEV clone (rehearse).")
+
+
+def job_cost(client, job) -> dict:
+    """Duration and bytes billed of a finished job; for a script, the sum over its child statements too."""
+    children = []
+    try:
+        children = list(client.list_jobs(parent_job=job.job_id))
+    except Exception:
+        pass
+    secs = (job.ended - job.started).total_seconds() if getattr(job, "ended", None) and getattr(job, "started", None) else None
+    return {"seconds": secs, "bytes_billed": job.total_bytes_billed,
+            "child_statements": len(children),
+            "child_bytes_billed": sum((c.total_bytes_billed or 0) for c in children) if children else None}
+
+
+def remaining(client, table: str) -> int:
+    return len(list(client.query(candidates_sql(table)).result()))
+
+
+def cmd_apply(client, plan: dict, production: bool, forward: bool = True) -> dict:
+    table = plan["table"]
+    refuse_unless_allowed(table, production)
     changes = plan["changes"]
     sids = sorted({c["SessionID"] for c in changes})
-    if sys.argv[1] == "apply":
-        backup = f"{PROJECT}.DEV.adb_eastern_fix_backup_{stamp()}"
-        client.query(f"CREATE TABLE `{backup}` AS SELECT * FROM `{TABLE}` WHERE SessionID IN UNNEST(@s)",
+    backup = None
+    if forward:
+        backup = f"{DEV_PREFIX}adb_eastern_fix_backup_{stamp()}"
+        client.query(f"CREATE TABLE `{backup}` AS SELECT * FROM `{table}` WHERE SessionID IN UNNEST(@s)",
                      job_config=bigquery.QueryJobConfig(query_parameters=[
                          bigquery.ArrayQueryParameter("s", "STRING", sids)])).result()
         n = list(client.query(f"SELECT COUNT(*) n FROM `{backup}`").result())[0]["n"]
         print(f"backup: {backup} ({n} rows)")
-        run_changes(client, changes, forward=True)
-        print(f"applied {len(changes)} changes in one transaction")
+    job = run_changes(client, changes, forward=forward, table=table)
+    cost = job_cost(client, job)
+    left = remaining(client, table)
+    what = "applied" if forward else "rolled back"
+    secs = f"{cost['seconds']:.1f} s, " if cost["seconds"] is not None else ""
+    print(f"{what} {len(changes)} changes on {table} in one transaction (committed): {secs}"
+          f"{cost['bytes_billed'] or 0:,} bytes billed, {cost['child_statements']} statements")
+    print(f"rows still stored in local time: {left}")
+    return {"cost": cost, "left": left, "backup": backup}
+
+
+def cmd_rehearse(client, keep: bool = False) -> bool:
+    run = stamp()
+    clone = f"{DEV_PREFIX}adb_eastern_rehearsal_{run}"
+    client.query(f"CREATE TABLE `{clone}` CLONE `{TABLE}`").result()
+    print(f"clone: {clone} (of {TABLE} as of now)")
+    made = [clone]
+    try:
+        before = remaining(client, clone)
+        plan_path = cmd_list(client, table=clone)
+        with open(plan_path) as f:
+            plan = json.load(f)
+        rows_listed = sum(int(c["rows"]) for c in plan["changes"] if c["column"] == "checkinDateTime")
+        print(f"\nrehearsal: {before} rows in local time on the clone; {len(plan['changes'])} changes planned")
+        fwd = cmd_apply(client, plan, production=False, forward=True)
+        made.append(fwd["backup"])
+        back = cmd_apply(client, plan, production=False, forward=False)
+        ok = fwd["left"] == 0 and back["left"] == before and rows_listed == before
+        print(f"\nREHEARSAL {'PASS' if ok else 'FAIL'}: apply committed in {fwd['cost']['seconds']:.1f} s, "
+              f"{fwd['cost']['bytes_billed'] or 0:,} bytes billed, left {fwd['left']} rows in local time (want 0); "
+              f"rollback committed in {back['cost']['seconds']:.1f} s, restored {back['left']} of {before}")
+        return ok
+    finally:
+        if keep:
+            print(f"kept {', '.join(made)}")
+        else:
+            for t in made:
+                client.delete_table(t, not_found_ok=True)
+            print(f"dropped {', '.join(made)}")
+
+
+def main_(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("action", choices=("list", "rehearse", "apply", "rollback"))
+    ap.add_argument("plan", nargs="?")
+    ap.add_argument("--table", default=TABLE, help="list only: the table to read (default RESPONSES.response_data)")
+    ap.add_argument("--production", action="store_true", help="apply/rollback: allow a plan whose table is not in DEV")
+    ap.add_argument("--keep", action="store_true", help="rehearse: keep the clone and its backup")
+    args = ap.parse_args(argv)
+    if args.action in ("apply", "rollback"):
+        if not args.plan:
+            raise SystemExit(f"{args.action} needs the plan file")
+        with open(args.plan) as f:
+            plan = json.load(f)
+        refuse_unless_allowed(plan["table"], args.production)      # before any sign-in or query
+    client = make_client()
+    if args.action == "list":
+        cmd_list(client, table=args.table)
+    elif args.action == "rehearse":
+        if not cmd_rehearse(client, keep=args.keep):
+            raise SystemExit(1)
     else:
-        run_changes(client, changes, forward=False)
-        print(f"rolled back {len(changes)} changes in one transaction")
-    left = [dict(r) for r in client.query(CANDIDATES).result()]
-    print(f"rows still stored in local time: {len(left)}")
+        cmd_apply(client, plan, production=args.production, forward=args.action == "apply")
 
 
 if __name__ == "__main__":

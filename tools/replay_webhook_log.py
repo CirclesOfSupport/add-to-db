@@ -576,7 +576,7 @@ def main_():
                 config.STAGED_TARGETS = {"users", "responses"}
                 config.FLUSH_BUCKET_S = max(1, round(30 / args.speed))
                 config.FLUSH_SAFETY_S = max(1, round(20 / args.speed))
-                svc.enqueue_flush = lambda *a: None       # the replay flushes on its own timer; nothing goes to Cloud Tasks
+                svc.enqueue_flush = lambda *a, **k: None       # the replay flushes on its own timer; nothing goes to Cloud Tasks
                 svc._last_kicked_bucket = None
                 runner = LiveRunner(svc, config, args.speed)
             elif variant == "staged":

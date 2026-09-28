@@ -68,7 +68,7 @@ main.enqueue_write = lambda path, target, data: queued.append((path, target, dat
 if hasattr(config, "STAGED_TARGETS"):
     config.STAGED_TARGETS = {"users", "responses"}          # the cutover setting must not touch these targets
 if hasattr(main, "enqueue_flush"):
-    main.enqueue_flush = lambda *a: rec.events.append({"flush_kick": True})
+    main.enqueue_flush = lambda *a, **k: rec.events.append({"flush_kick": True})
 
 web = main.app.test_client()
 with open(calls_path) as f:

@@ -31,21 +31,28 @@ def staged(svc, monkeypatch):
                                          F("finished_at", "TIMESTAMP"), F("from_wm", "TIMESTAMP"),
                                          F("to_wm", "TIMESTAMP"), F("items", "INT64"), F("statements", "INT64"),
                                          F("dead_letters", "INT64"), F("attempts", "INT64"), F("status", "STRING"),
-                                         F("error", "STRING")])
+                                         F("error", "STRING"), F("refs", "STRING", mode="REPEATED")])
     fake.create(config.FLUSH_STATE_TABLE, [F("id", "STRING"), F("watermark", "TIMESTAMP"),
-                                           F("version", "INT64"), F("updated_at", "TIMESTAMP")])
+                                           F("version", "INT64"), F("updated_at", "TIMESTAMP"),
+                                           F("paused_since", "TIMESTAMP")])
     for target in ("responses", "users"):
         fake.insert_raw(config.FLUSH_STATE_TABLE, {"id": f"flush:{target}", "updated_at": None, "version": 0,
-                                                   "watermark": datetime(1970, 1, 1, tzinfo=timezone.utc)})
+                                                   "watermark": datetime(1970, 1, 1, tzinfo=timezone.utc),
+                                                   "paused_since": None})
     monkeypatch.setattr(config, "STAGED_TARGETS", {"users", "responses"})
     clock = [0.0]                                  # sleeping advances a fake clock, so retry budgets run out
     monkeypatch.setattr(svc.time_module, "sleep", lambda secs: clock.__setitem__(0, clock[0] + secs))
     monkeypatch.setattr(svc.time_module, "monotonic", lambda: clock[0])
-    kicks = []
-    monkeypatch.setattr(svc, "enqueue_flush", lambda bucket, when: kicks.append((bucket, when)) or f"flush-{bucket}")
+    kicks, tasks = [], []                          # kicks: per-bucket flushes; tasks: every flush-queue task
+    def enqueue(bucket, when, kind="flush", body=None):
+        tasks.append({"kind": kind, "key": bucket, "when": when, "body": body})
+        if kind == "flush":
+            kicks.append((bucket, when))
+        return f"{kind}-{bucket}"
+    monkeypatch.setattr(svc, "enqueue_flush", enqueue)
     monkeypatch.setattr(svc, "_last_kicked_bucket", None)
     monkeypatch.setattr(svc, "is_task_request_authorized", lambda req: True)
-    svc.kicks = kicks
+    svc.kicks, svc.tasks, svc.clock = kicks, tasks, clock
     return svc
 
 
@@ -220,7 +227,7 @@ def test_a_second_writer_cannot_commit(staged, monkeypatch):
     def stale_once(target):                  # a slow writer: its first read predates the other commit
         reads.append(target)
         if target == "responses" and reads.count("responses") == 1:
-            return {"watermark": T0 + timedelta(seconds=40), "version": 0}
+            return {"watermark": T0 + timedelta(seconds=40), "version": 0, "paused_since": None}
         return real(target)
     monkeypatch.setattr(staged, "_read_flush_state", stale_once)
     out = staged.run_flush_cycle(now=T0 + timedelta(seconds=90))
@@ -252,12 +259,16 @@ def test_health_ok_when_clean_alert_only_while_failing(staged, caplog):
 
 
 def test_health_sees_a_call_that_arrived_after_its_flush(staged):
-    stage(staged, [("users", {"uuid": UUID})], T0)
-    staged.run_flush_cycle(now=T0 + timedelta(seconds=60))
-    stage(staged, [("users", {"uuid": UUID, "orgID": "9"})], T0 + timedelta(seconds=10))   # late, inside the flushed range
-    h = staged.flush_health()
-    assert h["targets"]["users"]["flushes_with_late_calls_24h"] == 1 and h["status"] == "alert"
-    assert h["targets"]["responses"]["flushes_with_late_calls_24h"] == 0
+    now = datetime.now(timezone.utc)
+    stage(staged, [("users", {"uuid": UUID})], now - timedelta(seconds=100))
+    staged.run_flush_cycle(now=now)
+    stage(staged, [("users", {"uuid": UUID, "orgID": "9"})], now - timedelta(seconds=90))   # late, inside the flushed range
+    h = staged.flush_health(now=now)
+    assert h["targets"]["users"]["late_calls_not_dead_lettered"] == 1 and h["status"] == "alert"
+    assert h["targets"]["responses"]["late_calls_not_dead_lettered"] == 0
+    staged.run_flush_cycle(now=now, late_check=True)            # the sweep's flush dead-letters it
+    h = staged.flush_health(now=now)
+    assert h["targets"]["users"]["late_calls_not_dead_lettered"] == 0 and h["status"] == "ok", h
 
 
 def test_flush_endpoint_returns_500_for_a_retry(staged):
@@ -281,10 +292,10 @@ def test_retry_lines_carry_the_whole_reason(staged, caplog):
     assert line.endswith("Reason: Transaction is aborted due to concurrent update")
 
 
-def test_flush_kick_requests_the_current_bucket(staged):
+def test_flush_kick_requests_the_sweep_flush_under_its_own_name(staged):
     r = staged.app.test_client().post("/tasks/flush-kick")
-    assert r.status_code == 200 and len(staged.kicks) == 1
-    assert r.get_json()["bucket"] == staged.kicks[0][0]
+    assert r.status_code == 200 and staged.kicks == []          # never the name a call in this bucket asks for
+    assert [(t["kind"], t["key"], t["body"]) for t in staged.tasks] == [("sweep", r.get_json()["bucket"], {"late_check": True})]
 
 
 def test_contended_users_gives_up_within_its_short_budget(staged):

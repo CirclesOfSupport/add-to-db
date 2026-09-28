@@ -15,6 +15,12 @@ Scenarios:
   6  flushes while another writer keeps updating users (the nightly contacts sync):
      a failed flush writes nothing and a retry commits
   7  the health check sees backlog, failures and dead letters
+  8  a maintenance pause: the flush writes nothing, health says "paused", the sweep raises no backlog
+     alert; unpaused, the same backlog alerts; after a flush it does not
+  9  a backlog drains in bounded flushes (cap 5 here), each flush asking for the next at once, and
+     each flush reads each table's schema once
+ 10  a call that lands behind its flush is dead-lettered (stage late) by the sweep's flush, not written,
+     and only once
 
     python tools/prove_staged.py
 """
@@ -88,7 +94,7 @@ def _run(args, client, run, prefix, ds, rd, us, statements):
     config.FLUSH_SAFETY_S = 5     # production default is 20; shorter here so the proof runs in minutes
     svc = load_service(client, {"responses": rd, "users": us})
     kicks = []
-    svc.enqueue_flush = lambda bucket, when: kicks.append(bucket)
+    svc.enqueue_flush = lambda bucket, when, kind="flush", body=None: kicks.append((kind, bucket))
     web = svc.app.test_client()
     results = []
 
@@ -258,6 +264,79 @@ def _run(args, client, run, prefix, ds, rd, us, statements):
     check("7 health ok when nothing is failing",
           h["status"] == "ok" and all(t["consecutive_failed_flushes"] == 0 and t["backlog_calls"] == 0
                                       for t in h["targets"].values()) and h["dead_letters_24h"] >= 1, h)
+
+    # 8. maintenance pause
+    st_table = config.FLUSH_STATE_TABLE
+
+    def set_pause(on):
+        client.query(f"UPDATE `{st_table}` SET paused_since = {'CURRENT_TIMESTAMP()' if on else 'NULL'} "
+                     f"WHERE id LIKE 'flush:%'").result()
+    alert_s = config.BACKLOG_ALERT_S
+    config.BACKLOG_ALERT_S = 1              # production 300 s; 1 s here so a few seconds of backlog counts as old
+    try:
+        set_pause(True)
+        post(("users", {"uuid": UUID, "checkInRepliesTotal": "8000"}), ("responses", body(8000, "paused")))
+        out = flush_now()
+        paused_rows = rows(f"SELECT COUNT(*) n FROM `{config.ALLOWED_TARGETS['responses']}` WHERE SessionID = @s", s=sid(8000))
+        h = svc.flush_health()
+        quiet = svc.sweep_check()
+        set_pause(False)
+        loud = svc.sweep_check()
+        flush_now()
+        after = svc.sweep_check()
+        landed = rows(f"SELECT COUNT(*) n FROM `{config.ALLOWED_TARGETS['responses']}` WHERE SessionID = @s", s=sid(8000))
+    finally:
+        config.BACKLOG_ALERT_S = alert_s
+    check("8 paused: nothing written, health 'paused', no backlog alert; unpaused: alert; flushed: none",
+          all(v.get("status") == "paused" for v in out["targets"].values()) and paused_rows[0]["n"] == 0
+          and h["status"] == "paused" and quiet == [] and any(a.startswith("BACKLOG") for a in loud)
+          and after == [] and landed[0]["n"] == 1,
+          f"flush {out}, rows while paused {paused_rows}, health {h}, sweep paused {quiet}, unpaused {loud}, "
+          f"after {after}, rows after {landed}")
+
+    # 9. bounded drain, one schema read per table per flush
+    cap = config.FLUSH_MAX_ITEMS
+    config.FLUSH_MAX_ITEMS = 5
+    reads = []
+    real_get_table = client.get_table
+    client.get_table = lambda t, *a, **k: reads.append(str(t)) or real_get_table(t, *a, **k)
+    try:
+        for n in range(9000, 9012):
+            post(("users", {"uuid": UUID, "checkInRepliesTotal": str(n)}), ("responses", body(n, f"d{n}")))
+            time.sleep(0.2)                  # distinct receive times
+        del kicks[:]
+        taken, secs, per_flush_reads = [], [], []
+        for _ in range(4):
+            reads.clear()
+            out = flush_now()
+            taken.append(out["targets"]["responses"]["items"])
+            secs.append(round(timing["last"], 1))
+            per_flush_reads.append(len(reads))
+        drains = [k for k in kicks if k[0] == "drain"]
+    finally:
+        config.FLUSH_MAX_ITEMS = cap
+        client.get_table = real_get_table
+    landed = rows(f"SELECT COUNT(*) n FROM `{config.ALLOWED_TARGETS['responses']}` WHERE SessionID LIKE @p",
+                  p=f"staged-proof-{run}-90%")
+    check("9 backlog drains 5 + 5 + 2, each flush asks for the next, at most one schema read per table per flush",
+          taken == [5, 5, 2, 0] and len(drains) == 2 and landed[0]["n"] == 12 and max(per_flush_reads) <= 2,
+          f"taken {taken}, drain requests {drains}, rows {landed}, schema reads per flush {per_flush_reads}")
+    print(f"      flush seconds {secs}, schema reads per flush {per_flush_reads}")
+
+    # 10. a call that lands behind its flush
+    wm = svc._read_flush_state("responses")["watermark"]
+    svc.stage_calls([("responses", body(10000, "late"))], wm - timedelta(seconds=1))
+    first = svc.run_flush_cycle(late_check=True)
+    second = svc.run_flush_cycle(late_check=True)
+    late_dl = rows(f"SELECT COUNT(*) n FROM `{config.DEAD_LETTER_TABLE}` WHERE stage = 'late' AND payload LIKE @p",
+                   p=f"%{sid(10000)}%")
+    written = rows(f"SELECT COUNT(*) n FROM `{config.ALLOWED_TARGETS['responses']}` WHERE SessionID = @s", s=sid(10000))
+    check("10 late call dead-lettered once by the sweep's flush, never written",
+          first["targets"]["responses"].get("late_dead_lettered") == 1
+          and second["targets"]["responses"].get("late_dead_lettered") == 0
+          and late_dl[0]["n"] == 1 and written[0]["n"] == 0,
+          f"first {first['targets'].get('responses')}, second {second['targets'].get('responses')}, "
+          f"dead letters {late_dl}, written {written}")
 
     print()
     failed = sum(1 for _, ok, _ in results if not ok)

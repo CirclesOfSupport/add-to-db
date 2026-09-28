@@ -1,17 +1,45 @@
 """
-DDL for the single-writer tables.
+DDL for the single-writer tables, and the step that creates and checks them.
 
-    python tools/staged_ddl.py RESPONSES              print the statements (review, then run them)
+    python tools/staged_ddl.py RESPONSES              print the statements (to read them)
     python tools/staged_ddl.py --dry-run RESPONSES    ask BigQuery to validate every CREATE (writes nothing)
+    python tools/staged_ddl.py --apply RESPONSES      validate, create the four tables and the two state
+                                                      rows, then verify them; exit 0 only if all is right
+    python tools/staged_ddl.py --verify RESPONSES     verify only (read-only): the four tables, their
+                                                      columns, and exactly the two state rows
 
-The proof tool dry-runs, creates and uses the same statements in DEV; the
-closing INSERT can only be validated once its table exists, which the proof does.
+--apply runs each statement itself through the BigQuery client (never through a shell argument, so
+there is no line-joining step to get wrong). A table that already exists stops it before anything
+else is created; nothing is replaced. --verify is the read-only check.
 """
 from __future__ import annotations
 
 import sys
 
 PROJECT = "early-alert-responses"
+TABLES = ("staging", "dead_letter", "flush_log", "flush_state")
+STATE_IDS = ("flush:responses", "flush:users")
+
+# column -> (type, mode) the flush code relies on; --verify checks each one
+REQUIRED_COLUMNS = {
+    "staging": {"request_id": ("STRING", "REQUIRED"), "item_index": ("INTEGER", "REQUIRED"),
+                "target": ("STRING", "REQUIRED"), "received_at": ("TIMESTAMP", "REQUIRED"),
+                "payload": ("STRING", "REQUIRED")},
+    "dead_letter": {"recorded_at": ("TIMESTAMP", "NULLABLE"), "received_at": ("TIMESTAMP", "NULLABLE"),
+                    "request_id": ("STRING", "NULLABLE"), "item_index": ("INTEGER", "NULLABLE"),
+                    "target": ("STRING", "NULLABLE"), "stage": ("STRING", "NULLABLE"),
+                    "errors": ("STRING", "NULLABLE"), "payload": ("STRING", "NULLABLE")},
+    "flush_log": {"flush_id": ("STRING", "NULLABLE"), "target": ("STRING", "NULLABLE"),
+                  "started_at": ("TIMESTAMP", "NULLABLE"), "finished_at": ("TIMESTAMP", "NULLABLE"),
+                  "from_wm": ("TIMESTAMP", "NULLABLE"), "to_wm": ("TIMESTAMP", "NULLABLE"),
+                  "items": ("INTEGER", "NULLABLE"), "statements": ("INTEGER", "NULLABLE"),
+                  "dead_letters": ("INTEGER", "NULLABLE"), "attempts": ("INTEGER", "NULLABLE"),
+                  "status": ("STRING", "NULLABLE"), "error": ("STRING", "NULLABLE"),
+                  "refs": ("STRING", "REPEATED")},
+    "flush_state": {"id": ("STRING", "REQUIRED"), "watermark": ("TIMESTAMP", "REQUIRED"),
+                    "version": ("INTEGER", "REQUIRED"), "updated_at": ("TIMESTAMP", "NULLABLE"),
+                    "paused_since": ("TIMESTAMP", "NULLABLE")},
+}
 
 
 def ddl(dataset: str, prefix: str = "adb_") -> list[str]:
@@ -27,18 +55,20 @@ OPTIONS (partition_expiration_days = 30,
   recorded_at TIMESTAMP, received_at TIMESTAMP, request_id STRING, item_index INT64,
   target STRING, stage STRING, errors STRING, payload STRING)
 PARTITION BY DATE(recorded_at)
-OPTIONS (description = 'add-to-db: calls that failed validation (stage upsert) or pre-flight at flush (stage flush).')""",
+OPTIONS (description = 'add-to-db: calls not written -- failed validation (upsert), pre-flight at flush (flush), or became visible after their flush (late).')""",
         f"""CREATE TABLE {t('flush_log')} (
   flush_id STRING, target STRING, started_at TIMESTAMP, finished_at TIMESTAMP, from_wm TIMESTAMP, to_wm TIMESTAMP,
-  items INT64, statements INT64, dead_letters INT64, attempts INT64, status STRING, error STRING)
+  items INT64, statements INT64, dead_letters INT64, attempts INT64, status STRING, error STRING,
+  refs ARRAY<STRING>)
 PARTITION BY DATE(started_at)
-OPTIONS (description = 'add-to-db: one row per target per flush (ok rows are written in the flush transaction).')""",
+OPTIONS (description = 'add-to-db: one row per target per flush (ok rows are written in the flush transaction); refs = request_id:item_index of every call the flush took.')""",
         f"""CREATE TABLE {t('flush_state')} (
-  id STRING NOT NULL, watermark TIMESTAMP NOT NULL, version INT64 NOT NULL, updated_at TIMESTAMP)
-OPTIONS (description = 'add-to-db: one watermark per target for the single writer (compare-and-set on version).')""",
-        f"""INSERT INTO {t('flush_state')} (id, watermark, version, updated_at)
-VALUES ('flush:responses', CURRENT_TIMESTAMP(), 0, CURRENT_TIMESTAMP()),
-       ('flush:users', CURRENT_TIMESTAMP(), 0, CURRENT_TIMESTAMP())""",
+  id STRING NOT NULL, watermark TIMESTAMP NOT NULL, version INT64 NOT NULL, updated_at TIMESTAMP,
+  paused_since TIMESTAMP)
+OPTIONS (description = 'add-to-db: one watermark per target for the single writer (compare-and-set on version); paused_since set = maintenance pause.')""",
+        f"""INSERT INTO {t('flush_state')} (id, watermark, version, updated_at, paused_since)
+VALUES ('flush:responses', CURRENT_TIMESTAMP(), 0, CURRENT_TIMESTAMP(), NULL),
+       ('flush:users', CURRENT_TIMESTAMP(), 0, CURRENT_TIMESTAMP(), NULL)""",
     ]
 
 
@@ -54,16 +84,69 @@ def dry_run(client, statements) -> list[str]:
     return failures
 
 
+def verify(client, dataset: str, prefix: str = "adb_") -> list[str]:
+    """Read-only: every table and required column present, and exactly the two state rows, unpaused. Returns problems."""
+    problems = []
+    for name in TABLES:
+        table_id = f"{PROJECT}.{dataset}.{prefix}{name}"
+        try:
+            schema = {f.name: (f.field_type, f.mode) for f in client.get_table(table_id).schema}
+        except Exception as exc:
+            problems.append(f"{table_id}: not readable ({str(exc).splitlines()[0]})")
+            continue
+        for col, want in REQUIRED_COLUMNS[name].items():
+            got = schema.get(col)
+            if got is None:
+                problems.append(f"{table_id}: column {col} missing")
+            elif (got[0].replace("INT64", "INTEGER"), got[1] or "NULLABLE") != want:
+                problems.append(f"{table_id}: column {col} is {got[0]} {got[1]}, expected {want[0]} {want[1]}")
+    if not problems:
+        rows = [dict(r) for r in client.query(
+            f"SELECT id, version, paused_since FROM `{PROJECT}.{dataset}.{prefix}flush_state` ORDER BY id").result()]
+        ids = [r["id"] for r in rows]
+        if ids != sorted(STATE_IDS):
+            problems.append(f"flush_state rows are {ids}, expected exactly {sorted(STATE_IDS)}")
+        problems += [f"flush_state {r['id']} is paused since {r['paused_since']}" for r in rows if r["paused_since"] is not None]
+    return problems
+
+
+def apply(client, dataset: str, prefix: str = "adb_", out=print) -> list[str]:
+    """Validate, create and verify. Stops at the first failure; never replaces an existing table."""
+    statements = ddl(dataset, prefix)
+    creates = [s for s in statements if s.startswith("CREATE")]
+    failed = dry_run(client, creates)
+    if failed:
+        return [f"DDL does not validate, nothing created: {f}" for f in failed]
+    existing = {t.table_id for t in client.list_tables(f"{PROJECT}.{dataset}")}
+    already = [f"{prefix}{n}" for n in TABLES if f"{prefix}{n}" in existing]
+    if already:
+        return [f"already exists, nothing created: {PROJECT}.{dataset}.{n}" for n in already]
+    for stmt in statements:
+        client.query(stmt).result()
+        out(f"ran: {stmt.splitlines()[0]}")
+    return verify(client, dataset, prefix)
+
+
 if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     dataset = args[0] if args else "RESPONSES"
     statements = ddl(dataset)
-    if "--dry-run" in sys.argv:
+    if "--dry-run" in sys.argv or "--apply" in sys.argv or "--verify" in sys.argv:
         from _harness import make_client
-        creates = [s for s in statements if s.startswith("CREATE")]
-        failed = dry_run(make_client(), creates)
-        for f in failed:
-            print("FAIL", f)
-        print(f"{len(creates) - len(failed)} of {len(creates)} CREATE statements valid for {dataset}")
-        sys.exit(1 if failed else 0)
+        client = make_client()
+        if "--dry-run" in sys.argv:
+            creates = [s for s in statements if s.startswith("CREATE")]
+            failed = dry_run(client, creates)
+            for f in failed:
+                print("FAIL", f)
+            print(f"{len(creates) - len(failed)} of {len(creates)} CREATE statements valid for {dataset}")
+            sys.exit(1 if failed else 0)
+        problems = apply(client, dataset) if "--apply" in sys.argv else verify(client, dataset)
+        for p in problems:
+            print("FAIL", p)
+        if problems:
+            sys.exit(1)
+        print(f"OK: {PROJECT}.{dataset} has adb_staging, adb_dead_letter, adb_flush_log, adb_flush_state with every "
+              f"required column, and exactly the state rows {', '.join(STATE_IDS)}, neither paused")
+        sys.exit(0)
     print(";\n\n".join(statements) + ";")
