@@ -266,3 +266,102 @@ def test_cli_refuses_production_plan_before_signing_in(tmp_path, monkeypatch):
 
 def test_same_treats_blank_as_null_and_numbers_by_value():
     assert G.same("", None) and G.same(None, "  ") and G.same(8, 8.0) and not G.same("No", None)
+
+
+# --- review 2026-09-28: interrupted runs are not replies ----------------------------------------
+# Four patterns checked against the TextIt API by the reviewer: three runs interrupted by the
+# contact's next check-in (value '', category "No Response", time = the interruption) and one real
+# reply (a scored reply with text, category "All Responses"). Identifiers here are synthetic.
+
+def result(value, category, t):
+    return {"flow": "F", "uuid": "r", "contact": U1, "created_on": "2026-09-25T16:01:09Z",
+            "values": {"checkinresponse": {"value": value, "category": category, "time": t}}}
+
+
+INTERRUPTED = [result("", "No Response", "2026-09-26T14:05:30.616577Z"),
+               result("", "No Response", "2026-09-26T18:02:03.703737Z"),
+               result("", "No Response", "2026-09-26T18:47:01.179880Z")]
+REAL = result("5 = neutral 😐 thanks for asking", "All Responses", "2026-09-26T16:37:23.964784Z")
+CALL_NO_REPLY = {"checkinReply": "No", "checkinReplyText": None, "checkinReplyNumerical": None,
+                 "checkinReplyDistressed": None, "checkinReplyDateTime": None}
+
+
+def test_interrupted_run_is_not_a_reply():
+    m = G.learn_mapping(agreeing())
+    for r in INTERRUPTED:
+        assert G.run_reply(r)[0] is False and G.run_reply(r)[3] is None
+        row, verdict, _ = G.apply_run(dict(CALL_NO_REPLY), r, m, {"F"})
+        assert verdict == "agree" and row == CALL_NO_REPLY          # the stored "No" stays "No"
+    assert G.run_reply(result("7", "no response", "2026-09-26T14:05:30Z"))[0] is False   # category, any case
+    assert G.run_reply(result("  ", "All Responses", "2026-09-26T14:05:30Z"))[0] is False  # empty value
+
+
+def test_real_reply_run_fills_the_reply():
+    row, verdict, _ = G.apply_run(dict(CALL_NO_REPLY), REAL, G.learn_mapping(agreeing()), {"F"})
+    assert verdict == "run: reply the call lacks"
+    assert row["checkinReply"] == "Yes" and row["checkinReplyText"] == "5 = neutral 😐 thanks for asking"
+    assert row["checkinReplyDateTime"] == datetime(2026, 9, 26, 16, 37, 23, 964784)
+
+
+def test_list_stops_when_runs_outweigh_calls(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    runs = tmp_path / "runs.json"
+    runs.write_text("[]")
+    fake = {"totals": {}, "sessions": [], "_ctx": {"sessions": {"x": {"verdict": "run: reply the call lacks"}},
+                                                   "excluded": {}, "call_changed": 40, "run_changed": 51}}
+    monkeypatch.setattr(G, "build_plan", lambda *a, **k: dict(fake))
+    with pytest.raises(SystemExit, match="runs rule is suspect"):
+        G.cmd_list(object(), ["F"], table="p.DEV.x", runs_file=str(runs))
+    assert not list(tmp_path.glob("gap_repair_plan_*.json"))
+
+
+# --- review 2026-09-28: generated SQL, dry-run forms --------------------------------------------
+
+def test_stored_read_with_only_the_key_is_valid_sql():
+    sql = G.read_stored_sql("p.DEV.t", ["SessionID"])
+    assert sql == "SELECT SessionID, FARM_FINGERPRINT(TO_JSON_STRING(t)) AS gap_fp FROM `p.DEV.t` t WHERE SessionID IN UNNEST(@s)"
+    assert ", ," not in G.read_stored_sql("p.DEV.t", ["SessionID", "uuid"])
+
+
+def test_dry_run_forms_of_the_apply_script():
+    sql, _ = G.build_apply_script("p.DEV.t", PLAN, "p.DEV.rows")
+    forms = G.dry_run_forms(sql)
+    joined = "\n".join(forms)
+    for gone in ("BEGIN", "COMMIT", "DECLARE", "SET gap_before", "@@row_count", "gap_keep", "ASSERT", "CREATE TEMP"):
+        assert gone not in joined
+    assert any(f.startswith("MERGE") for f in forms) and any(f.startswith("DELETE") for f in forms)
+    assert any(f.startswith("INSERT INTO `p.DEV.t` SELECT * FROM (SELECT * EXCEPT(gap_rn)") for f in forms)
+    assert any(f.endswith("= 0 + -1") for f in forms)                            # row-count check, variable as 0
+    rb, _ = G.build_rollback_script("p.DEV.t", {"backup": "p.DEV.bk", "sessions": [
+        {"sid": "a", "before": [0, ""], "after": [1, "7"]}]})
+    assert [f.split()[0] for f in G.dry_run_forms(rb)] == ["SELECT", "DELETE", "INSERT", "SELECT"]
+
+
+class _DryBQ:
+    def __init__(self, reject=""):
+        self.seen, self.reject = [], reject
+
+    def query(self, sql, job_config=None):
+        assert job_config.dry_run is True
+        self.seen.append((sql, sorted(p.name for p in job_config.query_parameters)))
+        if self.reject and self.reject in sql:
+            raise Exception("400 Syntax error: Expected end of input but got \",\" at [1:19]")
+        return _Job([])
+
+
+def test_preflight_dry_runs_each_statement_with_only_its_parameters():
+    sql, params = G.build_apply_script("p.DEV.t", PLAN, "p.DEV.rows")
+    bq = _DryBQ()
+    G.preflight(bq, [(x, params) for x in G.dry_run_forms(sql)])
+    merge = next(p for s, p in bq.seen if s.startswith("MERGE"))
+    assert merge == ["gap_max_ranged", "gap_min_ranged"]
+    with pytest.raises(SystemExit, match="Syntax error"):
+        G.preflight(_DryBQ(reject="DELETE"), [(x, params) for x in G.dry_run_forms(sql)])
+
+
+def test_rollback_without_an_after_state_checks_one_row_each():
+    sql, params = G.build_rollback_script("p.DEV.t", {"backup": "p.DEV.bk", "sessions": [
+        {"sid": "a", "before": [0, ""], "after": None}]})
+    after = next(p for p in params if p.name == "gap_after")
+    assert after.values[0].struct_values == {"sid": "a", "n": 1, "fps": None}
+    assert "p.fps IS NOT NULL AND" in sql

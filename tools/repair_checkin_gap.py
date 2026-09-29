@@ -75,6 +75,7 @@ WINDOW_END = datetime(2026, 9, 29, 0, 57, 0, tzinfo=UTC)        # after the old 
 CLOSEOUT_S = 2
 RUN_MATCH_S = 5
 REPLY_AGREE_S = 2
+GATE_MIN = 50       # the list stops if the runs would change more replies than this AND more than the calls do
 MAPPING_MIN = 20
 REPLY_FIELDS = config.STALE_REPLY_FIELDS["responses"]
 CONVENTIONS = config.DATETIME_CONVENTIONS["responses"]
@@ -234,13 +235,27 @@ def match_run(by_contact, uuid: str, checkin):
     return best[1] if best else None
 
 
+NO_RESPONSE = "no response"
+
+
 def run_reply(run):
-    """(replied, value, category, time naive UTC) from the run's checkinresponse result."""
+    """
+    (replied, value, category, time naive UTC) from the run's checkinresponse result.
+
+    A reply only when the category is not "No Response" and the value is not empty. TextIt writes
+    value '' / category "No Response" when the run is interrupted (typically by the contact's next
+    check-in); that result's time is the interruption, not a reply.
+    """
     res = (run.get("values") or {}).get("checkinresponse")
     if not res:
         return False, None, None, None
+    value, cat = res.get("value"), res.get("category")
     t = _aware(res.get("time"))
-    return t is not None, res.get("value"), res.get("category"), (t.astimezone(UTC).replace(tzinfo=None) if t else None)
+    replied = (t is not None and str(cat or "").strip().lower() != NO_RESPONSE
+               and value is not None and str(value).strip() != "")
+    if not replied:
+        return False, value, cat, None
+    return True, value, cat, t.astimezone(UTC).replace(tzinfo=None)
 
 
 def _num(value):
@@ -313,12 +328,16 @@ def apply_run(row: dict, run, mapping: dict, usable_flows: set) -> tuple[dict, s
 # stored rows
 # ---------------------------------------------------------------------------------------------
 
+def read_stored_sql(table: str, cols: list[str]) -> str:
+    sel = ", ".join(["SessionID"] + [quote_identifier(c) for c in cols if c != "SessionID"]
+                    + ["FARM_FINGERPRINT(TO_JSON_STRING(t)) AS gap_fp"])
+    return f"SELECT {sel} FROM `{table}` t WHERE SessionID IN UNNEST(@s)"
+
+
 def read_stored(client, table: str, sids: list[str], cols: list[str]) -> dict[str, list[dict]]:
     if not sids:
         return {}
-    sel = ", ".join(quote_identifier(c) for c in cols if c != "SessionID")
-    sql = (f"SELECT SessionID, {sel}, FARM_FINGERPRINT(TO_JSON_STRING(t)) AS gap_fp "
-           f"FROM `{table}` t WHERE SessionID IN UNNEST(@s)")
+    sql = read_stored_sql(table, cols)
     out = defaultdict(list)
     cfg = bigquery.QueryJobConfig(query_parameters=[bigquery.ArrayQueryParameter("s", "STRING", sorted(sids))])
     for r in client.query(sql, job_config=cfg).result():
@@ -415,6 +434,13 @@ def build_plan(client, table: str, runs: list[dict], flows: list[str], out=None)
             s["collapse"] = len(rows) > 1
             s["update"] = bool(rows) and bool(s["changed"])
 
+    call_changed = run_changed = 0
+    for s in sessions.values():
+        call = _reply(s["call_row"].get("checkinReply"))
+        stored_replies = [_reply(r.get("checkinReply")) for r in s["stored"]]
+        call_changed += (call == "Yes" and not stored_replies) or any(v != call for v in stored_replies)
+        run_changed += _reply(s["row"].get("checkinReply")) != call
+
     types = {f.name: f.field_type.upper() for f in schema}
     actions = [s for s in sessions.values() if s["insert"] or s["update"] or s["collapse"]]
     plan = {
@@ -431,7 +457,8 @@ def build_plan(client, table: str, runs: list[dict], flows: list[str], out=None)
     }
     plan["_ctx"] = {"calls": calls, "keyless": keyless, "sessions": sessions, "excluded": excluded,
                     "staged": skipped_staged, "bad": bad, "unknown": unknown_keys, "mapping": mapping,
-                    "usable_flows": usable_flows, "runs": runs, "flows": flows}
+                    "usable_flows": usable_flows, "runs": runs, "flows": flows,
+                    "call_changed": call_changed, "run_changed": run_changed}
     return plan
 
 
@@ -526,11 +553,11 @@ def group_report(title, group: dict, lines: list, examples=5):
                  (", ".join(f"{c} {n}" for c, n in colc.most_common()) or "none"))
     lines.append("  (c) what the last call was: " + "; ".join(f"{k}: {v}" for k, v in kinds.most_common()))
     ex = [s for s in group.values() if s["update"]][:examples]
-    lines.append(f"  (d) {len(ex)} examples, stored -> planned (contact uuid first 8, check-in UTC):")
+    lines.append(f"  (d) {len(ex)} examples, stored -> planned (contact uuid first 8 + SessionID time; run verdict):")
     for s in ex:
         r = s["stored"][0]
         diffs = "; ".join(f"{c}: {_short(r.get(c))} -> {_short(s['row'].get(c))}" for c in s["changed"])
-        lines.append(f"      {s['sid'][:8]} {_short(s['row'].get('checkinDateTime'))}  {diffs}")
+        lines.append(f"      {s['sid'][:8]}..{s['sid'][36:]}  [{s.get('verdict', 'close-out, not repaired')}]  {diffs}")
 
 
 def cmd_list(client, flows, table=TABLE, runs_file=None, token=None, out=None) -> tuple[str, dict]:
@@ -550,6 +577,13 @@ def cmd_list(client, flows, table=TABLE, runs_file=None, token=None, out=None) -
     plan = build_plan(client, table, runs, flows)
     ctx = plan.pop("_ctx")
     sessions, excluded = ctx["sessions"], ctx["excluded"]
+    verdicts = Counter(s["verdict"] for s in sessions.values())
+    gate = (f"reply changes: from the calls {ctx['call_changed']} check-ins, from the runs {ctx['run_changed']} "
+            f"(runs vs calls: " + ", ".join(f"{k} {v}" for k, v in verdicts.most_common()) + ")")
+    print(gate, file=out)
+    if ctx["run_changed"] > max(GATE_MIN, ctx["call_changed"]):
+        raise SystemExit(f"STOPPED: the runs would change more replies ({ctx['run_changed']}) than the calls do "
+                         f"({ctx['call_changed']}); the runs rule is suspect. Nothing was written; no plan file.")
     before = diagnose(client, table, sessions)
 
     lines = [f"table {table}; window {WINDOW_START.isoformat()} -> {WINDOW_END.isoformat()} (calls to {OLD_PATH})", ""]
@@ -565,7 +599,6 @@ def cmd_list(client, flows, table=TABLE, runs_file=None, token=None, out=None) -
 
     t = plan["totals"]
     by_group = Counter(s["group"] for s in sessions.values())
-    verdicts = Counter(s["verdict"] for s in sessions.values())
     m = ctx["mapping"]
     summary = [
         f"calls in the window {len(ctx['calls'])}; without a SessionID (sign-up events, not repaired) {len(ctx['keyless'])}",
@@ -580,14 +613,14 @@ def cmd_list(client, flows, table=TABLE, runs_file=None, token=None, out=None) -
         "",
         f"runs read {len(ctx['runs'])}; flows with a check-in reply result: {sorted(ctx['usable_flows']) or 'none'} "
         f"of {ctx['flows']}",
-        "runs vs calls: " + ", ".join(f"{k} {v}" for k, v in verdicts.most_common()),
+        gate,
         f"mapping learned from {m['agreeing']} agreeing check-ins: reply value {m['reply_value']!r}, "
         f"text {'yes' if m['text'] else 'NO'}, numerical {'yes' if m['numerical'] else 'NO'}, "
         f"distressed by category {m['distressed'] or 'none'}",
         "",
     ]
     grp = []
-    group_report("IN WINDOW", {k: v for k, v in sessions.items() if v["group"] == "in window"}, grp, examples=0)
+    group_report("IN WINDOW", {k: v for k, v in sessions.items() if v["group"] == "in window"}, grp)
     group_report("CHECKED IN BEFORE THE WINDOW, LATE CALL IN IT (repaired)",
                  {k: v for k, v in sessions.items() if v["group"] == "late call"}, grp)
     group_report("ONLY CLOSE-OUT CALLS IN THE WINDOW (not repaired: what the close-out would have changed)",
@@ -715,7 +748,9 @@ def build_rollback_script(table: str, applied: dict) -> tuple[str, list]:
         bigquery.ScalarQueryParameter("fps", "STRING", x[key][1])) for x in sess])
     check = lambda p, msg: (f"ASSERT (SELECT COUNT(*) FROM UNNEST(@{p}) p LEFT JOIN (SELECT SessionID, COUNT(*) n, {fp_agg} fps "  # noqa: E731
                             f"FROM `{table}` t WHERE SessionID IN UNNEST(@gap_sids) GROUP BY SessionID) c ON c.SessionID = p.sid "
-                            f"WHERE IFNULL(c.n, 0) != p.n OR IFNULL(c.fps, '') != p.fps) = 0 AS '{msg}'")
+                            f"WHERE IFNULL(c.n, 0) != p.n OR (p.fps IS NOT NULL AND IFNULL(c.fps, '') != p.fps)) = 0 AS '{msg}'")
+    if any(x["after"] is None for x in sess):
+        sess = [dict(x, after=x["after"] or [1, None]) for x in sess]
     n_after = sum(x["after"][0] for x in sess)
     n_before = sum(x["before"][0] for x in sess)
     s = ["BEGIN TRANSACTION",
@@ -729,6 +764,46 @@ def build_rollback_script(table: str, applied: dict) -> tuple[str, list]:
     params = [bigquery.ArrayQueryParameter("gap_sids", "STRING", [x["sid"] for x in sess]),
               pre("gap_after", "after"), pre("gap_before", "before")]
     return ";\n".join(s) + ";", params
+
+
+def dry_run_forms(script: str) -> list[str]:
+    """
+    Each statement of a generated script in a form BigQuery can dry-run on its own: transaction and
+    variable statements skipped, ASSERT as SELECT, the temp table's SELECT inlined where it is used,
+    the row-count variable as 0. @@row_count asserts are checked by the real run only.
+    """
+    out, keep = [], None
+    for stmt in [x.strip() for x in script.split(";\n") if x.strip()]:
+        stmt = stmt.rstrip(";")
+        head = stmt.split(None, 2)[:2]
+        if head[0] in ("DECLARE", "BEGIN", "COMMIT", "SET") or stmt.startswith("DROP TABLE gap_keep") \
+                or "@@row_count" in stmt:
+            continue
+        if stmt.startswith("CREATE TEMP TABLE gap_keep AS "):
+            keep = stmt[len("CREATE TEMP TABLE gap_keep AS "):]
+            out.append(keep)
+            continue
+        if keep is not None:
+            stmt = re.sub(r"\bgap_keep\b", f"({keep})", stmt)
+        stmt = re.sub(r"\bgap_before\b", "0", stmt)
+        m = re.match(r"^ASSERT (.*) AS '[^']*'$", stmt, re.S)
+        out.append(f"SELECT {m.group(1)}" if m else stmt)
+    return out
+
+
+def preflight(client, statements: list[tuple[str, list]]) -> None:
+    """Dry-run every statement against BigQuery (validated, nothing runs). Any failure stops before writing."""
+    bad = []
+    for sql, params in statements:
+        used = [p for p in params if re.search(rf"@{re.escape(p.name)}\b", sql)]
+        try:
+            client.query(sql, job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False,
+                                                                 query_parameters=used))
+        except Exception as e:                      # noqa: BLE001  (report every failure, then stop)
+            bad.append(f"{sql[:120]!r}: {str(e).splitlines()[0][:300]}")
+    print(f"dry run: {len(statements) - len(bad)} of {len(statements)} statements valid")
+    if bad:
+        raise SystemExit("STOPPED before writing: statements BigQuery rejects in a dry run:\n  " + "\n  ".join(bad))
 
 
 def job_cost(client, job) -> str:
@@ -775,12 +850,14 @@ class Pause:
         return False
 
 
-def cmd_apply(client, plan: dict, production: bool, pause: bool | None = None) -> dict:
+def cmd_apply(client, plan: dict, production: bool, pause: bool | None = None, created: list | None = None) -> dict:
     table = plan["table"]
     refuse_unless_allowed(table, production)
+    created = created if created is not None else []
     run = stamp()
     backup = f"{DEV_PREFIX}adb_gap_repair_backup_{run}"
     rows_table = f"{DEV_PREFIX}adb_gap_repair_rows_{run}"
+    path = f"gap_repair_applied_{run}.json"
     with Pause(client, production if pause is None else pause):
         staged = staged_sessions(client)
         dropped = [s["sid"] for s in plan["sessions"] if s["sid"] in staged]
@@ -792,27 +869,37 @@ def cmd_apply(client, plan: dict, production: bool, pause: bool | None = None) -
                               "extra_rows": sum(s["n"] - 1 for s in t if s["collapse"])}
         print(f"check-ins dropped from the plan because add-to-db has staged a call for them since the list: {len(dropped)}")
         sids = [s["sid"] for s in plan["sessions"]]
-        client.query(f"CREATE TABLE `{backup}` AS SELECT * FROM `{table}` WHERE SessionID IN UNNEST(@s)",
-                     job_config=bigquery.QueryJobConfig(query_parameters=[
-                         bigquery.ArrayQueryParameter("s", "STRING", sids)])).result()
+        sid_param = [bigquery.ArrayQueryParameter("s", "STRING", sids)]
+        backup_sql = f"CREATE TABLE `{backup}` AS SELECT * FROM `{table}` WHERE SessionID IN UNNEST(@s)"
+        preflight(client, [(backup_sql, sid_param)])
+        client.query(backup_sql, job_config=bigquery.QueryJobConfig(query_parameters=sid_param)).result()
+        created.append(backup)
         nb = list(client.query(f"SELECT COUNT(*) n FROM `{backup}`").result())[0]["n"]
         print(f"backup: {backup} ({nb} rows)")
+        created.append(rows_table)
         loaded = load_rows(client, plan, rows_table)
         print(f"planned rows loaded: {rows_table} ({loaded} rows)")
         before = {s["sid"]: [s["n"], s["fps"]] for s in plan["sessions"]}
         sql, params = build_apply_script(table, plan, rows_table)
+        rb_sql, rb_params = build_rollback_script(table, {"backup": backup, "sessions": [
+            {"sid": sid, "before": before[sid], "after": [1, ""]} for sid in sids]})
+        preflight(client, [(x, params) for x in dry_run_forms(sql)] + [(x, rb_params) for x in dry_run_forms(rb_sql)]
+                  + [(read_stored_sql(table, ["SessionID"]), sid_param)])
+        applied = {"table": table, "backup": backup, "rows_table": rows_table, "dropped": dropped,
+                   "applied_at": None, "sessions": [{"sid": sid, "before": before[sid], "after": None} for sid in sids]}
+        with open(path, "w", encoding="utf-8") as f:            # written before the transaction: rollback needs it
+            json.dump(applied, f, indent=1)
         job = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params))
         job.result()
         t = plan["totals"]
         print(f"APPLIED in one transaction (committed) on {table}: insert {t['insert']}, update {t['update']}, "
               f"collapse {t['collapse']} (extra rows deleted {t['extra_rows']}); {job_cost(client, job)}")
+        applied["applied_at"] = datetime.now(UTC).isoformat()
         after = fp_state(client, table, sids)          # read while the flush is still paused
-    applied = {"table": table, "backup": backup, "rows_table": rows_table, "applied_at": datetime.now(UTC).isoformat(),
-               "dropped": dropped,
-               "sessions": [{"sid": sid, "before": before[sid], "after": after[sid]} for sid in sids]}
-    path = f"gap_repair_applied_{run}.json"
-    with open(path, "w") as f:
-        json.dump(applied, f, indent=1)
+        for x in applied["sessions"]:
+            x["after"] = after[x["sid"]]
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(applied, f, indent=1)
     print(f"applied record (rollback needs it): {path}")
     applied["_path"] = path
     return applied
@@ -843,8 +930,7 @@ def cmd_rehearse(client, flows, runs_file, keep=False) -> bool:
         plan_path, plan = cmd_list(client, flows, table=clone, runs_file=runs_file)
         plan.pop("_ctx")
         before_fp = {s["sid"]: [s["n"], s["fps"]] for s in plan["sessions"]}
-        applied = cmd_apply(client, plan, production=False, pause=False)
-        made += [applied["backup"], applied["rows_table"]]
+        applied = cmd_apply(client, plan, production=False, pause=False, created=made)
         for sid in applied["dropped"]:
             before_fp.pop(sid, None)
         print("\nrehearsal: list again on the repaired clone (the repair must leave nothing to do):")
@@ -876,6 +962,11 @@ def cmd_rehearse(client, flows, runs_file, keep=False) -> bool:
 
 
 def main_(argv=None):
+    for stream in (sys.stdout, sys.stderr):          # reply text carries emoji; never depend on the code page
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("action", choices=("list", "rehearse", "apply", "rollback"))
     ap.add_argument("file", nargs="?", help="apply: the plan; rollback: the applied record")
@@ -889,7 +980,7 @@ def main_(argv=None):
     if args.action in ("apply", "rollback"):
         if not args.file:
             raise SystemExit(f"{args.action} needs its file")
-        with open(args.file) as f:
+        with open(args.file, encoding="utf-8") as f:
             doc = json.load(f)
         refuse_unless_allowed(doc["table"], args.production)            # before any sign-in or query
     elif not flows:
