@@ -1,4 +1,5 @@
-"""Gap repair: sources, close-outs, add-to-db's preparation, runs, the plan, the transaction text, the guards."""
+"""Gap repair: bodies and their repair, add-to-db's preparation and fold over the complete call sequence,
+the plan, the transaction text, the guards."""
 import json
 import os
 import sys
@@ -11,128 +12,144 @@ import repair_checkin_gap as G  # noqa: E402
 from conftest import RESPONSE_DATA_SCHEMA  # noqa: E402
 
 UTC = timezone.utc
-U1, U2 = "11111111-0000-0000-0000-000000000001", "22222222-0000-0000-0000-000000000002"
+U1, U2, U3 = ("11111111-0000-0000-0000-000000000001", "22222222-0000-0000-0000-000000000002",
+              "33333333-0000-0000-0000-000000000003")
 
 
-def body(sid, checkin, reply="No", reply_t="", **extra):
-    resp = {"sessionID": sid.replace(":", "%3A"), "uuid": sid[:36], "checkinDateTime": checkin.replace(":", "%3A"),
-            "checkinReply": reply, "checkinReplyDateTime": reply_t.replace(":", "%3A"), "userWeek": "3",
-            "wellnessDomain": "sleep", "orgCode": "demo"}
-    resp.update(extra)
-    return json.dumps({"Users": {"uuid": sid[:36]}, "Responses": resp})
+def enc(v):
+    return v.replace(":", "%3A").replace("+", "%2B")
+
+
+def old_body(sid, checkin, reply="No", reply_t="", **extra):
+    """The old writer's body: every value url-encoded, pretty-printed."""
+    resp = {"sessionID": enc(sid), "uuid": sid[:36], "checkinDateTime": enc(checkin), "checkinReply": reply,
+            "checkinReplyDateTime": enc(reply_t), "userWeek": "3", "wellnessDomain": "Physical", "orgCode": "demo"}
+    resp.update({k: enc(v) for k, v in extra.items()})
+    return json.dumps({"Users": {"uuid": sid[:36]}, "Responses": resp}, indent=2)
+
+
+def new_data(sid, checkin, reply="No", reply_t="", **extra):
+    d = {"uuid": sid[:36], "orgCode": "demo", "userWeek": 3, "sessionID": sid, "contactType": "CheckIn",
+         "checkinDateTime": checkin, "wellnessDomain": "Physical", "checkinReplyDateTime": reply_t,
+         "checkinReply": reply, "checkinReplyNumerical": None}
+    d.update(extra)
+    return d
+
+
+def new_body(sid, checkin, **kw):
+    """add-to-db's body, as the live webhook flow sends it."""
+    return json.dumps({"tables": [{"table": "users", "data": {"uuid": sid[:36], "orgCode": "demo"}},
+                                  {"table": "responses", "data": new_data(sid, checkin, **kw)}]}, indent=2)
+
+
+def broken(body_text, key, raw):
+    """The body the pre-fix template produced: `raw` pasted between the quotes of `key` unescaped."""
+    marker = "@@RAW@@"
+    obj = json.loads(body_text)
+    obj["tables"][1]["data"][key] = marker
+    return json.dumps(obj, indent=2).replace(marker, raw)
 
 
 def at(s):
     return datetime.fromisoformat(s).astimezone(UTC)
 
 
-# --- close-outs --------------------------------------------------------------------------------
-
-def test_closeout_is_the_call_fired_as_the_next_checkin_starts():
-    old = f"{U1}2026-09-20T13:00:00.000001-04:00"
-    new = f"{U1}2026-09-27T13:00:00.000002-04:00"
-    calls = [G.parse_call(1, at("2026-09-27T17:00:00.9+00:00"), body(old, "2026-09-20T13:00:00.000001-04:00")),
-             G.parse_call(2, at("2026-09-27T17:00:01.2+00:00"), body(new, "2026-09-27T13:00:00.000002-04:00")),
-             G.parse_call(3, at("2026-09-27T18:00:00+00:00"), body(old, "2026-09-20T13:00:00.000001-04:00"))]
-    G.mark_closeouts(calls)
-    assert [c["closeout"] for c in calls] == [True, False, False]   # 3 s from nothing -> a real late call
-    assert calls[0]["sid"] == old                                    # url-encoded SessionID decoded
+def req(i, fired, text, path=G.OLD_PATHS[0], status="HTTP/2.0 200 OK"):
+    return {"httplog_id": i, "fired_at": at(fired), "request_path": path, "response_status_line": status,
+            "request_body": text}
 
 
-# --- preparation is add-to-db's ----------------------------------------------------------------
+# --- bodies and their repair --------------------------------------------------------------------
 
-def test_prepare_row_matches_plan_target_writes(svc, monkeypatch):
-    sid = f"{U1}2026-09-27T13:00:00.5-04:00"
-    resp = json.loads(body(sid, "2026-09-27T13:00:00.5-04:00", reply="Yes", reply_t="2026-09-27T13:05:00-04:00",
-                           checkinReplyNumerical="7", subscribed=""))["Responses"]
+S9 = f"{U1}2026-09-29T12:54:00.675676-04:00"
+
+
+def test_quote_newline_and_backslash_bodies_repair_and_nothing_else_changes():
+    base = new_body(S9, "2026-09-29T12:54:00.676636-04:00")
+    for raw in ('Early Alert helps me "bounce my thoughts " off it.', "cares how I am. \nThank you.", "5\\15\\96"):
+        text = broken(base, "testimonial", raw)
+        with pytest.raises(ValueError):
+            json.loads(text)
+        rep = G.repair_body(text)
+        assert rep["escaped"] == [("testimonial", raw)]
+        assert rep["obj"]["tables"][1]["data"]["testimonial"] == raw          # the value as typed
+        proof = G.prove_repair(text, rep)
+        assert proof["ok"] and proof["outside_identical"] and proof["identical"] == proof["raw_strings"] > 10
+        clean = json.loads(base)
+        clean["tables"][1]["data"]["testimonial"] = raw
+        assert rep["obj"] == clean                                              # every other value untouched
+
+
+def test_a_body_that_cannot_be_repaired_is_reported():
+    assert G.repair_body('{"tables": [ {"table": "responses", "data": {"a": 1,, }}]}') is None
+    assert G.repair_body("") is None
+
+
+def test_body_items_old_new_and_other_tables(svc):
+    assert G.body_items(svc, old_body(S9, "2026-09-29T12:54:00-04:00"))[0][0]["sessionID"] == enc(S9)
+    items, rep, err = G.body_items(svc, new_body(S9, "2026-09-29T12:54:00-04:00"))
+    assert [d["sessionID"] for d in items] == [S9] and rep is None and err is None
+    assert G.body_items(svc, json.dumps({"table": "triage_data", "data": {"message_id": "m"}}))[0] == []
+    items, rep, err = G.body_items(svc, broken(new_body(S9, "2026-09-29T12:54:00-04:00"), "testimonial", 'a "b" c'))
+    assert len(items) == 1 and rep is not None and err is None
+    assert G.body_items(svc, "{nope")[2] == "not JSON and not repairable"
+
+
+# --- preparation and fold are add-to-db's -------------------------------------------------------
+
+def test_prepare_matches_plan_target_writes(svc, monkeypatch):
+    resp = json.loads(old_body(S9, "2026-09-27T13:00:00.5-04:00", reply="Yes", reply_t="2026-09-27T13:05:00-04:00",
+                               checkinReplyNumerical="7", subscribed=""))["Responses"]
     captured = {}
     real = svc.fold_rows
     monkeypatch.setattr(svc, "fold_rows", lambda rows, *a, **k: captured.setdefault("rows", rows) and real(rows, *a, **k))
     svc.plan_target_writes("responses", [{"data": dict(resp), "ref": 0}])
-    row, errors, unknown, guarded = G.prepare_row(svc, RESPONSE_DATA_SCHEMA, resp)
-    assert errors == [] and unknown == [] and not guarded
+    row, errors, unknown, keyless, guarded = G.prepare(svc, RESPONSE_DATA_SCHEMA, resp)
+    assert errors == [] and unknown == [] and not keyless and not guarded
     assert row == captured["rows"][0]
     assert row["checkinDateTime"] == datetime(2026, 9, 27, 17, 0, 0, 500000)       # UTC, naive
     assert row["subscribed"] is None and row["checkinReplyNumerical"] == 7.0
 
 
-def test_prepare_row_stale_reply_guard_and_unknown_keys(svc):
-    sid = f"{U1}2026-09-27T13:00:00-04:00"
-    resp = json.loads(body(sid, "2026-09-27T13:00:00-04:00", reply="Yes", reply_t="2026-09-20T13:05:00-04:00",
-                           notAColumn="x"))["Responses"]
-    row, errors, unknown, guarded = G.prepare_row(svc, RESPONSE_DATA_SCHEMA, resp)
-    assert guarded and row["checkinReply"] is None and row["checkinReplyDateTime"] is None
-    assert unknown == ["notAColumn"] and "notAColumn" not in row and errors == []
+def test_fold_of_a_mixed_sequence_is_the_writers_fold(svc, monkeypatch):
+    """Old-writer and add-to-db calls of one check-in, fed to plan_target_writes in fired order, fold to the
+    row the tool plans: last call wins, blank -> NULL, a blank check-in time kept, the stale reply cleared."""
+    S = f"{U1}2026-09-27T13:00:00.5-04:00"
+    ci = "2026-09-27T13:00:00.5-04:00"
+    reqs = [req(1, "2026-09-27T17:00:01+00:00", old_body(S, ci, reply="Yes", reply_t="2026-09-20T09:00:00-04:00")),
+            req(2, "2026-09-27T23:00:00+00:00", old_body(S, ci, wellnessDomain="Relational")),
+            req(3, "2026-09-29T01:10:00+00:00", new_body(S, "", reply="Yes", reply_t="2026-09-28T21:05:00-04:00",
+                                                         checkinReplyNumerical=8, orgCode=""),
+                path=G.NEW_PATH, status="HTTP/2.0 202 Accepted")]
+    calls = [c for r in reqs for c in G.make_calls(svc, RESPONSE_DATA_SCHEMA, r)]
+    assert calls[0]["guarded"] and calls[0]["row"]["checkinReply"] is None           # previous session's reply
+    mine = G.fold(RESPONSE_DATA_SCHEMA, calls)[S]
+    captured = {}
+    real = svc.fold_rows
+    monkeypatch.setattr(svc, "fold_rows", lambda rows, *a, **k: captured.setdefault("out", real(rows, *a, **k)))
+    datas = [json.loads(old_body(S, ci, reply="Yes", reply_t="2026-09-20T09:00:00-04:00"))["Responses"],
+             json.loads(old_body(S, ci, wellnessDomain="Relational"))["Responses"],
+             json.loads(new_body(S, "", reply="Yes", reply_t="2026-09-28T21:05:00-04:00", checkinReplyNumerical=8,
+                                 orgCode=""))["tables"][1]["data"]]
+    svc.plan_target_writes("responses", [{"data": d, "ref": i} for i, d in enumerate(datas)])
+    (theirs,) = captured["out"][0].values()
+    assert mine == theirs
+    assert mine["checkinDateTime"] == datetime(2026, 9, 27, 17, 0, 0, 500000)     # blank never replaces it
+    assert mine["wellnessDomain"] == "Physical" and mine["orgCode"] is None        # the last call's values
+    assert mine["checkinReply"] == "Yes" and mine["checkinReplyNumerical"] == 8.0
 
 
-# --- runs --------------------------------------------------------------------------------------
-
-def run(contact, created, value=None, t=None, cat="7-10", flow="F"):
-    vals = {"checkinresponse": {"value": value, "category": cat, "time": t}} if t else {"other": {"value": "x"}}
-    return {"flow": flow, "uuid": "r", "contact": contact, "created_on": created, "values": vals}
-
-
-def agreeing(n=25):
-    pairs = []
-    for i in range(n):
-        t = f"2026-09-27T17:{i:02d}:00Z"
-        row = {"checkinReply": "Yes", "checkinReplyText": "8", "checkinReplyNumerical": 8.0,
-               "checkinReplyDistressed": "No", "checkinReplyDateTime": datetime(2026, 9, 27, 17, i)}
-        pairs.append((row, run(U1, "2026-09-27T17:00:00Z", "8", t)))
-    return pairs
+def test_differs_follows_the_merge():
+    assert not G.differs({"checkinDateTime": datetime(2026, 9, 27)}, {"checkinDateTime": None}, "checkinDateTime")
+    assert G.differs({"wellnessDomain": "Physical"}, {"wellnessDomain": None}, "wellnessDomain")
+    assert not G.differs({"wellnessDomain": ""}, {"wellnessDomain": None}, "wellnessDomain")
 
 
-def test_mapping_is_learned_only_from_unanimous_agreement():
-    m = G.learn_mapping(agreeing())
-    assert m == {"agreeing": 25, "text": True, "numerical": True, "reply_value": "Yes", "distressed": {"7-10": "No"}}
-    pairs = agreeing()
-    pairs[0][0]["checkinReplyText"] = "eight"
-    assert G.learn_mapping(pairs)["text"] is False
-    assert G.learn_mapping(agreeing(5))["text"] is False                 # too few to trust
-
-
-def test_run_verdicts():
-    m = G.learn_mapping(agreeing())
-    base = {"checkinReply": "No", "checkinReplyText": None, "checkinReplyNumerical": None,
-            "checkinReplyDistressed": None, "checkinReplyDateTime": None}
-    row, v, notes = G.apply_run(dict(base), run(U1, "x", "9", "2026-09-27T18:00:00Z"), m, {"F"})
-    assert v == "run: reply the call lacks" and notes == []
-    assert (row["checkinReply"], row["checkinReplyNumerical"], row["checkinReplyText"],
-            row["checkinReplyDistressed"], row["checkinReplyDateTime"]) == ("Yes", 9.0, "9", "No", datetime(2026, 9, 27, 18))
-    replied = dict(base, checkinReply="Yes", checkinReplyText="3", checkinReplyNumerical=3.0,
-                   checkinReplyDateTime=datetime(2026, 9, 18, 17))
-    row, v, _ = G.apply_run(dict(replied), run(U1, "x"), m, {"F"})
-    assert v.startswith("run: no reply") and all(row[f] is None for f in G.REPLY_FIELDS)
-    assert G.apply_run(dict(replied), run(U1, "x", flow="OLD"), m, {"F"})[1] == "run flow carries no check-in reply result"
-    assert G.apply_run(dict(base), None, m, {"F"})[1] == "no run"
-    same_t = dict(replied, checkinReplyDateTime=datetime(2026, 9, 27, 18, 0, 1))
-    assert G.apply_run(same_t, run(U1, "x", "3", "2026-09-27T18:00:00Z"), m, {"F"})[1] == "agree"
-
-
-def test_match_run_nearest_within_five_seconds():
-    by = G.index_runs([run(U1, "2026-09-27T17:00:04Z"), run(U1, "2026-09-27T17:00:01Z"), run(U1, "2026-09-27T17:00:09Z")])
-    got = G.match_run(by, U1, at("2026-09-27T17:00:00+00:00"))
-    assert got["created_on"] == "2026-09-27T17:00:01Z"
-    assert G.match_run(by, U1, at("2026-09-27T16:59:50+00:00")) is None
-
-
-class _Resp:
-    def __init__(self, code, data=None, text=""):
-        self.status_code, self._data, self.text = code, data, text
-
-    def json(self):
-        return self._data
-
-
-def test_fetch_runs_pages_and_waits_as_told_on_429():
-    pages = iter([_Resp(429, text='{"detail":"Request was throttled. Expected available in 7 seconds."}'),
-                  _Resp(200, {"results": [{"uuid": "r1", "contact": {"uuid": U1}, "created_on": "t"}], "next": "page2"}),
-                  _Resp(200, {"results": [{"uuid": "r2", "contact": {"uuid": U2}, "created_on": "t"}], "next": None})])
-    slept = []
-    out = G.fetch_runs(["F"], at("2026-09-14T00:00:00+00:00"), "tok", sleep=slept.append, get=lambda *a, **k: next(pages))
-    assert [r["contact"] for r in out] == [U1, U2] and slept == [10, 1.5]
-    with pytest.raises(SystemExit):
-        G.fetch_runs(["F"], at("2026-09-14T00:00:00+00:00"), "tok", sleep=slept.append, get=lambda *a, **k: _Resp(500))
+def test_sid_time_and_groups():
+    assert G.sid_time(S9) == at("2026-09-29T16:54:00.675676+00:00")
+    assert G.group_of(S9, set()) == "began after the switch (rejected call)"
+    assert G.group_of(f"{U1}2026-09-20T13:00:00-04:00", set()) == "began before the window"
+    assert G.group_of(f"{U1}2026-09-27T13:00:00-04:00", set()) == "began in the window"
 
 
 # --- the plan end to end on a stub BigQuery ----------------------------------------------------
@@ -149,85 +166,162 @@ class _Table:
     schema = RESPONSE_DATA_SCHEMA
 
 
+CUTOFF = at("2026-09-29T21:10:02+00:00")
+
+
 class _BQ:
-    def __init__(self, calls, staged, stored, pre=()):
-        self.calls, self.staged, self.stored, self.pre = calls, staged, stored, list(pre)
+    def __init__(self, scope, history, staged, stored):
+        self.scope, self.history, self.staged, self.stored = scope, history, staged, stored
+        self.sql, self.counts = [], []
 
     def get_table(self, table):
         return _Table()
 
     def query(self, sql, job_config=None):
-        if "webhook_log_detail" in sql:
-            return _Job(self.pre if "@sids" in sql else self.calls)
+        self.sql.append(sql)
+        if "MAX(fired_at)" in sql:
+            return _Job([{"m": CUTOFF}])
+        if "GROUP BY sid" in sql:
+            return _Job(self.counts)
+        if "STARTS_WITH(response_status_line, 'HTTP/2.0 400') ORDER" in sql and "@ws" not in sql:
+            return _Job([r for r in self.scope if r["response_status_line"].startswith("HTTP/2.0 400")])
+        if "STARTS_WITH(response_status_line, 'HTTP/2.0 2')" in sql:
+            return _Job([r for r in self.history if r["request_path"] == G.NEW_PATH and r["fired_at"] > G.SWITCH_AT
+                         and r["response_status_line"].startswith("HTTP/2.0 2")])
         if "adb_staging" in sql:
             return _Job([{"sid": s} for s in self.staged])
+        if "IN UNNEST(@sids)" in sql:
+            return _Job(self.history)
+        if "@ws" in sql:
+            return _Job(self.scope)
         if "FARM_FINGERPRINT" in sql:
             wanted = set(job_config.query_parameters[0].values)
             return _Job([dict(r) for r in self.stored if r["SessionID"] in wanted])
         raise AssertionError(sql)
 
 
-def _call(i, fired, sid, checkin, **kw):
-    return {"httplog_id": i, "fired_at": at(fired), "request_body": body(sid, checkin, **kw)}
+def _stored(sid, ci, fp, **kw):
+    r = {"SessionID": sid, "checkinDateTime": ci, "uuid": sid[:36], "userWeek": 3, "orgCode": "demo",
+         "wellnessDomain": "Physical", "checkinReply": "No", "checkinReplyDateTime": None, "contactType": None,
+         "checkinReplyNumerical": None, "gap_fp": fp}
+    r.update(kw)
+    return r
 
 
-def test_plan_scope_actions_and_groups(svc, monkeypatch, tmp_path):
+def test_plan_folds_every_call_of_every_checkin_in_scope(svc, monkeypatch):
     monkeypatch.setattr(G, "load_svc", lambda client: svc)
-    monkeypatch.chdir(tmp_path)
-    A = f"{U1}2026-09-27T13:00:00.5-04:00"       # in window, no row -> insert
-    B = f"{U2}2026-09-27T14:00:00.5-04:00"       # in window, two rows, run confirms the reply -> update + collapse
-    C = f"{U1}2026-09-20T13:00:00.5-04:00"       # earlier check-in, only a close-out in the window -> excluded
-    D = f"{U2}2026-09-19T14:00:00.5-04:00"       # earlier check-in, late reply, no run -> reply not confirmed, kept
-    E = "33333333-0000-0000-0000-0000000000032026-09-27T15:00:00-04:00"    # add-to-db owns it -> skipped
-    calls = [
-        _call(1, "2026-09-27T17:00:00.9+00:00", C, "2026-09-20T13:00:00.5-04:00"),
-        _call(2, "2026-09-27T17:00:01+00:00", A, "2026-09-27T13:00:00.5-04:00"),
-        _call(3, "2026-09-27T18:00:01+00:00", B, "2026-09-27T14:00:00.5-04:00", reply="Yes",
-              reply_t="2026-09-27T14:30:00-04:00"),
-        _call(4, "2026-09-27T19:00:00+00:00", D, "2026-09-19T14:00:00.5-04:00", reply="Yes",
-              reply_t="2026-09-27T15:00:00-04:00"),
-        _call(5, "2026-09-27T20:00:00+00:00", E, "2026-09-27T15:00:00-04:00"),
-        {"httplog_id": 6, "fired_at": at("2026-09-27T20:00:01+00:00"),
-         "request_body": json.dumps({"Users": {}, "Responses": {"sessionID": ""}})},
-    ]
-    pre = [_call(0, "2026-09-19T18:00:01+00:00", D, "2026-09-19T14:00:00.5-04:00")]
-    stored_b = {"SessionID": B, "checkinDateTime": datetime(2026, 9, 27, 18, 0, 0, 500000), "uuid": U2, "userWeek": 3,
-                "wellnessDomain": "sleep", "orgCode": "demo", "checkinReply": "No", "checkinReplyDateTime": None, "gap_fp": 5}
-    stored = [stored_b, dict(stored_b, gap_fp=-2),
-              dict(stored_b, SessionID=D, checkinDateTime=datetime(2026, 9, 19, 18, 0, 0, 500000), gap_fp=9),
-              dict(stored_b, SessionID=C, uuid=U1, checkinDateTime=datetime(2026, 9, 20, 17, 0, 0, 500000), gap_fp=1)]
-    runs = [run(U2, "2026-09-27T18:00:01Z", "8", "2026-09-27T18:30:00Z")]
-    plan = G.build_plan(_BQ(calls, [E], stored, pre), "p.DEV.x", runs, ["F"])
+    A = f"{U1}2026-09-27T13:00:00.5-04:00"      # in window, no row -> insert
+    B = f"{U2}2026-09-27T14:00:00.5-04:00"      # in window, two rows, a later add-to-db call -> update + collapse
+    C = f"{U1}2026-09-20T13:00:00.5-04:00"      # began a week earlier; its call in the window is the one
+                                                #   fired as the next check-in starts: an ordinary call now
+    D = f"{U3}2026-09-29T12:54:00.5-04:00"      # after the switch, only a rejected (400) call -> insert
+    M = f"{U3}2026-09-27T15:00:00-04:00"        # add-to-db staged a call after the log cutoff -> left for later
+    ciA, ciB, ciC, ciD, ciM = (x[36:] for x in (A, B, C, D, M))
+    scope = [req(2, "2026-09-27T17:00:01+00:00", old_body(A, ciA)),
+             req(3, "2026-09-27T18:00:01+00:00", old_body(B, ciB)),
+             req(4, "2026-09-27T17:00:00.9+00:00", old_body(C, ciC, reply="Yes", reply_t="2026-09-20T15:00:00-04:00")),
+             req(5, "2026-09-27T20:00:00+00:00", old_body(M, ciM)),
+             req(6, "2026-09-27T20:00:01+00:00", json.dumps({"Users": {}, "Responses": {"sessionID": ""}})),
+             req(9, "2026-09-29T16:54:00.7+00:00", broken(new_body(D, ciD), "testimonial", 'x "y" z'),
+                 path=G.NEW_PATH, status="HTTP/2.0 400 Bad Request")]
+    history = [req(1, "2026-09-20T17:00:01+00:00", old_body(C, ciC)),
+               req(7, "2026-09-29T02:00:00+00:00", new_body(B, ciB, reply="Yes", reply_t="2026-09-28T21:00:00-04:00"),
+                   path=G.NEW_PATH, status="HTTP/2.0 202 Accepted"),
+               req(8, "2026-09-01T12:00:00+00:00", new_body(A, ciA, wellnessDomain="Test"),
+                   path=G.NEW_PATH, status="HTTP/2.0 202 Accepted")] + scope
+    history.sort(key=lambda r: (r["fired_at"], r["httplog_id"]))
+    stored = [_stored(B, datetime(2026, 9, 27, 18, 0, 0, 500000), 5), _stored(B, datetime(2026, 9, 27, 18, 0, 0, 500000), -2),
+              _stored(C, datetime(2026, 9, 20, 17, 0, 0, 500000), 9)]
+    bq = _BQ(scope, history, [M], stored)
+    plan = G.build_plan(bq, "p.DEV.x")
     ctx = plan.pop("_ctx")
-    assert set(ctx["sessions"]) == {A, B, D} and set(ctx["excluded"]) == {C} and ctx["staged"] == [E]
-    assert len(ctx["keyless"]) == 1 and ctx["first_missing"] == 0
-    assert ctx["sessions"][D]["group"] == "late call" and ctx["sessions"][A]["group"] == "in window"
-    assert ctx["sessions"][B]["verdict"] == "agree" and ctx["sessions"][D]["verdict"] == "no run"
+    assert ctx["loaded"]["sids"] == sorted([A, B, C, D, M]) and ctx["moving"] == [M]
+    ss = ctx["sessions"]
+    assert set(ss) == {A, B, C, D}
+    assert [c["id"] for c in ss[C]["calls"]] == [1, 4]                  # the earlier call comes from the log
+    assert ss[C]["row"]["checkinReply"] == "Yes" and ss[C]["changed"] == ["checkinReply", "checkinReplyDateTime"]
+    assert ss[B]["row"]["checkinReply"] == "Yes" and ss[B]["collapse"] and ss[B]["update"]
+    assert ss[A]["insert"] and ss[A]["row"]["wellnessDomain"] == "Physical"    # pre-switch add-to-db test call ignored
+    assert [c["endpoint"] for c in ss[A]["calls"]][0].startswith("add-to-db before the switch")
+    assert ss[D]["insert"] and ss[D]["rejected"] and ss[D]["calls"][0]["repaired"]
+    assert ss[D]["group"] == "began after the switch (rejected call)" and ss[C]["group"] == "began before the window"
     by = {s["sid"]: s for s in plan["sessions"]}
-    assert by[A]["insert"] and not by[A]["update"] and "orgCode" in by[A]["write"]
-    assert by[B]["update"] and by[B]["collapse"] and by[B]["fps"] == "-2,5" and by[B]["n"] == 2
-    assert by[B]["changed"] == ["checkinReply", "checkinReplyDateTime"]
-    assert "orgCode" not in by[B]["write"] and "userWeek" not in by[B]["write"]      # other columns kept
-    assert D not in by                          # its reply is not run-confirmed and its identity matches
-    assert plan["totals"] == {"insert": 1, "update": 1, "collapse": 1, "extra_rows": 1}
-    assert C not in by                                             # a close-out never becomes a repair
+    assert set(by) == {A, B, C, D} and by[B]["fps"] == "-2,5" and by[B]["n"] == 2
+    assert plan["totals"] == {"insert": 2, "update": 2, "collapse": 1, "extra_rows": 1}
+    assert plan["log_cutoff"] == CUTOFF.isoformat()
+    assert all(w == [c for c in [f.name for f in RESPONSE_DATA_SCHEMA] if c in s["row"]] for s in by.values()
+               for w in [s["write"]])                                    # every carried column is written
 
 
-def test_identity_from_the_first_call_and_other_columns_kept(svc, monkeypatch):
+def _world():
+    A = f"{U1}2026-09-27T13:00:00.5-04:00"
+    B = f"{U2}2026-09-27T14:00:00.5-04:00"
+    D = f"{U3}2026-09-29T12:54:00.5-04:00"
+    scope = [req(2, "2026-09-27T17:00:01+00:00", old_body(A, A[36:])),
+             req(3, "2026-09-27T18:00:01+00:00", old_body(B, B[36:])),
+             req(9, "2026-09-29T16:54:00.7+00:00", broken(new_body(D, D[36:]), "testimonial", 'x "y" z'),
+                 path=G.NEW_PATH, status="HTTP/2.0 400 Bad Request")]
+    history = scope + [req(7, "2026-09-29T02:00:00+00:00", new_body(B, B[36:], reply="Yes",
+                                                                   reply_t="2026-09-28T21:00:00-04:00"),
+                           path=G.NEW_PATH, status="HTTP/2.0 202 Accepted")]
+    history.sort(key=lambda r: (r["fired_at"], r["httplog_id"]))
+    stored = [_stored(B, datetime(2026, 9, 27, 18, 0, 0, 500000), 5, checkinReply="Yes", contactType="CheckIn",
+                      checkinReplyDateTime=datetime(2026, 9, 29, 1, 0))]
+    return A, B, D, scope, history, stored
+
+
+def test_calls_counts_match_and_mismatch_fails(svc, monkeypatch, capsys):
     monkeypatch.setattr(G, "load_svc", lambda client: svc)
-    S = f"{U1}2026-09-27T13:00:00.5-04:00"
-    calls = [_call(1, "2026-09-27T17:00:01+00:00", S, "2026-09-27T13:00:00.5-04:00", wellnessDomain="Physical",
-                   testimonial="kind words"),
-             _call(2, "2026-09-27T23:00:00+00:00", S, "2026-09-27T13:00:00.5-04:00", wellnessDomain="Relational",
-                   testimonial="", orgCode="other")]
-    stored = [{"SessionID": S, "checkinDateTime": datetime(2026, 9, 27, 17, 0, 0, 500000), "uuid": U1,
-               "wellnessDomain": "Relational", "orgCode": "demo", "checkinReply": "No", "gap_fp": 3}]
-    plan = G.build_plan(_BQ(calls, [], stored), "p.DEV.x", [], ["F"])
-    plan.pop("_ctx")
-    (only,) = plan["sessions"]
-    assert only["changed"] == ["wellnessDomain"] and only["row"]["wellnessDomain"] == "Physical"
-    assert only["write"] == ["SessionID", "checkinDateTime", "wellnessDomain"]   # contactType blank in the first call
-    assert "checkinReply" not in only["write"]                    # no run: reply fields untouched
+    A, B, D, scope, history, stored = _world()
+    bq = _BQ(scope, history, [], stored)
+    bq.counts = [{"sid": A, "old_n": 1, "new_n": 0, "pre_n": 0}, {"sid": B, "old_n": 1, "new_n": 1, "pre_n": 0},
+                 {"sid": D, "old_n": 0, "new_n": 1, "pre_n": 0}]
+    assert G.cmd_calls(bq) is True
+    assert "CALLS PASS: counts equal for 3 of 3" in capsys.readouterr().out
+    bq.counts[1]["new_n"] = 2
+    assert G.cmd_calls(bq) is False
+
+
+def test_repaired_proves_each_rejected_body(svc, monkeypatch, capsys):
+    monkeypatch.setattr(G, "load_svc", lambda client: svc)
+    A, B, D, scope, history, stored = _world()
+    assert G.cmd_repaired(_BQ(scope, history, [], stored)) is True
+    out = capsys.readouterr().out
+    assert "escaped testimonial (quote)" in out and "REPAIRED PASS: 1 of 1" in out
+
+
+def test_check_separates_what_the_writer_wrote_from_what_it_lost(svc, monkeypatch, capsys):
+    monkeypatch.setattr(G, "load_svc", lambda client: svc)
+    A, B, D, scope, history, stored = _world()
+    assert G.cmd_check(_BQ(scope, history, [], stored), table="p.DEV.x") is True
+    assert "CHECK PASS: 0 differing columns" in capsys.readouterr().out
+    stored[0]["wellnessDomain"] = "Relational"                       # the writer's row is not the fold
+    assert G.cmd_check(_BQ(scope, history, [], stored), table="p.DEV.x") is False
+
+
+def test_list_writes_the_planned_rows_and_the_sample(svc, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(G, "load_svc", lambda client: svc)
+    monkeypatch.setattr(G, "preflight", lambda *a, **k: None)
+    monkeypatch.chdir(tmp_path)
+    A = f"{U1}2026-09-27T13:00:00.5-04:00"
+    scope = [req(2, "2026-09-27T17:00:01+00:00", old_body(A, A[36:]))]
+    G.cmd_list(_BQ(scope, scope, [], []), table="p.DEV.x")
+    out = capsys.readouterr().out
+    assert "PLAN: insert 1, update 0, collapse 0" in out and "SAMPLE -- 1 check-ins" in out
+    (csv_file,) = tmp_path.glob("gap_repair_planned_*.csv")
+    lines = csv_file.read_text(encoding="utf-8").splitlines()
+    assert lines[0].startswith("SessionID,group,action,stored_rows,calls,changed_columns,") and lines[1].startswith(A)
+    assert list(tmp_path.glob("gap_repair_sample_*.txt")) and list(tmp_path.glob("gap_repair_plan_*.json"))
+
+
+def test_sample_is_fixed_and_spread_over_the_actions():
+    ss = {}
+    for i in range(40):
+        ss[f"s{i}"] = {"insert": i < 10, "update": 10 <= i < 30, "collapse": 25 <= i < 30, "rejected": i == 39,
+                       "group": "began before the window" if i % 3 == 0 else "began in the window"}
+    a, b = G.sample_of(ss), G.sample_of(dict(reversed(list(ss.items()))))
+    assert a == b and len(a) == 20 and len(set(a)) == 20
+    assert sum(ss[s]["insert"] for s in a) >= 5 and sum(ss[s]["collapse"] for s in a) >= 3 and "s39" in a
 
 
 # --- the transaction ---------------------------------------------------------------------------
@@ -285,60 +379,10 @@ def test_cli_refuses_production_plan_before_signing_in(tmp_path, monkeypatch):
     monkeypatch.setattr(G, "make_client", lambda: (_ for _ in ()).throw(AssertionError("signed in")))
     with pytest.raises(SystemExit, match="not a DEV table"):
         G.main_(["apply", str(p)])
-    with pytest.raises(SystemExit, match="--flows is required"):
-        G.main_(["list"])
 
 
 def test_same_treats_blank_as_null_and_numbers_by_value():
     assert G.same("", None) and G.same(None, "  ") and G.same(8, 8.0) and not G.same("No", None)
-
-
-# --- review 2026-09-28: interrupted runs are not replies ----------------------------------------
-# Four patterns checked against the TextIt API by the reviewer: three runs interrupted by the
-# contact's next check-in (value '', category "No Response", time = the interruption) and one real
-# reply (a scored reply with text, category "All Responses"). Identifiers here are synthetic.
-
-def result(value, category, t):
-    return {"flow": "F", "uuid": "r", "contact": U1, "created_on": "2026-09-25T16:01:09Z",
-            "values": {"checkinresponse": {"value": value, "category": category, "time": t}}}
-
-
-INTERRUPTED = [result("", "No Response", "2026-09-26T14:05:30.616577Z"),
-               result("", "No Response", "2026-09-26T18:02:03.703737Z"),
-               result("", "No Response", "2026-09-26T18:47:01.179880Z")]
-REAL = result("5 = neutral 😐 thanks for asking", "All Responses", "2026-09-26T16:37:23.964784Z")
-CALL_NO_REPLY = {"checkinReply": "No", "checkinReplyText": None, "checkinReplyNumerical": None,
-                 "checkinReplyDistressed": None, "checkinReplyDateTime": None}
-
-
-def test_interrupted_run_is_not_a_reply():
-    m = G.learn_mapping(agreeing())
-    for r in INTERRUPTED:
-        assert G.run_reply(r)[0] is False and G.run_reply(r)[3] is None
-        row, verdict, _ = G.apply_run(dict(CALL_NO_REPLY), r, m, {"F"})
-        assert verdict == "agree" and row == CALL_NO_REPLY          # the stored "No" stays "No"
-    assert G.run_reply(result("7", "no response", "2026-09-26T14:05:30Z"))[0] is False   # category, any case
-    assert G.run_reply(result("  ", "All Responses", "2026-09-26T14:05:30Z"))[0] is False  # empty value
-
-
-def test_real_reply_run_fills_the_reply():
-    row, verdict, _ = G.apply_run(dict(CALL_NO_REPLY), REAL, G.learn_mapping(agreeing()), {"F"})
-    assert verdict == "run: reply the call lacks"
-    assert row["checkinReply"] == "Yes" and row["checkinReplyText"] == "5 = neutral 😐 thanks for asking"
-    assert row["checkinReplyDateTime"] == datetime(2026, 9, 26, 16, 37, 23, 964784)
-
-
-def test_list_stops_when_runs_outweigh_calls(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    runs = tmp_path / "runs.json"
-    runs.write_text("[]")
-    fake = {"totals": {}, "sessions": [], "_ctx": {"sessions": {"x": {"verdict": "run: reply the call lacks"}},
-                                                   "excluded": {}, "call_changed": 40, "run_changed": 51}}
-    monkeypatch.setattr(G, "build_plan", lambda *a, **k: dict(fake))
-    monkeypatch.setattr(G, "preflight", lambda *a, **k: None)
-    with pytest.raises(SystemExit, match="runs rule is suspect"):
-        G.cmd_list(_BQ([], [], []), ["F"], table="p.DEV.x", runs_file=str(runs))
-    assert not list(tmp_path.glob("gap_repair_plan_*.json"))
 
 
 # --- review 2026-09-28: generated SQL, dry-run forms --------------------------------------------
@@ -419,12 +463,10 @@ def test_rollback_dry_run_keeps_its_parameters():
 
 def test_list_dry_runs_before_reading_anything(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    runs = tmp_path / "runs.json"
-    runs.write_text("[]")
     bq = _DryBQ(reject="MERGE")
     bq.get_table = lambda table: _Table()
     with pytest.raises(SystemExit, match="dry run"):
-        G.cmd_list(bq, ["F"], table="p.DEV.x", runs_file=str(runs))
+        G.cmd_list(bq, table="p.DEV.x")
     assert all(s for s, _ in bq.seen)                               # only dry runs were sent
 
 

@@ -1,55 +1,56 @@
 """
-Repair the check-in rows the old writer (get-responses_v2) lost or left wrong between the
-response_data partition swap (2026-09-26 06:49 CT, 11:49 UTC) and the switch to add-to-db
-(2026-09-28 19:56 CT; its last call 2026-09-29 00:56:33 UTC).
+Repair the check-in rows of RESPONSES.response_data that the old writer (get-responses_v2) lost or left
+wrong between the partition swap (2026-09-26 06:49 CT, 11:49 UTC) and the switch to add-to-db (the old
+writer's last call 2026-09-29 00:56:33 UTC), plus the check-ins of the calls add-to-db answered 400 on
+2026-09-29 because the webhook body was not valid JSON.
 
-Source of truth, per check-in (SessionID):
-  * the check-in's LAST call to the old writer in the window, from OPS.webhook_log_detail, prepared
-    with add-to-db's own code (key casing, typed values, UTC datetimes, blank -> NULL, stale-reply
-    guard: a reply dated before the check-in is not a reply);
-  * TextIt runs of the check-in flow for the reply fields: a run is matched on contact + created_on
-    within 5 s of the check-in time; where run and call disagree, the run wins and the row is listed.
+The rule: the repaired row of a check-in (SessionID) is what add-to-db writes when it receives every
+logged call of that check-in in the order the calls were fired -- the service's own preparation of
+each call (key casing, typed values, UTC datetimes, blank -> NULL, stale-reply guard) and its own fold
+(last call wins per column; a blank check-in time never replaces a stored one), imported from the
+service, not rewritten here. Every logged call counts, from both endpoints and whatever it was answered:
+  * /get-responses_v2/v2/add (and the maintenance-hold path of the 2026-09-26 swap): the Responses
+    object, whose url-encoded values the service's preparation decodes, as it does for every string;
+  * /upsert on add-to-db after the switch: the responses item of the body, exactly as sent, including
+    the calls the service has already written; a body that is not valid JSON (answered 400) is repaired
+    by escaping only the string values that broke it -- every other byte is kept -- and then used.
+A check-in is in scope when it has a call to the old writer inside the window or a rejected call after
+the switch; its calls are taken from the whole log (bodies are kept from 2026-08-25), whatever the edge.
+Calls without a SessionID (sign-up events) are counted and left alone; the users table is out of scope.
 
-Close-out calls are not check-in updates. When a contact's next check-in starts, the flow re-sends
-the PREVIOUS check-in's body at the same second, built from contact fields that are already partly
-the new check-in's (state, nudges, wellness domain). A call fired within 2 s of the start of another
-check-in of the same contact is a close-out; it is never used as a source. A check-in whose only
-calls in the window are close-outs is not repaired (its row predates the window: out of scope).
-
-Also out of scope: check-ins with any call in OPS.adb_staging (add-to-db owns them), calls with no
-SessionID (sign-up events), the users table, and every row outside the check-ins listed.
-
-    python tools/repair_checkin_gap.py list --flows UUID[,UUID] [--table T] [--runs FILE]
-        read-only (BigQuery reads; TextIt runs read with TEXTIT_API_TOKEN). Console: summary only.
-        Writes gap_repair_list_<stamp>.txt (every check-in, every change, why), the plan
-        gap_repair_plan_<stamp>.json, and the runs it read gap_repair_runs_<stamp>.json (subscriber
-        reply text: keep it on this machine; --runs reuses it instead of reading TextIt again).
-    python tools/repair_checkin_gap.py rehearse --runs FILE [--keep]
-        on a DEV clone of today's RESPONSES.response_data: list, diagnose, apply (backup, one
-        transaction), diagnose again, roll back, check every row is back; drops the clone, backup and
-        loaded rows (--keep keeps them). Writes nothing outside DEV.
+    python tools/repair_checkin_gap.py calls
+        read-only. Loads the check-ins in scope and every logged call of each; counts them per check-in
+        by endpoint and answer, and against an independent count read in SQL; hour-by-hour coverage.
+    python tools/repair_checkin_gap.py repaired
+        read-only. The /upsert bodies answered 400 since the switch: each one repaired, parsed, and
+        proven identical to the raw text in every value except the escaped ones.
+    python tools/repair_checkin_gap.py check
+        read-only. For every check-in add-to-db has written since the switch: the fold of its complete
+        call sequence against the stored row, column by column.
+    python tools/repair_checkin_gap.py list [--table T]
+        read-only. The plan for the check-ins in scope. Console: summary and a 20-check-in sample.
+        Files: gap_repair_list_<stamp>.txt (every change), gap_repair_plan_<stamp>.json (for apply),
+        gap_repair_planned_<stamp>.csv (every planned row), gap_repair_sample_<stamp>.txt (the sample
+        with every call). They carry subscriber reply text: they stay on this machine.
+    python tools/repair_checkin_gap.py rehearse [--keep]
+        on a DEV clone of today's RESPONSES.response_data: list, apply, list again, roll back.
     python tools/repair_checkin_gap.py apply PLAN [--production]
-        production only with --production, and never 02:00-04:30 CT (07:00-09:30 UTC: covers the
-        nightly chain in daylight and standard time). Sets the flush maintenance pause (OPS), drops
-        from the plan any check-in add-to-db has since staged, backs up the plan's rows to DEV, loads
-        the planned rows to DEV, then ONE transaction: asserts every listed row is as listed (a row
-        add-to-db flushed since the list fails it: rerun list); a call add-to-db stages during the apply
-        is flushed after the commit, when the pause clears, so its newer values win; inserts
-        and updates with add-to-db's own MERGE; collapses duplicates to one row; asserts exactly one
-        row per check-in and the table's row count moved by exactly inserts - extra rows. Clears the
-        pause (also on failure), reruns the diagnosis and writes gap_repair_applied_<stamp>.json.
+        production only with --production, and never 02:00-04:30 CT (07:00-09:30 UTC). Flush
+        maintenance pause on (OPS); drops from the plan any check-in add-to-db has staged a call for
+        after the log the list read; backs up the plan's rows to DEV; loads the planned rows to DEV; ONE
+        transaction: every listed row still as listed, add-to-db's MERGE, duplicates collapsed to one
+        row, exactly one row per check-in, the table's row count moved by exactly inserts - extra rows.
     python tools/repair_checkin_gap.py rollback APPLIED [--production]
-        one transaction: asserts every repaired row is still exactly as the apply left it, then puts
-        back the backup. Same flags and pause as apply.
+        one transaction: every repaired row still as the apply left it, then the backup put back.
 """
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import json
-import os
 import re
 import sys
-import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote
@@ -61,31 +62,137 @@ from google.cloud import bigquery
 import config  # noqa: E402  (src/ is on sys.path via _harness)
 from bq_writer import (  # noqa: E402
     BQ_TYPE_MAP, PRESENT_FIELD, apply_stale_reply_guard, build_batch_merge_query, coerce_payload_to_schema,
-    normalize_payload_to_schema, parse_datetime_like, quote_identifier)
+    fold_rows, is_keyless_row, normalize_payload_to_schema, parse_datetime_like, quote_identifier,
+    resolve_key_columns, validate_upsert_keys)
 
 UTC = timezone.utc
+TARGET = "responses"
 TABLE = f"{PROJECT}.RESPONSES.response_data"
 DEV_PREFIX = f"{PROJECT}.DEV."
 LOG = f"{PROJECT}.OPS.webhook_log_detail"
 STAGING = f"{PROJECT}.OPS.adb_staging"
 FLUSH_STATE = f"{PROJECT}.OPS.adb_flush_state"
-OLD_PATH = "/get-responses_v2/v2/add"
-WINDOW_START = datetime(2026, 9, 26, 11, 49, 0, tzinfo=UTC)     # partition swap, 06:49 CT
-WINDOW_END = datetime(2026, 9, 29, 0, 57, 0, tzinfo=UTC)        # after the old writer's last call (00:56:33)
-CLOSEOUT_S = 2
-RUN_MATCH_S = 5
-REPLY_AGREE_S = 2
-GATE_MIN = 50       # the list stops if the runs would change more replies than this AND more than the calls do
-MAPPING_MIN = 20
-REPLY_FIELDS = config.STALE_REPLY_FIELDS["responses"]
-CONVENTIONS = config.DATETIME_CONVENTIONS["responses"]
-TEXTIT_RUNS = "https://textit.com/api/v2/runs.json"
+OLD_PATHS = ["/get-responses_v2/v2/add", "/get-responses_v2-maintenance-hold/v2/add"]
+NEW_PATH = "/upsert"
+NEW_HOST = "add-to-db-853176470965.us-east1.run.app"
+WINDOW_START = datetime(2026, 9, 26, 11, 49, 0, tzinfo=UTC)          # partition swap, 06:49 CT
+WINDOW_END = datetime(2026, 9, 29, 0, 57, 0, tzinfo=UTC)             # after the old writer's last call
+SWITCH_AT = datetime(2026, 9, 29, 0, 56, 33, 721566, tzinfo=UTC)     # the old writer's last call
+LOG_FLOOR = datetime(2026, 8, 25, tzinfo=UTC)                        # the log keeps bodies from here
+REPLY_FIELDS = config.STALE_REPLY_FIELDS[TARGET]
+CONVENTIONS = config.DATETIME_CONVENTIONS[TARGET]
+PRESERVE = config.PRESERVE_ON_BLANK[TARGET]
 QUIET_UTC = ((7, 0), (9, 30))       # no production write 07:00-09:30 UTC
+SAMPLE_N = 20
+SID_SQL = (r"REPLACE(REPLACE(REPLACE(REPLACE(REGEXP_EXTRACT(request_body, r'(?i)\"sessionid\"\s*:\s*\"([^\"]*)\"'), "
+           r"'%3A', ':'), '%3a', ':'), '%2B', '+'), '%2b', '+')")
+UUID_SQL = r"REGEXP_EXTRACT(request_body, r'\"uuid\"\s*:\s*\"([0-9A-Fa-f-]{36})\"')"
+IS_RESP_SQL = ("(request_path IN UNNEST(@old) OR (request_path = @new AND request_host = @host AND "
+               r"REGEXP_CONTAINS(request_body, r'\"table\"\s*:\s*\"responses\"')))")
 
 
 # ---------------------------------------------------------------------------------------------
-# calls
+# bodies: parse, and repair a body the webhook template broke
 # ---------------------------------------------------------------------------------------------
+
+_KEY = r"[A-Za-z_][A-Za-z0-9_]*"
+# a "key": "value" pair of the webhook template, ending where the template ends a value: the closing
+# quote followed by an optional comma, a line break, and the next key or the end of the object
+STRING_PAIR = re.compile(r'"(' + _KEY + r')"\s*:\s*"(.*?)"(?=[ \t]*,?[ \t]*\r?\n[ \t]*(?:"' + _KEY + r'"\s*:|[}\]]))',
+                         re.S)
+
+
+def _offending(raw: str) -> bool:
+    return '"' in raw or "\\" in raw or any(ord(ch) < 0x20 for ch in raw)
+
+
+def repair_body(text: str):
+    """
+    A body that is not valid JSON because a string value was pasted raw (a quote, a backslash or a line
+    break typed by a subscriber): escape exactly those values, keep every other byte. Returns
+    {"obj", "text", "escaped": [(key, raw)], "spans": [(start, end)]} or None when it still does not parse.
+    """
+    spans = [(m.start(2), m.end(2), m.group(1), m.group(2)) for m in STRING_PAIR.finditer(text or "")
+             if _offending(m.group(2))]
+    if not spans:
+        return None
+    out, pos = [], 0
+    for s, e, _, raw in spans:
+        out += [text[pos:s], json.dumps(raw, ensure_ascii=False)[1:-1]]
+        pos = e
+    out.append(text[pos:])
+    fixed = "".join(out)
+    try:
+        obj = json.loads(fixed)
+    except ValueError:
+        return None
+    return {"obj": obj, "text": fixed, "escaped": [(k, raw) for _, _, k, raw in spans],
+            "spans": [(s, e) for s, e, _, _ in spans]}
+
+
+def _string_leaves(obj, key=None):
+    """Every (key, string value) of a parsed body, in document order."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _string_leaves(v, k)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _string_leaves(v, key)
+    elif isinstance(obj, str):
+        yield key, obj
+
+
+def prove_repair(text: str, rep: dict) -> dict:
+    """
+    Proof that the repair changed nothing but the escaping of the offending values:
+      outside   -- the text outside the escaped values is byte-identical before and after;
+      values    -- every string value of the parsed body equals the raw characters between its quotes in
+                   the original text (the escaped ones included), one for one, in order;
+    numbers and nulls sit outside the escaped values, so they parse from identical text.
+    """
+    before, pos = [], 0
+    for s, e in rep["spans"]:
+        before.append(text[pos:s])
+        pos = e
+    before.append(text[pos:])
+    after, pos, fixed = [], 0, rep["text"]
+    for (s, e), (_, raw) in zip(rep["spans"], rep["escaped"]):
+        esc = json.dumps(raw, ensure_ascii=False)[1:-1]
+        start = fixed.index(esc, pos)
+        after.append(fixed[pos:start])
+        pos = start + len(esc)
+    after.append(fixed[pos:])
+    raw_pairs = [(m.group(1), m.group(2)) for m in STRING_PAIR.finditer(text)]
+    parsed = list(_string_leaves(rep["obj"]))
+    same_values = sum(1 for (k1, v1), (k2, v2) in zip(raw_pairs, parsed) if k1 == k2 and v1 == v2)
+    return {"parses": True, "outside_identical": before == after, "strings": len(parsed),
+            "raw_strings": len(raw_pairs), "identical": same_values,
+            "ok": before == after and len(parsed) == len(raw_pairs) == same_values}
+
+
+def body_items(svc, text: str):
+    """(responses payloads the body carries, repair or None, error or None) -- as the writer parses bodies."""
+    rep = None
+    try:
+        body = json.loads(text)
+    except (TypeError, ValueError):
+        rep = repair_body(text or "")
+        if rep is None:
+            return [], None, "not JSON and not repairable"
+        body = rep["obj"]
+    if not isinstance(body, dict):
+        return [], rep, "not a JSON object"
+    if isinstance(body.get("Responses"), dict):              # the old writer's body
+        return [body["Responses"]], rep, None
+    items, err = svc.normalize_target_requests(body)       # add-to-db's own body parsing
+    if err:
+        return [], rep, err
+    return [i["data"] for i in items if i["target"] == TARGET], rep, None
+
+
+def _get(d: dict, key: str):
+    return next((v for k, v in d.items() if k.lower() == key.lower()), None)
+
 
 def _aware(value):
     if value is None or str(value).strip() == "":
@@ -97,78 +204,17 @@ def _aware(value):
     return v if v.tzinfo else v.replace(tzinfo=UTC)
 
 
-def parse_call(httplog_id, fired_at, body_text):
-    """One logged call -> dict, or None when the body has no Responses object."""
-    try:
-        body = json.loads(body_text)
-    except (TypeError, ValueError):
-        return None
-    resp = body.get("Responses") if isinstance(body, dict) else None
-    if not isinstance(resp, dict):
-        return None
-    users = body.get("Users") if isinstance(body.get("Users"), dict) else {}
-    get = lambda d, k: next((v for kk, v in d.items() if kk.lower() == k.lower()), None)  # noqa: E731
-    sid = unquote(str(get(resp, "sessionID") or "")).strip()
-    return {"id": httplog_id, "fired_at": fired_at, "resp": resp, "users": users, "sid": sid,
-            "uuid": unquote(str(get(resp, "uuid") or "")).strip(),
-            "checkin": _aware(get(resp, "checkinDateTime"))}
-
-
-def fetch_calls(client) -> list[dict]:
-    sql = (f"SELECT httplog_id, fired_at, request_body FROM `{LOG}` WHERE request_path = @p "
-           f"AND fired_at >= @s AND fired_at < @e ORDER BY fired_at, httplog_id")
-    cfg = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("p", "STRING", OLD_PATH),
-        bigquery.ScalarQueryParameter("s", "TIMESTAMP", WINDOW_START),
-        bigquery.ScalarQueryParameter("e", "TIMESTAMP", WINDOW_END)])
-    calls = []
-    for r in client.query(sql, job_config=cfg).result():
-        c = parse_call(r["httplog_id"], r["fired_at"], r["request_body"])
-        if c is not None:
-            calls.append(c)
-    calls.sort(key=lambda c: (c["fired_at"], c["id"]))
-    return calls
-
-
-def mark_closeouts(calls: list[dict]) -> None:
-    """call["closeout"] = True when another check-in of the same contact starts within CLOSEOUT_S of it."""
-    starts = defaultdict(set)
-    for c in calls:
-        if c["sid"] and c["uuid"] and c["checkin"] is not None:
-            starts[c["uuid"]].add((c["sid"], c["checkin"]))
-    for c in calls:
-        c["closeout"] = any(sid != c["sid"] and abs((ci - c["fired_at"]).total_seconds()) <= CLOSEOUT_S
-                            for sid, ci in starts.get(c["uuid"], ()))
-
-
-def staged_sessions(client) -> set[str]:
-    sql = (f"SELECT DISTINCT COALESCE(JSON_VALUE(payload, '$.sessionID'), JSON_VALUE(payload, '$.SessionID'), "
-           f"JSON_VALUE(payload, '$.sessionid')) sid FROM `{STAGING}` WHERE target = 'responses'")
-    return {unquote(str(r["sid"])).strip() for r in client.query(sql).result() if r["sid"]}
+def sid_time(sid: str):
+    """A SessionID is the contact uuid followed by the time the session started."""
+    return _aware(sid[36:]) if sid and len(sid) > 36 else None
 
 
 # ---------------------------------------------------------------------------------------------
-# row preparation: add-to-db's own code, in plan_target_writes' order, without schema changes
+# preparation and fold: add-to-db's own functions, in plan_target_writes' order
 # ---------------------------------------------------------------------------------------------
-
-def prepare_row(svc, schema, resp: dict):
-    """
-    (row, errors, unknown_keys, guarded). Same steps as main.plan_target_writes for one item, except
-    that a key the table lacks is dropped and reported instead of added as a column.
-    """
-    names = {f.name.lower() for f in schema}
-    unknown = sorted(k for k in resp if k.lower() not in names)
-    normalized, n_err = normalize_payload_to_schema(dict(resp), schema)
-    coerced, c_err = coerce_payload_to_schema(normalized, schema, CONVENTIONS)
-    errors, _ = svc.validate_payload(coerced, schema)
-    errors = [e for e in errors + n_err + c_err if "not found in BigQuery schema" not in e]
-    row = svc.filter_to_schema(coerced, schema)
-    guarded_row = apply_stale_reply_guard(row, REPLY_FIELDS)
-    return guarded_row, errors, unknown, guarded_row != row
-
 
 def load_svc(client):
-    """main (for validate_payload / filter_to_schema) imported with our client; nothing else is used."""
+    """main (the service) imported with our client, for its body parsing and validation."""
     original = bigquery.Client
     bigquery.Client = lambda *a, **k: client
     try:
@@ -179,149 +225,160 @@ def load_svc(client):
     return main
 
 
+def prepare(svc, schema, data: dict):
+    """
+    One call's row exactly as main.plan_target_writes prepares it, except that a key the table lacks
+    is dropped and reported instead of added as a column. (row, errors, unknown_keys, keyless, guarded)
+    """
+    names = {f.name.lower() for f in schema}
+    unknown = sorted(k for k in data if k.lower() not in names)
+    normalized, normalize_errors = normalize_payload_to_schema(dict(data), schema)
+    coerced, coerce_errors = coerce_payload_to_schema(normalized, schema, CONVENTIONS)
+    errors, _warnings = svc.validate_payload(coerced, schema)
+    errors = errors + normalize_errors + coerce_errors
+    resolved, key_errors = resolve_key_columns(config.UPSERT_KEYS[TARGET], schema)
+    row = svc.filter_to_schema(coerced, schema)
+    keyless = TARGET in config.KEYLESS_INSERT_TARGETS and is_keyless_row(resolved, row)
+    if not keyless:
+        errors = errors + key_errors + validate_upsert_keys(resolved, schema, row)
+    guarded_row = apply_stale_reply_guard(row, REPLY_FIELDS)
+    return guarded_row, errors, unknown, keyless, guarded_row != row
+
+
+def fold(schema, calls: list[dict]) -> dict:
+    """add-to-db's fold over prepared calls in fired order -> {SessionID: row}."""
+    resolved, _ = resolve_key_columns(config.UPSERT_KEYS[TARGET], schema)
+    ordered = sorted((c for c in calls if c["row"] is not None and not c["errors"] and not c["keyless"]),
+                     key=lambda c: c["order"])
+    folded, _ = fold_rows([c["row"] for c in ordered], resolved, PRESERVE)
+    return {key[0]: row for key, row in folded.items()}
+
+
 # ---------------------------------------------------------------------------------------------
-# TextIt runs
+# calls from the log
 # ---------------------------------------------------------------------------------------------
 
-def fetch_runs(flows: list[str], after: datetime, token: str, sleep=time.sleep, get=None) -> list[dict]:
-    """Every run of each flow modified after `after` (TextIt filters after/before on modified_on)."""
-    import requests
-    get = get or requests.get
+def _endpoint(path: str, fired) -> str:
+    if path in OLD_PATHS:
+        return "old writer" if path == OLD_PATHS[0] else "old writer (maintenance hold)"
+    return "add-to-db" if fired > SWITCH_AT else "add-to-db before the switch (not the live writer: excluded)"
+
+
+def _status(line: str) -> str:
+    m = re.search(r"\b(\d{3})\b", line or "")
+    return m.group(1) if m else (line or "none").strip()
+
+
+def make_calls(svc, schema, r) -> list[dict]:
+    """One logged request -> one call per responses payload it carries (prepared)."""
+    items, rep, err = body_items(svc, r["request_body"])
+    base = {"id": r["httplog_id"], "fired_at": r["fired_at"], "endpoint": _endpoint(r["request_path"], r["fired_at"]),
+            "status": _status(r["response_status_line"]), "repaired": rep is not None}
+    if err:
+        return [dict(base, sid=None, raw_sid=None, row=None, errors=[err], unknown=[], keyless=False, guarded=False,
+                     order=(r["fired_at"], r["httplog_id"], 0))]
     out = []
-    for flow in flows:
-        url = f"{TEXTIT_RUNS}?flow={flow}&after={after.astimezone(UTC).strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
-        pages = 0
-        while url:
-            resp = get(url, headers={"Authorization": f"Token {token}"}, timeout=60)
-            if resp.status_code == 429:
-                m = re.search(r"available in (\d+)", resp.text or "")
-                sleep((int(m.group(1)) if m else 60) + 3)
-                continue
-            if resp.status_code != 200:
-                raise SystemExit(f"TextIt runs read failed: HTTP {resp.status_code} for flow {flow} "
-                                 f"(page {pages + 1}); nothing was written")
-            data = resp.json()
-            for run in data.get("results", []):
-                out.append({"flow": flow, "uuid": run.get("uuid"),
-                            "contact": (run.get("contact") or {}).get("uuid"),
-                            "created_on": run.get("created_on"), "values": run.get("values") or {}})
-            pages += 1
-            if pages % 20 == 0:
-                print(f"runs: flow {flow}: {pages} pages read")
-            url = data.get("next")
-            if url:
-                sleep(1.5)                         # 2,500 requests/hour, shared with every other job
-        print(f"runs: flow {flow}: {sum(1 for r in out if r['flow'] == flow)} runs, {pages} pages")
+    for i, data in enumerate(items):
+        row, errors, unknown, keyless, guarded = prepare(svc, schema, data)
+        raw_sid = _get(data, "sessionID")
+        sid = row.get("SessionID") if not keyless else None
+        out.append(dict(base, sid=sid, raw_sid=unquote(str(raw_sid)) if raw_sid is not None else None,
+                        row=row, errors=errors, unknown=unknown, keyless=keyless, guarded=guarded,
+                        order=(r["fired_at"], r["httplog_id"], i)))
     return out
 
 
-def index_runs(runs: list[dict]) -> dict:
-    by_contact = defaultdict(list)
-    for r in runs:
-        created = _aware(r.get("created_on"))
-        if r.get("contact") and created is not None:
-            by_contact[r["contact"]].append((created, r))
-    return by_contact
+def _params(**kw):
+    out = []
+    for name, v in kw.items():
+        if isinstance(v, list):
+            out.append(bigquery.ArrayQueryParameter(name, "STRING", v))
+        elif isinstance(v, datetime):
+            out.append(bigquery.ScalarQueryParameter(name, "TIMESTAMP", v))
+        else:
+            out.append(bigquery.ScalarQueryParameter(name, "STRING", v))
+    return bigquery.QueryJobConfig(query_parameters=out)
 
 
-def match_run(by_contact, uuid: str, checkin):
-    if checkin is None:
-        return None
-    best = None
-    for created, run in by_contact.get(uuid, ()):
-        d = abs((created - checkin).total_seconds())
-        if d <= RUN_MATCH_S and (best is None or d < best[0]):
-            best = (d, run)
-    return best[1] if best else None
+def log_cutoff(client):
+    """The newest add-to-db call the log has ingested (the log is filled hourly): calls are read up to it."""
+    sql = f"SELECT MAX(fired_at) m FROM `{LOG}` WHERE fired_at > @sw AND request_path = @new AND request_host = @host"
+    return list(client.query(sql, job_config=_params(sw=SWITCH_AT, new=NEW_PATH, host=NEW_HOST)).result())[0]["m"]
 
 
-NO_RESPONSE = "no response"
+COLS = "httplog_id, fired_at, request_path, response_status_line, request_body"
 
 
-def run_reply(run):
+def scope_rows(client):
+    """Calls that put a check-in in scope: the old writer's in the window, add-to-db's answered 400."""
+    sql = (f"SELECT {COLS} FROM `{LOG}` WHERE fired_at >= @ws AND ((request_path IN UNNEST(@old) AND fired_at < @we) "
+           f"OR (request_path = @new AND request_host = @host AND fired_at > @sw "
+           f"AND STARTS_WITH(response_status_line, 'HTTP/2.0 400'))) ORDER BY fired_at, httplog_id")
+    return client.query(sql, job_config=_params(ws=WINDOW_START, we=WINDOW_END, sw=SWITCH_AT, old=OLD_PATHS,
+                                                new=NEW_PATH, host=NEW_HOST)).result()
+
+
+def since_switch_rows(client, cutoff):
+    """add-to-db's accepted responses calls since the switch, up to the log cutoff."""
+    sql = (f"SELECT {COLS} FROM `{LOG}` WHERE fired_at > @sw AND fired_at <= @cut AND request_path = @new "
+           f"AND request_host = @host AND STARTS_WITH(response_status_line, 'HTTP/2.0 2') "
+           r"AND REGEXP_CONTAINS(request_body, r'\"table\"\s*:\s*\"responses\"') ORDER BY fired_at, httplog_id")
+    return client.query(sql, job_config=_params(sw=SWITCH_AT, cut=cutoff, new=NEW_PATH, host=NEW_HOST)).result()
+
+
+def history_rows(client, sids: list[str], floor, cutoff):
+    """Every logged call of these check-ins, both endpoints, any answer, from `floor` to the log cutoff."""
+    sql = (f"SELECT {COLS} FROM `{LOG}` WHERE fired_at >= @floor AND fired_at <= @cut AND {IS_RESP_SQL} "
+           f"AND {SID_SQL} IN UNNEST(@sids) ORDER BY fired_at, httplog_id")
+    return client.query(sql, job_config=_params(floor=floor, cut=cutoff, old=OLD_PATHS, new=NEW_PATH, host=NEW_HOST,
+                                                sids=sorted(sids))).result()
+
+
+def sql_counts(client, uuids: list[str], floor, cutoff):
+    """Independent count per SessionID (read by pattern in SQL, not by the JSON parser), for the contacts in scope."""
+    sql = (f"SELECT {SID_SQL} sid, COUNTIF(request_path IN UNNEST(@old)) old_n, "
+           f"COUNTIF(request_path = @new AND fired_at > @sw) new_n, COUNTIF(request_path = @new AND fired_at <= @sw) pre_n "
+           f"FROM `{LOG}` WHERE fired_at >= @floor AND fired_at <= @cut AND {IS_RESP_SQL} "
+           f"AND {UUID_SQL} IN UNNEST(@uuids) GROUP BY sid")
+    return {r["sid"]: (r["old_n"], r["new_n"], r["pre_n"]) for r in client.query(
+        sql, job_config=_params(floor=floor, cut=cutoff, sw=SWITCH_AT, old=OLD_PATHS, new=NEW_PATH, host=NEW_HOST,
+                                uuids=sorted(uuids))).result()}
+
+
+def staged_since(client, cutoff) -> set[str]:
+    """Check-ins with a call add-to-db staged after the log cutoff: the log does not have their newest call yet."""
+    sql = (f"SELECT DISTINCT COALESCE(JSON_VALUE(payload, '$.sessionID'), JSON_VALUE(payload, '$.SessionID'), "
+           f"JSON_VALUE(payload, '$.sessionid')) sid FROM `{STAGING}` WHERE target = @t AND received_at > @cut")
+    return {unquote(str(r["sid"])) for r in client.query(sql, job_config=_params(t=TARGET, cut=cutoff)).result() if r["sid"]}
+
+
+def load(client, svc, schema, mode: str) -> dict:
     """
-    (replied, value, category, time naive UTC) from the run's checkinresponse result.
-
-    A reply only when the category is not "No Response" and the value is not empty. TextIt writes
-    value '' / category "No Response" when the run is interrupted (typically by the contact's next
-    check-in); that result's time is the interruption, not a reply.
+    mode "window": the check-ins in scope of the repair; mode "since switch": every check-in add-to-db
+    has written since the switch. Returns the calls of those check-ins (all of them) and context.
     """
-    res = (run.get("values") or {}).get("checkinresponse")
-    if not res:
-        return False, None, None, None
-    value, cat = res.get("value"), res.get("category")
-    t = _aware(res.get("time"))
-    replied = (t is not None and str(cat or "").strip().lower() != NO_RESPONSE
-               and value is not None and str(value).strip() != "")
-    if not replied:
-        return False, value, cat, None
-    return True, value, cat, t.astimezone(UTC).replace(tzinfo=None)
-
-
-def _num(value):
-    try:
-        return float(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-
-
-def learn_mapping(pairs: list[tuple[dict, dict]]) -> dict:
-    """
-    From check-ins where call and run agree that a reply happened at the same time, learn how the run's
-    value/category show up in the row. A field is derivable from a run only if EVERY agreeing check-in
-    shows the same relation (and there are at least MAPPING_MIN of them).
-    """
-    rows = [(row, run_reply(run)) for row, run in pairs]
-    n = len(rows)
-    text_ok = n >= MAPPING_MIN and all((row.get("checkinReplyText") or "").strip() == str(v or "").strip()
-                                       for row, (_, v, _, _) in rows)
-    num_ok = n >= MAPPING_MIN and all(row.get("checkinReplyNumerical") == _num(v) for row, (_, v, _, _) in rows)
-    reply_vals = {row.get("checkinReply") for row, _ in rows}
-    yes = next(iter(reply_vals)) if n >= MAPPING_MIN and len(reply_vals) == 1 else None
-    seen = defaultdict(Counter)
-    for row, (_, _, cat, _) in rows:
-        seen[cat][row.get("checkinReplyDistressed")] += 1
-    distressed = {cat: next(iter(c)) for cat, c in seen.items() if len(c) == 1 and sum(c.values()) >= MAPPING_MIN}
-    return {"agreeing": n, "text": text_ok, "numerical": num_ok, "reply_value": yes, "distressed": distressed}
-
-
-def apply_run(row: dict, run, mapping: dict, usable_flows: set) -> tuple[dict, str, list[str]]:
-    """(row, verdict, notes). The run wins for reply fields where it disagrees."""
-    if run is None:
-        return row, "no run", []
-    if run["flow"] not in usable_flows:
-        return row, "run flow carries no check-in reply result", []
-    replied, value, cat, t = run_reply(run)
-    row_t = row.get("checkinReplyDateTime")
-    if not replied and row_t is None:
-        return row, "agree", []
-    if replied and row_t is not None and abs((row_t - t).total_seconds()) <= REPLY_AGREE_S:
-        return row, "agree", []
-    new = dict(row)
-    notes = []
-    if not replied:
-        for f in REPLY_FIELDS:
-            new[f] = None
-        return new, "run: no reply (call carried an earlier reply)", notes
-    new["checkinReplyDateTime"] = t
-    if mapping["reply_value"] is not None:
-        new["checkinReply"] = mapping["reply_value"]
-    else:
-        notes.append("checkinReply not derivable from runs")
-    if mapping["text"]:
-        new["checkinReplyText"] = None if value is None or str(value).strip() == "" else str(value)
-    else:
-        notes.append("checkinReplyText not derivable from runs")
-    if mapping["numerical"]:
-        new["checkinReplyNumerical"] = _num(value)
-    else:
-        notes.append("checkinReplyNumerical not derivable from runs")
-    if cat in mapping["distressed"]:
-        new["checkinReplyDistressed"] = mapping["distressed"][cat]
-    else:
-        notes.append(f"checkinReplyDistressed not derivable for category {cat!r}")
-    verdict = "run: reply the call lacks" if row_t is None else "run: reply at another time"
-    return new, verdict, notes
+    cutoff = log_cutoff(client)
+    seed, seed_rows = [], 0
+    hours = Counter()
+    rows = scope_rows(client) if mode == "window" else since_switch_rows(client, cutoff)
+    for r in rows:
+        seed_rows += 1
+        if mode == "window" and r["request_path"] in OLD_PATHS:
+            hours[r["fired_at"].astimezone(UTC).replace(minute=0, second=0, microsecond=0)] += 1
+        seed += make_calls(svc, schema, r)
+    sids = sorted({c["sid"] for c in seed if c["sid"]})
+    starts = [t for t in (sid_time(s) for s in sids) if t is not None]
+    floor = max(LOG_FLOOR, min(starts, default=WINDOW_START) - timedelta(minutes=10))
+    calls, unknown = [], Counter()
+    wanted = set(sids)
+    for r in history_rows(client, sids, floor, cutoff):
+        for c in make_calls(svc, schema, r):
+            if c["sid"] in wanted or (c["sid"] is None and c.get("raw_sid") in wanted):
+                calls.append(c)
+                unknown.update(c["unknown"])
+    calls.sort(key=lambda c: c["order"])
+    return {"mode": mode, "cutoff": cutoff, "floor": floor, "seed": seed, "seed_rows": seed_rows, "sids": sids,
+            "calls": calls, "unknown": unknown, "hours": hours}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -357,6 +414,13 @@ def same(a, b) -> bool:
     return a == b
 
 
+def differs(stored: dict, planned: dict, col: str) -> bool:
+    """Would add-to-db's MERGE change this stored value? A NULL in a preserve column keeps the stored one."""
+    if col.lower() in {p.lower() for p in PRESERVE} and planned.get(col) is None:
+        return False
+    return not same(stored.get(col), planned.get(col))
+
+
 def fps_of(rows: list[dict]) -> str:
     return ",".join(str(v) for v in sorted(int(r["gap_fp"]) for r in rows))
 
@@ -371,156 +435,47 @@ def _enc(v):
     return v
 
 
-IDENTITY = ["checkinDateTime", "contactType", "wellnessDomain"]
-REPLY6 = ["checkinReply", "checkinReplyText", "checkinReplyNumerical", "checkinReplyDateTime",
-          "checkinReplyNudges", "checkinReplyDistressed"]
+def group_of(sid: str, rejected: set) -> str:
+    t = sid_time(sid)
+    if t is not None and t >= SWITCH_AT:
+        return "began after the switch (rejected call)"
+    if t is not None and t < WINDOW_START:
+        return "began before the window"
+    return "began in the window"
 
 
-def fetch_first_calls(client, sids: list[str], since: datetime) -> dict:
-    """The earliest logged call before the window for each of these check-ins (bodies are kept from 2026-08-25)."""
-    if not sids:
-        return {}
-    sql = (f"SELECT httplog_id, fired_at, request_body FROM `{LOG}` WHERE request_path = @p "
-           f"AND fired_at >= @s AND fired_at < @e AND REPLACE(REPLACE(REPLACE(JSON_VALUE(request_body, "
-           f"'$.Responses.sessionID'), '%3A', ':'), '%2B', '+'), '%2b', '+') IN UNNEST(@sids)")
-    cfg = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("p", "STRING", OLD_PATH),
-        bigquery.ScalarQueryParameter("s", "TIMESTAMP", since),
-        bigquery.ScalarQueryParameter("e", "TIMESTAMP", WINDOW_START),
-        bigquery.ArrayQueryParameter("sids", "STRING", sorted(sids))])
-    wanted, first = set(sids), {}
-    for r in client.query(sql, job_config=cfg).result():
-        c = parse_call(r["httplog_id"], r["fired_at"], r["request_body"])
-        if c is None or c["sid"] not in wanted or c["fired_at"] >= WINDOW_START:
-            continue
-        if c["sid"] not in first or (c["fired_at"], c["id"]) < (first[c["sid"]]["fired_at"], first[c["sid"]]["id"]):
-            first[c["sid"]] = c
-    return first
-
-
-def build_plan(client, table: str, runs: list[dict], flows: list[str], out=None) -> dict:
-    """
-    Read-only. Narrow repair (Logan, 2026-09-29): per check-in
-      * no stored row -> insert the FIRST call's row, with the reply fields replaced by the run-confirmed
-        ones when the TextIt run confirms the reply;
-      * existing rows -> only the identity fields (from the FIRST call; a blank there is not written) and,
-        when the run confirms the reply, the six reply fields (the last call's, or the run's where it
-        decides); every other stored column is kept;
-      * more than one row -> collapse to one.
-    """
+def build_plan(client, table: str, loaded: dict | None = None) -> dict:
+    """Read-only. Per check-in in scope: the fold of its complete call sequence against its stored rows."""
     svc = load_svc(client)
     schema = list(client.get_table(table).schema)
-    names = {f.name.lower(): f.name for f in schema}
-    identity = [names[c.lower()] for c in IDENTITY if c.lower() in names]
-    reply6 = [names[c.lower()] for c in REPLY6 if c.lower() in names]
-    calls = fetch_calls(client)
-    mark_closeouts(calls)
-    staged = staged_sessions(client)
-    keyless = [c for c in calls if not c["sid"]]
+    loaded = loaded or load(client, svc, schema, "window")
+    calls = loaded["calls"]
+    moving = staged_since(client, loaded["cutoff"])
+    rejected = {c["sid"] for c in list(loaded["seed"]) + calls
+                if c["endpoint"] == "add-to-db" and c["status"] == "400" and c["sid"]}
     by_sid = defaultdict(list)
     for c in calls:
         if c["sid"]:
             by_sid[c["sid"]].append(c)
-
-    usable_flows = {f for f in flows if any(r["flow"] == f and "checkinresponse" in (r["values"] or {}) for r in runs)}
-    by_contact = index_runs(runs)
-
-    early = [sid for sid, cs in by_sid.items() if sid not in staged and any(not c["closeout"] for c in cs)
-             and min((c["checkin"] for c in cs if c["checkin"]), default=WINDOW_START) < WINDOW_START]
-    since = min((c["checkin"] for sid in early for c in by_sid[sid] if c["checkin"]), default=WINDOW_START)
-    pre_first = fetch_first_calls(client, early, since - timedelta(minutes=10))
-
-    sessions, excluded, skipped_staged, bad = {}, {}, [], []
-    unknown_keys = Counter()
-    first_missing = 0
-    for sid, cs in by_sid.items():
-        if sid in staged:
-            skipped_staged.append(sid)
-            continue
-        kept = [c for c in cs if not c["closeout"]]
-        last = (kept or cs)[-1]
-        first = pre_first.get(sid) or (kept or cs)[0]
-        row, errors, unknown, guarded = prepare_row(svc, schema, last["resp"])
-        first_row, f_errors, f_unknown, _ = prepare_row(svc, schema, first["resp"])
-        unknown_keys.update(set(unknown) | set(f_unknown))
-        group = ("late call" if first_row.get(identity[0]) is not None
-                 and first_row[identity[0]] < WINDOW_START.replace(tzinfo=None) else "in window")
-        info = {"sid": sid, "group": group, "last": last, "first": first, "row": row, "first_row": first_row,
-                "first_known": group == "in window" or sid in pre_first,
-                "guarded": guarded, "calls": len(cs), "closeouts": sum(c["closeout"] for c in cs)}
-        if errors or f_errors:
-            bad.append((sid, errors + f_errors))
-            continue
-        if not kept:
-            excluded[sid] = info
-            continue
-        if group == "late call" and sid not in pre_first:
-            first_missing += 1
-        sessions[sid] = info
-
-    # runs: learn the mapping on agreeing check-ins, then let runs decide where they disagree
-    pairs = []
-    for s in sessions.values():
-        s["run"] = match_run(by_contact, s["last"]["uuid"], s["first"]["checkin"] or s["last"]["checkin"])
-        if s["run"] and s["run"]["flow"] in usable_flows:
-            replied, _, _, t = run_reply(s["run"])
-            rt = s["row"].get("checkinReplyDateTime")
-            if replied and rt is not None and abs((rt - t).total_seconds()) <= REPLY_AGREE_S:
-                pairs.append((s["row"], s["run"]))
-    mapping = learn_mapping(pairs)
-    for s in sessions.values():
-        s["call_row"] = s["row"]
-        s["reply_row"], s["verdict"], s["notes"] = apply_run(s["row"], s["run"], mapping, usable_flows)
-        s["confirmed"] = s["verdict"] == "agree" or s["verdict"].startswith("run:")
-
+    folded = fold(schema, calls)
+    bad = {sid: [e for c in cs for e in c["errors"]] for sid, cs in by_sid.items() if any(c["errors"] for c in cs)}
+    in_scope = [sid for sid in loaded["sids"] if sid in folded and sid not in moving]
     cols = [f.name for f in schema]
-    stored = read_stored(client, table, list(sessions) + list(excluded), cols)
-    blank_identity = Counter()
-    for sid, s in sessions.items():
-        rows = stored.get(sid, [])
-        s["stored"] = rows
-        if not rows:
-            planned = dict(s["first_row"])
-            if s["confirmed"]:
-                planned.update({c: s["reply_row"].get(c) for c in reply6})
-            write = [c for c in cols if c in planned]
-        else:
-            write = ["SessionID"]
-            for c in identity:
-                if not s["first_known"]:
-                    blank_identity["first call not in the log (identity kept as stored)"] += 1
-                elif s["first_row"].get(c) is None:
-                    blank_identity[c] += 1
-                else:
-                    write.append(c)
-            if s["confirmed"]:
-                write += reply6
-            src = {**{c: s["first_row"].get(c) for c in identity}, **{c: s["reply_row"].get(c) for c in reply6}}
-            planned = {"SessionID": sid, **{c: src[c] for c in write if c != "SessionID"}}
-        s["row"], s["write"] = planned, write
-        s["changed"] = sorted({c for c in write if c != "SessionID" for r in rows if not same(r.get(c), planned.get(c))},
-                              key=cols.index)
-        s["insert"] = not rows
-        s["collapse"] = len(rows) > 1
-        s["update"] = bool(rows) and bool(s["changed"])
-    for sid, s in excluded.items():                      # reported only: what the close-out would have changed
-        rows = stored.get(sid, [])
-        s["stored"], s["verdict"] = rows, "close-out, not repaired"
-        s["changed"] = sorted({c for c, v in s["row"].items() for r in rows if not same(r.get(c), v)}, key=cols.index)
-        s["insert"], s["collapse"] = not rows, len(rows) > 1
-        s["update"] = bool(rows) and bool(s["changed"])
-
-    call_changed = run_changed = 0
-    for s in sessions.values():
-        call = _reply(s["call_row"].get("checkinReply"))
-        stored_replies = [_reply(r.get("checkinReply")) for r in s["stored"]]
-        call_changed += (call == "Yes" and not stored_replies) or any(v != call for v in stored_replies)
-        run_changed += s["confirmed"] and _reply(s["reply_row"].get("checkinReply")) != call
-
+    stored = read_stored(client, table, in_scope, cols)
+    sessions = {}
+    for sid in in_scope:
+        rows, planned = stored.get(sid, []), folded[sid]
+        write = [c for c in cols if c in planned]
+        changed = sorted({c for c in write if c != "SessionID" for r in rows if differs(r, planned, c)}, key=cols.index)
+        sessions[sid] = {"sid": sid, "group": group_of(sid, rejected), "calls": by_sid[sid], "row": planned,
+                         "write": write, "stored": rows, "changed": changed, "insert": not rows,
+                         "collapse": len(rows) > 1, "update": bool(rows) and bool(changed),
+                         "rejected": sid in rejected}
     types = {f.name: f.field_type.upper() for f in schema}
     actions = [s for s in sessions.values() if s["insert"] or s["update"] or s["collapse"]]
     plan = {
-        "table": table, "listed_at": datetime.now(UTC).isoformat(), "scope": "narrow (Logan, 2026-09-29)",
+        "table": table, "listed_at": datetime.now(UTC).isoformat(), "log_cutoff": loaded["cutoff"].isoformat(),
+        "rule": "add-to-db's fold over every logged call of the check-in, in fired order",
         "window": [WINDOW_START.isoformat(), WINDOW_END.isoformat()],
         "columns": {c: types[c] for c in cols if any(c in s["row"] for s in actions)},
         "totals": {"insert": sum(s["insert"] for s in actions), "update": sum(s["update"] for s in actions),
@@ -528,14 +483,11 @@ def build_plan(client, table: str, runs: list[dict], flows: list[str], out=None)
                    "extra_rows": sum(len(s["stored"]) - 1 for s in actions if s["collapse"])},
         "sessions": [{"sid": s["sid"], "group": s["group"], "insert": s["insert"], "update": s["update"],
                       "collapse": s["collapse"], "n": len(s["stored"]), "fps": fps_of(s["stored"]),
-                      "changed": s["changed"], "verdict": s["verdict"], "write": s["write"],
+                      "changed": s["changed"], "write": s["write"],
                       "row": {c: _enc(v) for c, v in s["row"].items()}} for s in actions],
     }
-    plan["_ctx"] = {"calls": calls, "keyless": keyless, "sessions": sessions, "excluded": excluded,
-                    "staged": skipped_staged, "bad": bad, "unknown": unknown_keys, "mapping": mapping,
-                    "usable_flows": usable_flows, "runs": runs, "flows": flows, "identity": identity,
-                    "reply6": reply6, "blank_identity": blank_identity, "first_missing": first_missing,
-                    "call_changed": call_changed, "run_changed": run_changed}
+    plan["_ctx"] = {"loaded": loaded, "sessions": sessions, "moving": sorted(set(loaded["sids"]) & moving),
+                    "bad": bad, "no_row_planned": sorted(set(loaded["sids"]) - set(folded)), "schema": schema}
     return plan
 
 
@@ -548,204 +500,323 @@ def _reply(v):
 
 
 def diagnose(client, table: str, sessions: dict) -> dict:
-    """
-    For the check-ins in scope: no row; more than one row; a stored row differs from the plan in a column the
-    plan writes; identity (check-in time, contact type, wellness domain) differs from the first call; stored
-    reply != the last call's (after the stale-reply guard; blank = NULL) and last call says Yes but no stored
-    row does -- each split into what the repair leaves by rule (the run decided the reply; the run did not
-    confirm it, so the stored reply is kept) and what is unexplained.
-    """
-    cols = sorted({c for s in sessions.values() for c in list(s["row"]) + IDENTITY + ["checkinReply"]})
+    """For the check-ins in scope: no row; more than one row; a stored row differs from the fold; the
+    stored reply differs from the fold's; the fold says Yes and no stored row does."""
+    cols = sorted({c for s in sessions.values() for c in list(s["row"]) + ["checkinReply"]})
     stored = read_stored(client, table, list(sessions), cols)
     d = Counter(sessions=len(sessions))
     for sid, s in sessions.items():
         rows = stored.get(sid, [])
-        last = _reply(s["call_row"].get("checkinReply"))
-        planned = _reply(s["reply_row"].get("checkinReply")) if s["confirmed"] else None
+        planned = _reply(s["row"].get("checkinReply"))
         d["no row"] += not rows
         d["duplicated"] += len(rows) > 1
-        d["differs from plan"] += (not rows) or any(not same(r.get(c), s["row"].get(c))
-                                                    for r in rows for c in s["write"])
-        d["identity != first call"] += s["first_known"] and any(
-            s["first_row"].get(c) is not None and not same(r.get(c), s["first_row"][c]) for r in rows for c in IDENTITY)
-        if rows and any(_reply(r.get("checkinReply")) != last for r in rows):
-            d["reply != last call"] += 1
-            if not s["confirmed"]:
-                d[R_UNCONF] += 1
-            elif planned != last:
-                d[R_RUN] += 1
-            else:
-                d[R_OPEN] += 1
-        if last == "Yes" and not any(r.get("checkinReply") == "Yes" for r in rows):
-            d["Yes missing"] += 1
-            if not s["confirmed"]:
-                d[Y_UNCONF] += 1
-            elif planned != "Yes":
-                d[Y_RUN] += 1
-            else:
-                d[Y_OPEN] += 1
+        d["differs from the fold"] += bool(rows) and any(differs(r, s["row"], c) for r in rows for c in s["write"])
+        d["reply != the fold's"] += bool(rows) and any(_reply(r.get("checkinReply")) != planned for r in rows)
+        d["Yes missing"] += planned == "Yes" and not any(r.get("checkinReply") == "Yes" for r in rows)
     return d
 
 
-R_RUN, R_UNCONF, R_OPEN = ("  the run decided another reply", "  run did not confirm: stored kept",
-                           "  to repair")
-Y_RUN, Y_UNCONF, Y_OPEN = ("  the run says no reply", "  run did not confirm: stored kept ", "  to repair ")
-DIAG_KEYS = ["sessions", "no row", "duplicated", "differs from plan", "identity != first call",
-             "reply != last call", R_RUN, R_UNCONF, R_OPEN, "Yes missing", Y_RUN, Y_UNCONF, Y_OPEN]
+DIAG_KEYS = ["sessions", "no row", "duplicated", "differs from the fold", "reply != the fold's", "Yes missing"]
 
 
 def diag_lines(before, after=None) -> list[str]:
-    out = [f"  {'':<40} {'before':>8}" + (f" {'after':>8}" if after is not None else "")]
+    out = [f"  {'':<28} {'before':>8}" + (f" {'after':>8}" if after is not None else "")]
     for k in DIAG_KEYS:
-        out.append(f"  {k:<40} {before.get(k, 0):>8}" + (f" {after.get(k, 0):>8}" if after is not None else ""))
+        out.append(f"  {k:<28} {before.get(k, 0):>8}" + (f" {after.get(k, 0):>8}" if after is not None else ""))
     return out
 
 
 def diag_explained(after) -> bool:
-    """After a repair: nothing missing, duplicated, off-plan or off the first call; nothing left to repair."""
-    return all(after.get(k, 0) == 0 for k in ("no row", "duplicated", "differs from plan", "identity != first call",
-                                               R_OPEN, Y_OPEN))
+    """After a repair every check-in in scope has exactly one row and it is the fold."""
+    return all(after.get(k, 0) == 0 for k in ("no row", "duplicated", "differs from the fold", "reply != the fold's",
+                                               "Yes missing"))
+
+
+# ---------------------------------------------------------------------------------------------
+# proofs: calls, repaired, check
+# ---------------------------------------------------------------------------------------------
+
+def _short(v, n=40):
+    v = "NULL" if v is None else (v.isoformat(sep=" ") if isinstance(v, datetime) else str(v))
+    v = v.replace("\r", "\\r").replace("\n", "\\n")
+    return v if len(v) <= n else v[:n - 3] + "..."
+
+
+def _counts(calls) -> Counter:
+    return Counter((c["endpoint"], c["status"] + (" (body repaired)" if c["repaired"] else "")) for c in calls)
+
+
+def cmd_calls(client, out=None) -> bool:
+    """Is the call set complete? Every check-in in scope, logged calls vs loaded calls."""
+    svc = load_svc(client)
+    schema = list(client.get_table(TABLE).schema)
+    L = load(client, svc, schema, "window")
+    calls, sids = L["calls"], L["sids"]
+    keyless_seed = sum(1 for c in L["seed"] if c["keyless"])
+    tool = Counter()
+    for c in calls:
+        if c["sid"] and c["endpoint"] != "add-to-db before the switch (not the live writer: excluded)":
+            tool[c["sid"]] += 1
+    uuids = sorted({s[:36] for s in sids})
+    sql = sql_counts(client, uuids, L["floor"], L["cutoff"])
+    mismatch = []
+    for sid in sids:
+        old_n, new_n, _ = sql.get(sid, (0, 0, 0))
+        if old_n + new_n != tool[sid]:
+            mismatch.append((sid, old_n + new_n, tool[sid]))
+    in_scope = set(sids)
+    loaded_ids = {c["id"] for c in calls}
+    seed_missing = sorted({c["id"] for c in L["seed"] if c["sid"] and c["id"] not in loaded_ids})
+    undecoded = sum(a + b + c for s, (a, b, c) in sql.items() if s and "%" in s)
+    pre_switch = sum(v[2] for s, v in sql.items() if s in in_scope)
+    early = [s for s in sids if (sid_time(s) or WINDOW_START) < LOG_FLOOR]
+    hours = [WINDOW_START.replace(minute=0) + timedelta(hours=i)
+             for i in range(int((WINDOW_END - WINDOW_START.replace(minute=0)).total_seconds() // 3600) + 1)]
+    counts = [L["hours"].get(h, 0) for h in hours]
+    empty = [h.strftime("%m-%d %H:00Z") for h, n in zip(hours, counts) if n == 0]
+    p = lambda *a: print(*a, file=out)  # noqa: E731
+    p(f"log read up to {L['cutoff'].isoformat()} (the newest add-to-db call ingested); history from {L['floor'].isoformat()}")
+    p(f"calls that put a check-in in scope: {L['seed_rows']} requests; without a SessionID (sign-up events, left "
+      f"alone) {keyless_seed}")
+    p(f"check-ins in scope: {len(sids)} (contacts {len(uuids)})")
+    p(f"calls loaded for them: {sum(tool.values())}, by endpoint and answer:")
+    for (ep, st), n in sorted(_counts([c for c in calls if c['sid']]).items()):
+        p(f"  {ep:<62} {st:<22} {n:>7}")
+    p(f"calls the service's preparation rejects (the writer would not write them either): "
+      f"{sum(1 for c in calls if c['errors'])}")
+    p(f"payload keys the table lacks (dropped, reported): {dict(L['unknown']) or 'none'}")
+    p(f"independent count (session id read by pattern in SQL): {sum(a + b for s, (a, b, _) in sql.items() if s in in_scope)} "
+      f"calls for these check-ins, {sum(a + b for a, b, _ in sql.values())} "
+      f"for these contacts; add-to-db calls before the switch for these check-ins (excluded): {pre_switch}; "
+      f"session ids SQL could not decode: {undecoded}")
+    p(f"check-ins whose session began before the log's first body (history may be incomplete): {len(early)}")
+    p(f"old-writer calls per hour in the window: min {min(counts)}, max {max(counts)}; hours with none: "
+      f"{', '.join(empty) or 'none'}")
+    p(f"calls that put a check-in in scope but were not found again in its history: {len(seed_missing)}"
+      + (f" (first ids {seed_missing[:5]})" if seed_missing else ""))
+    p(f"check-ins whose count differs (log vs loaded): {len(mismatch)}")
+    for sid, a, b in mismatch[:10]:
+        p(f"  {sid[:8]}..{sid[36:]}  log {a}  loaded {b}")
+    ok = not mismatch and undecoded == 0 and not seed_missing
+    p(f"CALLS {'PASS' if ok else 'FAIL'}: counts equal for {len(sids) - len(mismatch)} of {len(sids)} check-ins")
+    return ok
+
+
+def cmd_repaired(client, out=None) -> bool:
+    """Do the rejected bodies repair to valid JSON with no other value changed?"""
+    svc = load_svc(client)
+    schema = list(client.get_table(TABLE).schema)
+    sql = (f"SELECT {COLS} FROM `{LOG}` WHERE fired_at > @sw AND request_path = @new AND request_host = @host "
+           f"AND STARTS_WITH(response_status_line, 'HTTP/2.0 400') ORDER BY fired_at, httplog_id")
+    rows = list(client.query(sql, job_config=_params(sw=SWITCH_AT, new=NEW_PATH, host=NEW_HOST)).result())
+    p = lambda *a: print(*a, file=out)  # noqa: E731
+    good = 0
+    for r in rows:
+        text = r["request_body"] or ""
+        try:
+            json.loads(text)
+            p(f"{r['httplog_id']} {r['fired_at'].isoformat()}  parses as sent (answered 400 for another reason)")
+            continue
+        except ValueError:
+            pass
+        rep = repair_body(text)
+        if rep is None:
+            p(f"{r['httplog_id']} {r['fired_at'].isoformat()}  NOT REPAIRED: still not JSON")
+            continue
+        proof = prove_repair(text, rep)
+        items, _, err = body_items(svc, text)
+        sids = [prepare(svc, schema, d)[0].get("SessionID") for d in items]
+        good += proof["ok"] and not err
+        p(f"{r['httplog_id']} {r['fired_at'].isoformat()}  parses: yes; session {', '.join(s[:8] + '..' + s[36:] for s in sids if s)}")
+        for k, raw in rep["escaped"]:
+            what = sorted({"quote" if ch == '"' else "backslash" if ch == "\\" else "line break" if ch in "\r\n"
+                           else "control" for ch in raw if ch in '"\\' or ord(ch) < 0x20})
+            p(f"    escaped {k} ({', '.join(what)}): {_short(raw, 160)}")
+        p(f"    string values identical to the raw text: {proof['identical']} of {proof['raw_strings']}; "
+          f"text outside the escaped values byte-identical: {'yes' if proof['outside_identical'] else 'NO'}")
+    ok = good == len(rows)
+    p(f"REPAIRED {'PASS' if ok else 'FAIL'}: {good} of {len(rows)} bodies repaired and proven")
+    return ok
+
+
+def cmd_check(client, table=TABLE, out=None) -> bool:
+    """Is this fold the writer's fold? Every check-in add-to-db wrote since the switch."""
+    svc = load_svc(client)
+    schema = list(client.get_table(table).schema)
+    L = load(client, svc, schema, "since switch")
+    plan = build_plan(client, table, loaded=L)
+    ctx = plan.pop("_ctx")
+    sessions = ctx["sessions"]
+    cols = [f.name for f in schema]
+    post_cols = {}
+    for sid, s in sessions.items():
+        post_cols[sid] = {k for c in s["calls"] if c["endpoint"] == "add-to-db" and c["status"].startswith("2")
+                          and not c["errors"] for k in c["row"]}
+    by_post, by_pre, rejected_diff = Counter(), Counter(), Counter()
+    examples = []
+    compared = [s for s in sessions.values() if s["stored"]]
+    for s in compared:
+        for c in s["changed"]:
+            if s["rejected"]:
+                rejected_diff[c] += 1
+            elif c in post_cols[s["sid"]]:
+                by_post[c] += 1
+                if len(examples) < 10:
+                    examples.append((s["sid"], c, s["stored"][0].get(c), s["row"].get(c)))
+            else:
+                by_pre[c] += 1
+    guarded = sum(1 for s in compared for c in s["calls"] if c.get("guarded"))
+    blank_ci = sum(1 for s in compared if any(c["row"] and "checkinDateTime" in c["row"] and c["row"]["checkinDateTime"]
+                                              is None for c in s["calls"]))
+    p = lambda *a: print(*a, file=out)  # noqa: E731
+    p(f"log read up to {L['cutoff'].isoformat()}; history from {L['floor'].isoformat()}")
+    p(f"check-ins add-to-db wrote since the switch: {len(L['sids'])}; with a call staged after the log cutoff "
+      f"(not compared) {len(ctx['moving'])}; compared {len(compared)}; with no stored row {sum(1 for s in sessions.values() if not s['stored'])}; "
+      f"with more than one stored row {sum(1 for s in compared if len(s['stored']) > 1)}")
+    p(f"calls folded: {sum(len(s['calls']) for s in sessions.values())} "
+      f"({', '.join(f'{ep} {st} {n}' for (ep, st), n in sorted(_counts([c for s in sessions.values() for c in s['calls']]).items()))})")
+    p(f"columns compared per row: {len(cols)}; rows where the check-in time was blank on some call (kept by the "
+      f"writer's rule): {blank_ci}; calls whose earlier reply the stale-reply guard cleared: {guarded}")
+    p("differing columns carried by a call add-to-db accepted (must be 0): "
+      + (", ".join(f"{c} {n}" for c, n in by_post.most_common()) or "none"))
+    p("differing columns carried only by the old writer's calls (what it lost; the repair writes them): "
+      + (", ".join(f"{c} {n}" for c, n in by_pre.most_common()) or "none"))
+    p("differing columns on check-ins with a rejected call (the calls add-to-db could not write): "
+      + (", ".join(f"{c} {n}" for c, n in rejected_diff.most_common()) or "none"))
+    for sid, c, a, b in examples:
+        p(f"  {sid[:8]}..{sid[36:]}  {c}: stored {_short(a)} -> fold {_short(b)}")
+    ok = not by_post
+    p(f"CHECK {'PASS' if ok else 'FAIL'}: {sum(by_post.values())} differing columns where the writer wrote the "
+      f"same calls, over {len(compared)} check-ins")
+    return ok
 
 
 # ---------------------------------------------------------------------------------------------
 # list
 # ---------------------------------------------------------------------------------------------
 
-def _short(v, n=40):
-    v = "NULL" if v is None else (v.isoformat(sep=" ") if isinstance(v, datetime) else str(v))
-    return v if len(v) <= n else v[:n - 3] + "..."
+def _pick(sids, n):
+    return sorted(sids, key=lambda s: hashlib.sha1(s.encode()).hexdigest())[:n]
 
 
-def call_kind(c) -> str:
-    resp = c["resp"]
-    rt = _aware(resp.get("checkinReplyDateTime"))
-    users = {k.lower(): v for k, v in (c["users"] or {}).items()}
-    unsub = any(str(users.get(k) or "").strip() for k in ("unsubscribetime",)) or \
-        str(users.get("subscribed") or "").strip().lower() == "no"
-    if c["closeout"]:
-        return "close-out (fired as the contact's next check-in started)"
-    if rt is not None and rt >= WINDOW_START:
-        return "reply received in the window" + ("; users half: unsubscribed" if unsub else "")
-    return "other (no reply in the window)" + ("; users half: unsubscribed" if unsub else "")
+def sample_of(sessions: dict, n=SAMPLE_N) -> list[str]:
+    """A fixed-seed sample across actions and groups: inserts, updates, collapses, earlier starts, rejected calls."""
+    pools = [
+        [s for s, x in sessions.items() if x["insert"]],
+        [s for s, x in sessions.items() if x["update"] and not x["collapse"] and x["group"] == "began in the window"],
+        [s for s, x in sessions.items() if x["collapse"]],
+        [s for s, x in sessions.items() if (x["update"] or x["insert"]) and x["group"] == "began before the window"],
+        [s for s, x in sessions.items() if x["rejected"]],
+        [s for s, x in sessions.items() if not (x["insert"] or x["update"] or x["collapse"])],
+    ]
+    quota = [5, 4, 3, 3, 3, 2]
+    out = []
+    for pool, q in zip(pools, quota):
+        out += [s for s in _pick(pool, q + len(out)) if s not in out][:q]
+    rest = [s for s in _pick(list(sessions), len(sessions)) if s not in out]
+    return (out + rest)[:n]
 
 
-def group_report(title, group: dict, lines: list, examples=5):
-    act = Counter()
-    colc = Counter()
-    kinds = Counter()
-    for s in group.values():
-        act["insert (no row)"] += s["insert"]
-        act["update (values differ)"] += s["update"]
-        act["collapse (duplicates)"] += s["collapse"]
-        act["extra rows deleted"] += (len(s["stored"]) - 1) if s["collapse"] else 0
-        act["no change"] += not (s["insert"] or s["update"] or s["collapse"])
-        if s["update"]:
-            colc.update(s["changed"])
-        kinds[call_kind(s["last"])] += 1
-    lines.append(f"{title}: {len(group)} check-ins")
-    lines.append("  (a) actions: " + ", ".join(f"{k} {v}" for k, v in act.items()))
-    lines.append("  (b) columns changed on existing rows: " +
-                 (", ".join(f"{c} {n}" for c, n in colc.most_common()) or "none"))
-    lines.append("  (c) what the last call was: " + "; ".join(f"{k}: {v}" for k, v in kinds.most_common()))
-    ex = [s for s in group.values() if s["update"]][:examples]
-    lines.append(f"  (d) {len(ex)} examples, stored -> planned (contact uuid first 8 + SessionID time; run verdict):")
-    for s in ex:
-        r = s["stored"][0]
-        diffs = "; ".join(f"{c}: {_short(r.get(c))} -> {_short(s['row'].get(c))}" for c in s["changed"])
-        lines.append(f"      {s['sid'][:8]}..{s['sid'][36:]}  [{s.get('verdict', 'close-out, not repaired')}]  {diffs}")
+def sample_lines(s: dict) -> list[str]:
+    cols = [c for c in s["write"] if c != "SessionID"]
+    varying = [c for c in cols if len({_short(x["row"].get(c), 200) for x in s["calls"] if x["row"]}) > 1]
+    shown = [c for c in cols if c in varying or c in s["changed"]] or cols[:6]
+    act = "+".join(a for a in ("insert", "update", "collapse") if s[a]) or "no change"
+    lines = [f"{s['sid']}  [{s['group']}] {act}; stored rows {len(s['stored'])}; calls {len(s['calls'])}"]
+    for x in s["calls"]:
+        vals = "; ".join(f"{c}={_short(x['row'].get(c), 30)}" for c in shown if x["row"] and c in x["row"])
+        flag = " SET ASIDE: " + "; ".join(x["errors"])[:120] if x["errors"] else ""
+        lines.append(f"    call {x['fired_at'].astimezone(UTC).strftime('%m-%d %H:%M:%S')}Z {x['endpoint']} {x['status']}"
+                     f"{' repaired' if x['repaired'] else ''}: {vals}{flag}")
+    r0 = s["stored"][0] if s["stored"] else {}
+    lines.append("    stored: " + ("; ".join(f"{c}={_short(r0.get(c), 30)}" for c in shown) if r0 else "no row"))
+    lines.append("    fold:   " + "; ".join(f"{c}={_short(s['row'].get(c), 30)}" for c in shown))
+    return lines
 
 
-def cmd_list(client, flows, table=TABLE, runs_file=None, token=None, out=None) -> tuple[str, dict]:
+def cmd_list(client, table=TABLE, out=None) -> tuple[str, dict]:
     run = stamp()
     list_path, plan_path = f"gap_repair_list_{run}.txt", f"gap_repair_plan_{run}.json"
-    if runs_file:
-        with open(runs_file, encoding="utf-8") as f:
-            runs = json.load(f)
-        runs_path = runs_file
-    else:
-        if not token:
-            raise SystemExit("TEXTIT_API_TOKEN is not set; the runs cross-check needs it (nothing was read or written)")
-        runs = fetch_runs(flows, WINDOW_START - timedelta(days=12), token)
-        runs_path = f"gap_repair_runs_{run}.json"
-        with open(runs_path, "w", encoding="utf-8") as f:
-            json.dump(runs, f)
-    print("dry run of every statement shape (made-up check-ins):", file=out)
+    csv_path, sample_path = f"gap_repair_planned_{run}.csv", f"gap_repair_sample_{run}.txt"
+    p = lambda *a: print(*a, file=out)  # noqa: E731
+    p("dry run of every statement shape (made-up check-ins):")
     preflight(client, statement_set(table, synthetic_plan(client.get_table(table).schema)))
-    plan = build_plan(client, table, runs, flows)
+    plan = build_plan(client, table)
     ctx = plan.pop("_ctx")
-    sessions, excluded = ctx["sessions"], ctx["excluded"]
-    verdicts = Counter(s["verdict"] for s in sessions.values())
-    gate = (f"reply changes: from the calls {ctx['call_changed']} check-ins, from the runs {ctx['run_changed']} "
-            f"(runs vs calls: " + ", ".join(f"{k} {v}" for k, v in verdicts.most_common()) + ")")
-    print(gate, file=out)
-    if ctx["run_changed"] > max(GATE_MIN, ctx["call_changed"]):
-        raise SystemExit(f"STOPPED: the runs would change more replies ({ctx['run_changed']}) than the calls do "
-                         f"({ctx['call_changed']}); the runs rule is suspect. Nothing was written; no plan file.")
+    sessions, L = ctx["sessions"], ctx["loaded"]
     before = diagnose(client, table, sessions)
+    cols = [f.name for f in ctx["schema"]]
 
-    lines = [f"table {table}; window {WINDOW_START.isoformat()} -> {WINDOW_END.isoformat()} (calls to {OLD_PATH})", ""]
+    lines = [f"table {table}; rule: {plan['rule']}; log read up to {plan['log_cutoff']}", ""]
     for s in sorted(sessions.values(), key=lambda s: s["sid"]):
-        if not (s["insert"] or s["update"] or s["collapse"] or s["verdict"].startswith("run:")):
+        if not (s["insert"] or s["update"] or s["collapse"]):
             continue
-        what = [a for a in ("insert", "update", "collapse") if s[a]]
-        lines.append(f"{s['sid']}  [{s['group']}] {'+'.join(what) or 'no change'}  stored rows {len(s['stored'])}  "
-                     f"run: {s['verdict']}" + (f" ({'; '.join(s['notes'])})" if s["notes"] else ""))
+        what = "+".join(a for a in ("insert", "update", "collapse") if s[a])
+        lines.append(f"{s['sid']}  [{s['group']}] {what}  stored rows {len(s['stored'])}  calls {len(s['calls'])}")
         r0 = s["stored"][0] if s["stored"] else {}
         for c in s["changed"]:
             lines.append(f"      {c}: {_short(r0.get(c), 60)} -> {_short(s['row'].get(c), 60)}")
 
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        planned_cols = [c for c in cols if any(c in s["row"] for s in sessions.values())]
+        w.writerow(["SessionID", "group", "action", "stored_rows", "calls", "changed_columns"] + planned_cols[1:])
+        for s in sorted(sessions.values(), key=lambda s: s["sid"]):
+            act = "+".join(a for a in ("insert", "update", "collapse") if s[a]) or "none"
+            w.writerow([s["sid"], s["group"], act, len(s["stored"]), len(s["calls"]), "|".join(s["changed"])]
+                       + [_enc(s["row"].get(c)) if s["row"].get(c) is not None else "" for c in planned_cols[1:]])
+
+    picked = sample_of(sessions)
+    sample = []
+    for sid in picked:
+        sample += sample_lines(sessions[sid]) + [""]
+    with open(sample_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(sample) + "\n")
+
     t = plan["totals"]
     by_group = Counter(s["group"] for s in sessions.values())
-    nulled = Counter(c for x in sessions.values() if x["update"] for c in x["changed"]
-                     if x["row"].get(c) is None and any(_reply(r.get(c)) is not None for r in x["stored"]))
-    m = ctx["mapping"]
+    colc = Counter(c for s in sessions.values() if s["update"] for c in s["changed"])
+    nulled = Counter(c for s in sessions.values() if s["update"] for c in s["changed"]
+                     if s["row"].get(c) is None and any(_reply(r.get(c)) is not None for r in s["stored"]))
+    act_by_group = defaultdict(Counter)
+    for s in sessions.values():
+        act_by_group[s["group"]].update({"insert": s["insert"], "update": s["update"], "collapse": s["collapse"]})
     summary = [
-        f"calls in the window {len(ctx['calls'])}; without a SessionID (sign-up events, not repaired) {len(ctx['keyless'])}",
-        f"check-ins {len(sessions) + len(excluded) + len(ctx['staged']) + len(ctx['bad'])}: in scope {len(sessions)} "
-        f"(in window {by_group['in window']}, checked in earlier with a late call {by_group['late call']}); "
-        f"skipped: add-to-db owns them {len(ctx['staged'])}, only close-out calls {len(excluded)}, "
-        f"preparation errors {len(ctx['bad'])}",
-        f"payload keys the table lacks (dropped, no column added): {dict(ctx['unknown']) or 'none'}",
+        f"log read up to {plan['log_cutoff']}; history from {L['floor'].isoformat()}",
+        f"check-ins in scope {len(L['sids'])}: planned {len(sessions)}; with a call staged after the log cutoff "
+        f"(left for a later list) {len(ctx['moving'])}; every call rejected by the service's preparation "
+        f"{len(ctx['no_row_planned'])}; with at least one call so rejected (the rest folded) {len(ctx['bad'])}",
+        "  by group: " + "; ".join(f"{g} {n} (insert {act_by_group[g]['insert']}, update {act_by_group[g]['update']}, "
+                                   f"collapse {act_by_group[g]['collapse']})" for g, n in by_group.most_common()),
+        f"calls folded {sum(len(s['calls']) for s in sessions.values())}: " + ", ".join(
+            f"{ep} {st} {n}" for (ep, st), n in sorted(_counts([c for s in sessions.values() for c in s['calls']]).items())),
+        f"payload keys the table lacks (dropped, no column added): {dict(L['unknown']) or 'none'}",
         "",
-        f"PLAN: insert {t['insert']}, update {t['update']}, collapse {t['collapse']} (extra rows deleted {t['extra_rows']}); "
-        f"check-ins changed {len(plan['sessions'])}",
-        "scope: narrow. Inserts take the check-in's first call (reply fields from the run-confirmed reply). Existing "
-        "rows get check-in time, contact type and wellness domain from the first call, and the six reply fields only "
-        "where the TextIt run confirms the reply; every other stored column is kept. Duplicates collapse to one row.",
-        f"inserts whose reply the run did not confirm (reply fields from the first call): "
-        f"{sum(1 for x in sessions.values() if x['insert'] and not x['confirmed'])}",
-        f"identity not written: {dict(ctx['blank_identity']) or 'none'}",
-        f"late-call check-ins whose first call predates the logged bodies: {ctx['first_missing']}",
-        "non-NULL -> NULL on existing rows, by column: " + (", ".join(f"{c} {n}" for c, n in nulled.most_common()) or "none")
-        + " (live add-to-db also writes a blank value as NULL; a blank check-in time keeps the stored one)",
+        f"PLAN: insert {t['insert']}, update {t['update']}, collapse {t['collapse']} (extra rows deleted "
+        f"{t['extra_rows']}); check-ins changed {len(plan['sessions'])}",
+        "columns changed on existing rows: " + (", ".join(f"{c} {n}" for c, n in colc.most_common()) or "none"),
+        "non-NULL -> NULL on existing rows: " + (", ".join(f"{c} {n}" for c, n in nulled.most_common()) or "none")
+        + " (the writer stores a blank as NULL; a blank check-in time keeps the stored one)",
         "",
-        f"runs read {len(ctx['runs'])}; flows with a check-in reply result: {sorted(ctx['usable_flows']) or 'none'} "
-        f"of {ctx['flows']}",
-        gate,
-        f"mapping learned from {m['agreeing']} agreeing check-ins: reply value {m['reply_value']!r}, "
-        f"text {'yes' if m['text'] else 'NO'}, numerical {'yes' if m['numerical'] else 'NO'}, "
-        f"distressed by category {m['distressed'] or 'none'}",
+        "diagnosis (check-ins planned):",
+    ] + diag_lines(before) + [
         "",
+        f"full list:        {list_path}", f"plan:             {plan_path}", f"planned rows:     {csv_path}",
+        f"sample ({len(picked)}):      {sample_path}",
+        "Nothing was written to BigQuery.",
     ]
-    grp = []
-    group_report("IN WINDOW", {k: v for k, v in sessions.items() if v["group"] == "in window"}, grp)
-    group_report("CHECKED IN BEFORE THE WINDOW, LATE CALL IN IT (repaired)",
-                 {k: v for k, v in sessions.items() if v["group"] == "late call"}, grp)
-    group_report("ONLY CLOSE-OUT CALLS IN THE WINDOW (not repaired: what the close-out would have changed)",
-                 excluded, grp)
-    summary += grp + ["", "diagnosis (check-ins in scope):"] + diag_lines(before)
-    summary += ["", f"full list: {list_path}", f"plan:      {plan_path}", f"runs:      {runs_path}",
-                "Nothing was written to BigQuery."]
     with open(list_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines + [""] + summary) + "\n")
     if plan["sessions"]:
-        print("dry run of this plan's statements:", file=out)
+        p("dry run of this plan's statements:")
         preflight(client, statement_set(table, plan))
-    plan["flows"], plan["runs_file"] = flows, runs_path
     plan["diagnosis_before"] = dict(before)
     with open(plan_path, "w", encoding="utf-8") as f:
         json.dump(plan, f, indent=1, default=str)
-    print("\n".join(summary), file=out)
+    p("\n".join(summary))
+    p("")
+    p(f"SAMPLE -- {len(picked)} check-ins, every call (columns that vary across the calls or change on the row):")
+    p("\n".join(sample))
     plan["_ctx"] = ctx
     return plan_path, plan
 
@@ -941,7 +1012,7 @@ def synthetic_plan(schema) -> dict:
     """Three made-up check-ins covering every statement shape: ranged insert, update + collapse, key-only insert."""
     cols = {f.name: f.field_type.upper() for f in schema if f.field_type.upper() not in ("JSON", "RECORD", "STRUCT")}
     names = {c.lower(): c for c in cols}
-    write = ["SessionID"] + [names[c.lower()] for c in IDENTITY + REPLY6 if c.lower() in names]
+    write = ["SessionID"] + [names[c.lower()] for c in ("checkinDateTime", "wellnessDomain", "checkinReply") if c.lower() in names]
     pcol = config.PARTITION_COLUMNS["responses"]
     t = "2026-09-27 17:00:00"
     return {"columns": cols, "totals": {"insert": 2, "update": 1, "collapse": 1, "extra_rows": 1}, "sessions": [
@@ -1006,7 +1077,7 @@ def cmd_apply(client, plan: dict, production: bool, pause: bool | None = None, c
     rows_table = f"{DEV_PREFIX}adb_gap_repair_rows_{run}"
     path = f"gap_repair_applied_{run}.json"
     with Pause(client, production if pause is None else pause):
-        staged = staged_sessions(client)
+        staged = staged_since(client, datetime.fromisoformat(plan["log_cutoff"]))
         dropped = [s["sid"] for s in plan["sessions"] if s["sid"] in staged]
         if dropped:
             plan = dict(plan, sessions=[s for s in plan["sessions"] if s["sid"] not in staged])
@@ -1014,7 +1085,8 @@ def cmd_apply(client, plan: dict, production: bool, pause: bool | None = None, c
             plan["totals"] = {"insert": sum(s["insert"] for s in t), "update": sum(s["update"] for s in t),
                               "collapse": sum(s["collapse"] for s in t),
                               "extra_rows": sum(s["n"] - 1 for s in t if s["collapse"])}
-        print(f"check-ins dropped from the plan because add-to-db has staged a call for them since the list: {len(dropped)}")
+        print(f"check-ins dropped from the plan because add-to-db has staged a call for them after the log the list "
+              f"read: {len(dropped)}")
         sids = [s["sid"] for s in plan["sessions"]]
         sid_param = [bigquery.ArrayQueryParameter("s", "STRING", sids)]
         backup_sql = f"CREATE TABLE `{backup}` AS SELECT * FROM `{table}` WHERE SessionID IN UNNEST(@s)"
@@ -1067,25 +1139,25 @@ def cmd_rollback(client, applied: dict, production: bool, pause: bool | None = N
 # rehearse
 # ---------------------------------------------------------------------------------------------
 
-def cmd_rehearse(client, flows, runs_file, keep=False) -> bool:
+def cmd_rehearse(client, keep=False) -> bool:
     run = stamp()
     clone = f"{DEV_PREFIX}adb_gap_rehearsal_{run}"
     client.query(f"CREATE TABLE `{clone}` CLONE `{TABLE}`").result()
     print(f"clone: {clone} (of {TABLE} as of now)")
     made = [clone]
     try:
-        plan_path, plan = cmd_list(client, flows, table=clone, runs_file=runs_file)
+        plan_path, plan = cmd_list(client, table=clone)
         plan.pop("_ctx")
         before_fp = {s["sid"]: [s["n"], s["fps"]] for s in plan["sessions"]}
         applied = cmd_apply(client, plan, production=False, pause=False, created=made)
         for sid in applied["dropped"]:
             before_fp.pop(sid, None)
         print("\nrehearsal: list again on the repaired clone (the repair must leave nothing to do):")
-        _, again = cmd_list(client, flows, table=clone, runs_file=runs_file)
+        _, again = cmd_list(client, table=clone)
         again.pop("_ctx")
         t2 = again["totals"]
         diag_before, diag_after = Counter(plan["diagnosis_before"]), Counter(again["diagnosis_before"])
-        print("\nrehearsal diagnosis on the clone (check-ins in scope; add-to-db-owned check-ins excluded each time):")
+        print("\nrehearsal diagnosis on the clone:")
         print("\n".join(diag_lines(diag_before, diag_after)))
         cmd_rollback(client, applied, production=False, pause=False)
         back = fp_state(client, clone, list(before_fp))
@@ -1093,9 +1165,7 @@ def cmd_rehearse(client, flows, runs_file, keep=False) -> bool:
         idem = t2["insert"] == t2["update"] == t2["collapse"] == 0
         ok = diag_explained(diag_after) and idem and restored == len(before_fp)
         print(f"\nREHEARSAL {'PASS' if ok else 'FAIL'}: after apply no row {diag_after['no row']}, duplicated "
-              f"{diag_after['duplicated']}, differs from plan {diag_after['differs from plan']} (want 0 each); "
-              f"reply != last call {diag_after['reply != last call']} (run-changed {diag_after[RUN_REPLY]}), "
-              f"Yes missing {diag_after['Yes missing']} (run says no reply {diag_after[RUN_YES]}); "
+              f"{diag_after['duplicated']}, differs from the fold {diag_after['differs from the fold']} (want 0 each); "
               f"second list: insert {t2['insert']}, update {t2['update']}, collapse {t2['collapse']} (want 0); "
               f"rollback restored {restored} of {len(before_fp)} check-ins exactly")
         return ok
@@ -1115,47 +1185,47 @@ def main_(argv=None):
         except (AttributeError, ValueError):
             pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("action", choices=("list", "rehearse", "apply", "rollback"))
+    ap.add_argument("action", choices=("calls", "repaired", "check", "list", "rehearse", "apply", "rollback"))
     ap.add_argument("file", nargs="?", help="apply: the plan; rollback: the applied record")
-    ap.add_argument("--flows", default="", help="check-in flow UUIDs, comma-separated (list, rehearse)")
-    ap.add_argument("--runs", help="runs file written by an earlier list (skips the TextIt read)")
-    ap.add_argument("--table", default=TABLE, help="list only: the table to read")
+    ap.add_argument("--table", default=TABLE, help="list and check: the table to read")
     ap.add_argument("--production", action="store_true")
     ap.add_argument("--keep", action="store_true", help="rehearse: keep the clone, backup and loaded rows")
     args = ap.parse_args(argv)
-    flows = [f.strip() for f in args.flows.split(",") if f.strip()]
     if args.action in ("apply", "rollback"):
         if not args.file:
             raise SystemExit(f"{args.action} needs its file")
         with open(args.file, encoding="utf-8") as f:
             doc = json.load(f)
         refuse_unless_allowed(doc["table"], args.production)            # before any sign-in or query
-    elif not flows:
-        raise SystemExit("--flows is required (the check-in flow UUIDs whose runs carry the replies)")
-    if args.action == "rehearse" and not args.runs:
-        raise SystemExit("rehearse needs --runs (the file list wrote), so TextIt is read once")
     client = make_client()
-    if args.action == "list":
-        cmd_list(client, flows, table=args.table, runs_file=args.runs, token=os.environ.get("TEXTIT_API_TOKEN"))
+    if args.action == "calls":
+        ok = cmd_calls(client)
+    elif args.action == "repaired":
+        ok = cmd_repaired(client)
+    elif args.action == "check":
+        ok = cmd_check(client, table=args.table)
+    elif args.action == "list":
+        cmd_list(client, table=args.table)
+        ok = True
     elif args.action == "rehearse":
-        if not cmd_rehearse(client, flows, args.runs, keep=args.keep):
-            raise SystemExit(1)
+        ok = cmd_rehearse(client, keep=args.keep)
     elif args.action == "apply":
         applied = cmd_apply(client, doc, production=args.production)
-        print("\nafter the apply: list again (read-only) with the same runs file")
-        _, again = cmd_list(client, doc["flows"], table=doc["table"], runs_file=doc["runs_file"])
+        print("\nafter the apply: list again (read-only)")
+        _, again = cmd_list(client, table=doc["table"])
         again.pop("_ctx")
         before, after = Counter(doc["diagnosis_before"]), Counter(again["diagnosis_before"])
-        print("\ndiagnosis, the list read before the apply vs now (add-to-db-owned check-ins excluded each time):")
+        print("\ndiagnosis, the list read before the apply vs now:")
         print("\n".join(diag_lines(before, after)))
         t2 = again["totals"]
         ok = diag_explained(after) and t2["insert"] == t2["update"] == t2["collapse"] == 0
         print(f"\nAPPLY {'VERIFIED' if ok else 'NOT VERIFIED'}: second list insert {t2['insert']}, update {t2['update']}, "
               f"collapse {t2['collapse']} (want 0); applied record {applied['_path']}")
-        if not ok:
-            raise SystemExit(1)
     else:
         cmd_rollback(client, doc, production=args.production)
+        ok = True
+    if not ok:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
