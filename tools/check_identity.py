@@ -3,7 +3,7 @@ Identity gate for the triage-queue change: proves the check-in path (response_da
 staged single writer) is unchanged from the cutover revision, in two parts.
 
 1. SOURCE. Every top-level statement of src/*.py is compared, as a parsed syntax tree, between --base (the
-   cutover revision, default 6660347) and this checkout. Only the triage-queue additions may differ:
+   cutover revision, default 2925726) and this checkout. Only the triage-queue additions may differ:
    config's TRIAGE_* settings, tasks.queue_for and tasks.enqueue_write, and in main the /tasks/upsert
    endpoint plus the four triage-alert helpers. Anything else that differs -- the staging append, the
    flush, the sweep, perform_upsert, the MERGE builder -- fails the gate.
@@ -41,7 +41,7 @@ from google.cloud import bigquery
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 LOG = f"{PROJECT}.OPS.webhook_log_detail"
-BASE = "6660347d25a1cb882bdead41c8b3d54947b4d425"   # cutover-prereqs head, the revision runbook B deploys
+BASE = "29257265d004196f1003b6ad79218d554c1cab1b"   # cutover-prereqs head, the revision runbook B deploys
 ALLOWED_CHANGES = {
     "config.py": {"SERIALIZED_TARGETS", "TRIAGE_QUEUE", "TRIAGE_MAX_ATTEMPTS", "TRIAGE_WAIT_ALERT_S",
                   "if TRIAGE_QUEUE"},
