@@ -60,7 +60,7 @@ from google.cloud import bigquery
 
 import config  # noqa: E402  (src/ is on sys.path via _harness)
 from bq_writer import (  # noqa: E402
-    PRESENT_FIELD, apply_stale_reply_guard, build_batch_merge_query, coerce_payload_to_schema,
+    BQ_TYPE_MAP, PRESENT_FIELD, apply_stale_reply_guard, build_batch_merge_query, coerce_payload_to_schema,
     normalize_payload_to_schema, parse_datetime_like, quote_identifier)
 
 UTC = timezone.utc
@@ -371,10 +371,48 @@ def _enc(v):
     return v
 
 
+IDENTITY = ["checkinDateTime", "contactType", "wellnessDomain"]
+REPLY6 = ["checkinReply", "checkinReplyText", "checkinReplyNumerical", "checkinReplyDateTime",
+          "checkinReplyNudges", "checkinReplyDistressed"]
+
+
+def fetch_first_calls(client, sids: list[str], since: datetime) -> dict:
+    """The earliest logged call before the window for each of these check-ins (bodies are kept from 2026-08-25)."""
+    if not sids:
+        return {}
+    sql = (f"SELECT httplog_id, fired_at, request_body FROM `{LOG}` WHERE request_path = @p "
+           f"AND fired_at >= @s AND fired_at < @e AND REPLACE(REPLACE(REPLACE(JSON_VALUE(request_body, "
+           f"'$.Responses.sessionID'), '%3A', ':'), '%2B', '+'), '%2b', '+') IN UNNEST(@sids)")
+    cfg = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("p", "STRING", OLD_PATH),
+        bigquery.ScalarQueryParameter("s", "TIMESTAMP", since),
+        bigquery.ScalarQueryParameter("e", "TIMESTAMP", WINDOW_START),
+        bigquery.ArrayQueryParameter("sids", "STRING", sorted(sids))])
+    wanted, first = set(sids), {}
+    for r in client.query(sql, job_config=cfg).result():
+        c = parse_call(r["httplog_id"], r["fired_at"], r["request_body"])
+        if c is None or c["sid"] not in wanted or c["fired_at"] >= WINDOW_START:
+            continue
+        if c["sid"] not in first or (c["fired_at"], c["id"]) < (first[c["sid"]]["fired_at"], first[c["sid"]]["id"]):
+            first[c["sid"]] = c
+    return first
+
+
 def build_plan(client, table: str, runs: list[dict], flows: list[str], out=None) -> dict:
-    """Read-only. Returns the plan dict (also the list lines and summary under private keys)."""
+    """
+    Read-only. Narrow repair (Logan, 2026-09-29): per check-in
+      * no stored row -> insert the FIRST call's row, with the reply fields replaced by the run-confirmed
+        ones when the TextIt run confirms the reply;
+      * existing rows -> only the identity fields (from the FIRST call; a blank there is not written) and,
+        when the run confirms the reply, the six reply fields (the last call's, or the run's where it
+        decides); every other stored column is kept;
+      * more than one row -> collapse to one.
+    """
     svc = load_svc(client)
     schema = list(client.get_table(table).schema)
+    names = {f.name.lower(): f.name for f in schema}
+    identity = [names[c.lower()] for c in IDENTITY if c.lower() in names]
+    reply6 = [names[c.lower()] for c in REPLY6 if c.lower() in names]
     calls = fetch_calls(client)
     mark_closeouts(calls)
     staged = staged_sessions(client)
@@ -387,31 +425,43 @@ def build_plan(client, table: str, runs: list[dict], flows: list[str], out=None)
     usable_flows = {f for f in flows if any(r["flow"] == f and "checkinresponse" in (r["values"] or {}) for r in runs)}
     by_contact = index_runs(runs)
 
+    early = [sid for sid, cs in by_sid.items() if sid not in staged and any(not c["closeout"] for c in cs)
+             and min((c["checkin"] for c in cs if c["checkin"]), default=WINDOW_START) < WINDOW_START]
+    since = min((c["checkin"] for sid in early for c in by_sid[sid] if c["checkin"]), default=WINDOW_START)
+    pre_first = fetch_first_calls(client, early, since - timedelta(minutes=10))
+
     sessions, excluded, skipped_staged, bad = {}, {}, [], []
     unknown_keys = Counter()
+    first_missing = 0
     for sid, cs in by_sid.items():
         if sid in staged:
             skipped_staged.append(sid)
             continue
         kept = [c for c in cs if not c["closeout"]]
         last = (kept or cs)[-1]
+        first = pre_first.get(sid) or (kept or cs)[0]
         row, errors, unknown, guarded = prepare_row(svc, schema, last["resp"])
-        unknown_keys.update(unknown)
-        group = "late call" if last["checkin"] is not None and last["checkin"] < WINDOW_START else "in window"
-        info = {"sid": sid, "group": group, "last": last, "row": row, "guarded": guarded, "calls": len(cs),
-                "closeouts": sum(c["closeout"] for c in cs)}
-        if errors:
-            bad.append((sid, errors))
+        first_row, f_errors, f_unknown, _ = prepare_row(svc, schema, first["resp"])
+        unknown_keys.update(set(unknown) | set(f_unknown))
+        group = ("late call" if first_row.get(identity[0]) is not None
+                 and first_row[identity[0]] < WINDOW_START.replace(tzinfo=None) else "in window")
+        info = {"sid": sid, "group": group, "last": last, "first": first, "row": row, "first_row": first_row,
+                "first_known": group == "in window" or sid in pre_first,
+                "guarded": guarded, "calls": len(cs), "closeouts": sum(c["closeout"] for c in cs)}
+        if errors or f_errors:
+            bad.append((sid, errors + f_errors))
             continue
         if not kept:
             excluded[sid] = info
             continue
+        if group == "late call" and sid not in pre_first:
+            first_missing += 1
         sessions[sid] = info
 
-    # runs: learn the mapping on agreeing check-ins, then let runs win where they disagree
+    # runs: learn the mapping on agreeing check-ins, then let runs decide where they disagree
     pairs = []
     for s in sessions.values():
-        s["run"] = match_run(by_contact, s["last"]["uuid"], s["last"]["checkin"])
+        s["run"] = match_run(by_contact, s["last"]["uuid"], s["first"]["checkin"] or s["last"]["checkin"])
         if s["run"] and s["run"]["flow"] in usable_flows:
             replied, _, _, t = run_reply(s["run"])
             rt = s["row"].get("checkinReplyDateTime")
@@ -420,31 +470,57 @@ def build_plan(client, table: str, runs: list[dict], flows: list[str], out=None)
     mapping = learn_mapping(pairs)
     for s in sessions.values():
         s["call_row"] = s["row"]
-        s["row"], s["verdict"], s["notes"] = apply_run(s["row"], s["run"], mapping, usable_flows)
+        s["reply_row"], s["verdict"], s["notes"] = apply_run(s["row"], s["run"], mapping, usable_flows)
+        s["confirmed"] = s["verdict"] == "agree" or s["verdict"].startswith("run:")
 
     cols = [f.name for f in schema]
     stored = read_stored(client, table, list(sessions) + list(excluded), cols)
-    for group in (sessions, excluded):
-        for sid, s in group.items():
-            rows = stored.get(sid, [])
-            s["stored"] = rows
-            s["changed"] = sorted({c for c, v in s["row"].items() for r in rows if not same(r.get(c), v)},
-                                  key=cols.index)
-            s["insert"] = not rows
-            s["collapse"] = len(rows) > 1
-            s["update"] = bool(rows) and bool(s["changed"])
+    blank_identity = Counter()
+    for sid, s in sessions.items():
+        rows = stored.get(sid, [])
+        s["stored"] = rows
+        if not rows:
+            planned = dict(s["first_row"])
+            if s["confirmed"]:
+                planned.update({c: s["reply_row"].get(c) for c in reply6})
+            write = [c for c in cols if c in planned]
+        else:
+            write = ["SessionID"]
+            for c in identity:
+                if not s["first_known"]:
+                    blank_identity["first call not in the log (identity kept as stored)"] += 1
+                elif s["first_row"].get(c) is None:
+                    blank_identity[c] += 1
+                else:
+                    write.append(c)
+            if s["confirmed"]:
+                write += reply6
+            src = {**{c: s["first_row"].get(c) for c in identity}, **{c: s["reply_row"].get(c) for c in reply6}}
+            planned = {"SessionID": sid, **{c: src[c] for c in write if c != "SessionID"}}
+        s["row"], s["write"] = planned, write
+        s["changed"] = sorted({c for c in write if c != "SessionID" for r in rows if not same(r.get(c), planned.get(c))},
+                              key=cols.index)
+        s["insert"] = not rows
+        s["collapse"] = len(rows) > 1
+        s["update"] = bool(rows) and bool(s["changed"])
+    for sid, s in excluded.items():                      # reported only: what the close-out would have changed
+        rows = stored.get(sid, [])
+        s["stored"], s["verdict"] = rows, "close-out, not repaired"
+        s["changed"] = sorted({c for c, v in s["row"].items() for r in rows if not same(r.get(c), v)}, key=cols.index)
+        s["insert"], s["collapse"] = not rows, len(rows) > 1
+        s["update"] = bool(rows) and bool(s["changed"])
 
     call_changed = run_changed = 0
     for s in sessions.values():
         call = _reply(s["call_row"].get("checkinReply"))
         stored_replies = [_reply(r.get("checkinReply")) for r in s["stored"]]
         call_changed += (call == "Yes" and not stored_replies) or any(v != call for v in stored_replies)
-        run_changed += _reply(s["row"].get("checkinReply")) != call
+        run_changed += s["confirmed"] and _reply(s["reply_row"].get("checkinReply")) != call
 
     types = {f.name: f.field_type.upper() for f in schema}
     actions = [s for s in sessions.values() if s["insert"] or s["update"] or s["collapse"]]
     plan = {
-        "table": table, "listed_at": datetime.now(UTC).isoformat(),
+        "table": table, "listed_at": datetime.now(UTC).isoformat(), "scope": "narrow (Logan, 2026-09-29)",
         "window": [WINDOW_START.isoformat(), WINDOW_END.isoformat()],
         "columns": {c: types[c] for c in cols if any(c in s["row"] for s in actions)},
         "totals": {"insert": sum(s["insert"] for s in actions), "update": sum(s["update"] for s in actions),
@@ -452,12 +528,13 @@ def build_plan(client, table: str, runs: list[dict], flows: list[str], out=None)
                    "extra_rows": sum(len(s["stored"]) - 1 for s in actions if s["collapse"])},
         "sessions": [{"sid": s["sid"], "group": s["group"], "insert": s["insert"], "update": s["update"],
                       "collapse": s["collapse"], "n": len(s["stored"]), "fps": fps_of(s["stored"]),
-                      "changed": s["changed"], "verdict": s["verdict"],
+                      "changed": s["changed"], "verdict": s["verdict"], "write": s["write"],
                       "row": {c: _enc(v) for c, v in s["row"].items()}} for s in actions],
     }
     plan["_ctx"] = {"calls": calls, "keyless": keyless, "sessions": sessions, "excluded": excluded,
                     "staged": skipped_staged, "bad": bad, "unknown": unknown_keys, "mapping": mapping,
-                    "usable_flows": usable_flows, "runs": runs, "flows": flows,
+                    "usable_flows": usable_flows, "runs": runs, "flows": flows, "identity": identity,
+                    "reply6": reply6, "blank_identity": blank_identity, "first_missing": first_missing,
                     "call_changed": call_changed, "run_changed": run_changed}
     return plan
 
@@ -472,44 +549,62 @@ def _reply(v):
 
 def diagnose(client, table: str, sessions: dict) -> dict:
     """
-    For the check-ins in scope: no row; more than one row; stored reply != the last call's (after the
-    stale-reply guard; blank = NULL); last call says Yes and no stored row does; any stored row differs
-    from the planned row (calls + runs) in a column the plan carries.
+    For the check-ins in scope: no row; more than one row; a stored row differs from the plan in a column the
+    plan writes; identity (check-in time, contact type, wellness domain) differs from the first call; stored
+    reply != the last call's (after the stale-reply guard; blank = NULL) and last call says Yes but no stored
+    row does -- each split into what the repair leaves by rule (the run decided the reply; the run did not
+    confirm it, so the stored reply is kept) and what is unexplained.
     """
-    cols = sorted({c for s in sessions.values() for c in s["row"]})
-    stored = read_stored(client, table, list(sessions), cols or ["SessionID"])
+    cols = sorted({c for s in sessions.values() for c in list(s["row"]) + IDENTITY + ["checkinReply"]})
+    stored = read_stored(client, table, list(sessions), cols)
     d = Counter(sessions=len(sessions))
     for sid, s in sessions.items():
         rows = stored.get(sid, [])
         last = _reply(s["call_row"].get("checkinReply"))
+        planned = _reply(s["reply_row"].get("checkinReply")) if s["confirmed"] else None
         d["no row"] += not rows
         d["duplicated"] += len(rows) > 1
-        d["reply != last call"] += bool(rows) and any(_reply(r.get("checkinReply")) != last for r in rows)
-        d["Yes missing"] += last == "Yes" and not any(r.get("checkinReply") == "Yes" for r in rows)
-        d["differs from plan"] += (not rows) or any(not same(r.get(c), v) for r in rows for c, v in s["row"].items())
-        planned = _reply(s["row"].get("checkinReply"))
-        d[RUN_REPLY] += planned != last
-        d[RUN_YES] += last == "Yes" and planned != "Yes"
+        d["differs from plan"] += (not rows) or any(not same(r.get(c), s["row"].get(c))
+                                                    for r in rows for c in s["write"])
+        d["identity != first call"] += s["first_known"] and any(
+            s["first_row"].get(c) is not None and not same(r.get(c), s["first_row"][c]) for r in rows for c in IDENTITY)
+        if rows and any(_reply(r.get("checkinReply")) != last for r in rows):
+            d["reply != last call"] += 1
+            if not s["confirmed"]:
+                d[R_UNCONF] += 1
+            elif planned != last:
+                d[R_RUN] += 1
+            else:
+                d[R_OPEN] += 1
+        if last == "Yes" and not any(r.get("checkinReply") == "Yes" for r in rows):
+            d["Yes missing"] += 1
+            if not s["confirmed"]:
+                d[Y_UNCONF] += 1
+            elif planned != "Yes":
+                d[Y_RUN] += 1
+            else:
+                d[Y_OPEN] += 1
     return d
 
 
-RUN_REPLY = "  of which the run changed the reply"
-RUN_YES = "  of which the run says no reply"
-DIAG_KEYS = ["sessions", "no row", "duplicated", "differs from plan", "reply != last call", RUN_REPLY,
-             "Yes missing", RUN_YES]
+R_RUN, R_UNCONF, R_OPEN = ("  the run decided another reply", "  run did not confirm: stored kept",
+                           "  to repair")
+Y_RUN, Y_UNCONF, Y_OPEN = ("  the run says no reply", "  run did not confirm: stored kept ", "  to repair ")
+DIAG_KEYS = ["sessions", "no row", "duplicated", "differs from plan", "identity != first call",
+             "reply != last call", R_RUN, R_UNCONF, R_OPEN, "Yes missing", Y_RUN, Y_UNCONF, Y_OPEN]
 
 
 def diag_lines(before, after=None) -> list[str]:
     out = [f"  {'':<40} {'before':>8}" + (f" {'after':>8}" if after is not None else "")]
     for k in DIAG_KEYS:
-        out.append(f"  {k:<40} {before[k]:>8}" + (f" {after[k]:>8}" if after is not None else ""))
+        out.append(f"  {k:<40} {before.get(k, 0):>8}" + (f" {after.get(k, 0):>8}" if after is not None else ""))
     return out
 
 
 def diag_explained(after) -> bool:
-    """After a repair: nothing missing, duplicated or off-plan; every reply difference is the run's."""
-    return (after["no row"] == 0 and after["duplicated"] == 0 and after["differs from plan"] == 0
-            and after["reply != last call"] == after[RUN_REPLY] and after["Yes missing"] == after[RUN_YES])
+    """After a repair: nothing missing, duplicated, off-plan or off the first call; nothing left to repair."""
+    return all(after.get(k, 0) == 0 for k in ("no row", "duplicated", "differs from plan", "identity != first call",
+                                               R_OPEN, Y_OPEN))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -574,6 +669,8 @@ def cmd_list(client, flows, table=TABLE, runs_file=None, token=None, out=None) -
         runs_path = f"gap_repair_runs_{run}.json"
         with open(runs_path, "w", encoding="utf-8") as f:
             json.dump(runs, f)
+    print("dry run of every statement shape (made-up check-ins):", file=out)
+    preflight(client, statement_set(table, synthetic_plan(client.get_table(table).schema)))
     plan = build_plan(client, table, runs, flows)
     ctx = plan.pop("_ctx")
     sessions, excluded = ctx["sessions"], ctx["excluded"]
@@ -599,6 +696,8 @@ def cmd_list(client, flows, table=TABLE, runs_file=None, token=None, out=None) -
 
     t = plan["totals"]
     by_group = Counter(s["group"] for s in sessions.values())
+    nulled = Counter(c for x in sessions.values() if x["update"] for c in x["changed"]
+                     if x["row"].get(c) is None and any(_reply(r.get(c)) is not None for r in x["stored"]))
     m = ctx["mapping"]
     summary = [
         f"calls in the window {len(ctx['calls'])}; without a SessionID (sign-up events, not repaired) {len(ctx['keyless'])}",
@@ -610,6 +709,15 @@ def cmd_list(client, flows, table=TABLE, runs_file=None, token=None, out=None) -
         "",
         f"PLAN: insert {t['insert']}, update {t['update']}, collapse {t['collapse']} (extra rows deleted {t['extra_rows']}); "
         f"check-ins changed {len(plan['sessions'])}",
+        "scope: narrow. Inserts take the check-in's first call (reply fields from the run-confirmed reply). Existing "
+        "rows get check-in time, contact type and wellness domain from the first call, and the six reply fields only "
+        "where the TextIt run confirms the reply; every other stored column is kept. Duplicates collapse to one row.",
+        f"inserts whose reply the run did not confirm (reply fields from the first call): "
+        f"{sum(1 for x in sessions.values() if x['insert'] and not x['confirmed'])}",
+        f"identity not written: {dict(ctx['blank_identity']) or 'none'}",
+        f"late-call check-ins whose first call predates the logged bodies: {ctx['first_missing']}",
+        "non-NULL -> NULL on existing rows, by column: " + (", ".join(f"{c} {n}" for c, n in nulled.most_common()) or "none")
+        + " (live add-to-db also writes a blank value as NULL; a blank check-in time keeps the stored one)",
         "",
         f"runs read {len(ctx['runs'])}; flows with a check-in reply result: {sorted(ctx['usable_flows']) or 'none'} "
         f"of {ctx['flows']}",
@@ -630,6 +738,9 @@ def cmd_list(client, flows, table=TABLE, runs_file=None, token=None, out=None) -
                 "Nothing was written to BigQuery."]
     with open(list_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines + [""] + summary) + "\n")
+    if plan["sessions"]:
+        print("dry run of this plan's statements:", file=out)
+        preflight(client, statement_set(table, plan))
     plan["flows"], plan["runs_file"] = flows, runs_path
     plan["diagnosis_before"] = dict(before)
     with open(plan_path, "w", encoding="utf-8") as f:
@@ -659,7 +770,6 @@ def load_rows(client, plan: dict, rows_table: str) -> int:
     """Planned rows for insert/update into a DEV table: every planned column plus add-to-db's presence marker."""
     cols = plan["columns"]
     schema = [bigquery.SchemaField(c, t) for c, t in cols.items()] + [bigquery.SchemaField(PRESENT_FIELD, "STRING")]
-    present = "|" + "|".join(cols) + "|"
     data = []
     for s in plan["sessions"]:
         if not (s["insert"] or s["update"]):
@@ -668,7 +778,7 @@ def load_rows(client, plan: dict, rows_table: str) -> int:
         for c, t in cols.items():
             if t == "DATETIME" and rec[c] is not None:
                 rec[c] = str(rec[c]).replace("T", " ")
-        rec[PRESENT_FIELD] = present
+        rec[PRESENT_FIELD] = "|" + "|".join(s.get("write") or list(cols)) + "|"
         data.append(rec)
     job = client.load_table_from_json(data, rows_table, job_config=bigquery.LoadJobConfig(
         schema=schema, write_disposition="WRITE_EMPTY", create_disposition="CREATE_IF_NEEDED"))
@@ -707,7 +817,8 @@ def build_apply_script(table: str, plan: dict, rows_table: str) -> tuple[str, li
             continue
         sql = build_batch_merge_query(table, cols, ["SessionID"], pcol if use_range else None, preserve,
                                       rows_param="gap_rows", min_param=f"gap_min_{label}", max_param=f"gap_max_{label}")
-        src = (f"(SELECT * FROM `{rows_table}` WHERE `{pcol}` IS "
+        rows_from = rows_table if rows_table.startswith("(") else f"`{rows_table}`"
+        src = (f"(SELECT * FROM {rows_from} WHERE `{pcol}` IS "
                + ("NOT NULL" if use_range else "NULL") + ")")
         if sql.count("UNNEST(@gap_rows)") != 1:
             raise SystemExit("add-to-db's MERGE text changed shape; refusing to adapt it blindly")
@@ -751,18 +862,19 @@ def build_rollback_script(table: str, applied: dict) -> tuple[str, list]:
                             f"WHERE IFNULL(c.n, 0) != p.n OR (p.fps IS NOT NULL AND IFNULL(c.fps, '') != p.fps)) = 0 AS '{msg}'")
     if any(x["after"] is None for x in sess):
         sess = [dict(x, after=x["after"] or [1, None]) for x in sess]
+    backup_from = applied["backup"] if applied["backup"].startswith("(") else f"`{applied['backup']}`"
     n_after = sum(x["after"][0] for x in sess)
     n_before = sum(x["before"][0] for x in sess)
     s = ["BEGIN TRANSACTION",
-         check("gap_after", "a repaired check-in changed since the apply (add-to-db or someone else wrote it): not rolled back"),
+         check("gap_state_after", "a repaired check-in changed since the apply (add-to-db or someone else wrote it): not rolled back"),
          f"DELETE FROM `{table}` WHERE SessionID IN UNNEST(@gap_sids)",
          f"ASSERT @@row_count = {n_after} AS 'rollback: deleted rows != {n_after}'",
-         f"INSERT INTO `{table}` SELECT * FROM `{applied['backup']}` WHERE SessionID IN UNNEST(@gap_sids)",
+         f"INSERT INTO `{table}` SELECT * FROM {backup_from} WHERE SessionID IN UNNEST(@gap_sids)",
          f"ASSERT @@row_count = {n_before} AS 'rollback: restored rows != {n_before}'",
-         check("gap_before", "rollback: restored rows are not the rows the list read"),
+         check("gap_state_before", "rollback: restored rows are not the rows the list read"),
          "COMMIT TRANSACTION"]
     params = [bigquery.ArrayQueryParameter("gap_sids", "STRING", [x["sid"] for x in sess]),
-              pre("gap_after", "after"), pre("gap_before", "before")]
+              pre("gap_state_after", "after"), pre("gap_state_before", "before")]
     return ";\n".join(s) + ";", params
 
 
@@ -785,7 +897,7 @@ def dry_run_forms(script: str) -> list[str]:
             continue
         if keep is not None:
             stmt = re.sub(r"\bgap_keep\b", f"({keep})", stmt)
-        stmt = re.sub(r"\bgap_before\b", "0", stmt)
+        stmt = re.sub(r"(?<![@\w])gap_before\b", "0", stmt)
         m = re.match(r"^ASSERT (.*) AS '[^']*'$", stmt, re.S)
         out.append(f"SELECT {m.group(1)}" if m else stmt)
     return out
@@ -804,6 +916,41 @@ def preflight(client, statements: list[tuple[str, list]]) -> None:
     print(f"dry run: {len(statements) - len(bad)} of {len(statements)} statements valid")
     if bad:
         raise SystemExit("STOPPED before writing: statements BigQuery rejects in a dry run:\n  " + "\n  ".join(bad))
+
+
+def statement_set(table: str, plan: dict, rows_table: str | None = None, backup: str | None = None) -> list:
+    """Every statement apply and rollback would send, in dry-runnable form, with parameters.
+    Without real DEV tables (list time) the loaded rows are a typed empty SELECT and the backup is the table itself."""
+    cols = plan["columns"]
+    rows_from = rows_table or ("(SELECT " + ", ".join(
+        [f"CAST(NULL AS {BQ_TYPE_MAP[t]}) AS {quote_identifier(c)}" for c, t in cols.items()]
+        + [f"CAST(NULL AS STRING) AS {PRESENT_FIELD}"]) + " FROM UNNEST([1]) WHERE FALSE)")
+    backup_from = backup or f"(SELECT * FROM `{table}` WHERE FALSE)"
+    sids = [x["sid"] for x in plan["sessions"]]
+    sid_param = [bigquery.ArrayQueryParameter("s", "STRING", sids)]
+    sql, params = build_apply_script(table, plan, rows_from)
+    rb, rb_params = build_rollback_script(table, {"backup": backup_from, "sessions": [
+        {"sid": x["sid"], "before": [x["n"], x["fps"]], "after": [1, ""]} for x in plan["sessions"]]})
+    return ([(f"CREATE TABLE `{DEV_PREFIX}adb_gap_repair_backup_dryrun` AS SELECT * FROM `{table}` "
+              f"WHERE SessionID IN UNNEST(@s)", sid_param)]
+            + [(x, params) for x in dry_run_forms(sql)] + [(x, rb_params) for x in dry_run_forms(rb)]
+            + [(read_stored_sql(table, ["SessionID"]), sid_param), (read_stored_sql(table, list(cols)), sid_param)])
+
+
+def synthetic_plan(schema) -> dict:
+    """Three made-up check-ins covering every statement shape: ranged insert, update + collapse, key-only insert."""
+    cols = {f.name: f.field_type.upper() for f in schema if f.field_type.upper() not in ("JSON", "RECORD", "STRUCT")}
+    names = {c.lower(): c for c in cols}
+    write = ["SessionID"] + [names[c.lower()] for c in IDENTITY + REPLY6 if c.lower() in names]
+    pcol = config.PARTITION_COLUMNS["responses"]
+    t = "2026-09-27 17:00:00"
+    return {"columns": cols, "totals": {"insert": 2, "update": 1, "collapse": 1, "extra_rows": 1}, "sessions": [
+        {"sid": "gap-dryrun-a", "insert": True, "update": False, "collapse": False, "n": 0, "fps": "",
+         "write": list(cols), "row": {"SessionID": "gap-dryrun-a", pcol: t}},
+        {"sid": "gap-dryrun-b", "insert": False, "update": True, "collapse": True, "n": 2, "fps": "1,2",
+         "write": write, "row": {"SessionID": "gap-dryrun-b", pcol: t}},
+        {"sid": "gap-dryrun-c", "insert": True, "update": False, "collapse": False, "n": 0, "fps": "",
+         "write": list(cols), "row": {"SessionID": "gap-dryrun-c", pcol: None}}]}
 
 
 def job_cost(client, job) -> str:
