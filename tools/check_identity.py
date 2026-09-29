@@ -169,23 +169,33 @@ def main_():
     with open(outs["base"]) as fa, open(outs["branch"]) as fb:
         a, b = fa.read().splitlines(), fb.read().splitlines()
     differ = [i for i, (x, y) in enumerate(zip(a, b)) if x != y] + list(range(min(len(a), len(b)), max(len(a), len(b))))
-    kinds = {}
+    kinds, statements, flush_statements, staged = {}, 0, 0, 0
     for line in a:
         d = json.loads(line)
+        if "flush" in d:
+            flush_statements += len(d["statements"])
+            staged += d["calls"]
+            continue
         key = f"/upsert {d['ingress_status']}, worker {[w['status'] for w in d['worker']]}"
         kinds[key] = kinds.get(key, 0) + 1
-    statements = sum(len([e for w in json.loads(l)["worker"] for e in w["events"] if "sql" in e]) for l in a)
-    print(f"{len(calls)} recorded calls since {since:%Y-%m-%d %H:%M} UTC; {statements} BigQuery statements compared")
+        statements += len([e for e in d["ingress_events"] if "sql" in e or "insert_rows_json" in e])
+        statements += len([e for w in d["worker"] for e in w["events"] if "sql" in e or "insert_rows_json" in e])
+    print(f"{len(calls)} recorded calls since {since:%Y-%m-%d %H:%M} UTC; {statements} BigQuery statements "
+          f"compared at /upsert and /tasks/upsert (staging appends included); {staged} staged calls flushed "
+          f"into {flush_statements} flush statements compared")
     print("outcomes (base):", kinds)
     if differ:
-        print(f"DIFFERENT for {len(differ)} calls; first: call {differ[0]}")
+        print(f"DIFFERENT on {len(differ)} output lines (calls and flush chunks); first: line {differ[0]}")
         x, y = json.loads(a[differ[0]]), json.loads(b[differ[0]]) if differ[0] < len(b) else {}
         for k in sorted(set(x) | set(y)):
             if x.get(k) != y.get(k):
                 print(f"  {k}:\n    base   {json.dumps(x.get(k))[:600]}\n    branch {json.dumps(y.get(k))[:600]}")
     shutil.rmtree(work, ignore_errors=True)
-    print("RESULT:", "IDENTICAL" if not differ and calls else ("NO CALLS" if not calls else "DIFFERENT"))
-    sys.exit(0 if (not differ and calls) else 1)
+    staged_expected = any(t in ("users", "responses") for t in TARGETS)
+    empty = not calls or (staged_expected and flush_statements == 0)
+    print("RESULT:", "DIFFERENT" if differ else ("NO CALLS" if not calls else
+                                                  ("NO FLUSH STATEMENTS" if empty else "IDENTICAL")))
+    sys.exit(0 if (not differ and not empty) else 1)
 
 
 if __name__ == "__main__":
