@@ -210,3 +210,7 @@ regress_progress_*.json
 regress_done_*.json
 eastern_fix_plan_*.json
 eastern_fix_list_*.txt
+gap_repair_list_*.txt
+gap_repair_plan_*.json
+gap_repair_runs_*.json
+gap_repair_applied_*.json
