@@ -517,5 +517,6 @@ which write it was, never the message text.
 Proofs: `tests/test_triage_queue.py` (routing, all six arrival orders, the alerts);
 `python tools/prove_triage_queue.py` on a DEV copy of the table (the six orders one at a time, a control that
 reproduces the split with two concurrent writes, and the same instant through one worker);
-`python tools/check_identity.py` (the check-in path is unchanged from the cutover revision: source, and
-recorded calls replayed through both versions).
+`python tools/check_identity.py --days 40` (the check-in path is unchanged from the cutover revision: source,
+and recorded calls replayed through both versions with the receive clock and uuid4 pinned, the staged calls then
+flushed under the recorder so the MERGEs into response_data and users are compared too).
