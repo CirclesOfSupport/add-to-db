@@ -35,6 +35,13 @@ Calls without a SessionID (sign-up events) are counted and left alone; the users
         Files: gap_repair_list_<stamp>.txt (every change), gap_repair_plan_<stamp>.json (for apply),
         gap_repair_planned_<stamp>.csv (every planned row), gap_repair_sample_<stamp>.txt (the sample
         with every call). They carry subscriber reply text: they stay on this machine.
+    python tools/repair_checkin_gap.py history --from YYYY-MM-DD --to YYYY-MM-DD [--table T]
+        read-only. The check-ins that began in the slice (CT dates, session id's own time), before the window:
+        each rebuilt from every logged call and compared to its stored rows -- no row, more than one row, the
+        row equal to its own last call, to an earlier call (a later call lost), or to none; per column, where
+        stored differs from the rebuilt check-in and from the last call; previous-session replies kept. Check-ins
+        with a load-test call to add-to-db, a call in the repaired window, or a time inside a log hole are
+        counted and not diagnosed. Files: history_<from>_<to>_<stamp>.csv and .txt; they stay on this machine.
     python tools/repair_checkin_gap.py backup PLAN --backup DEV.<table>
         copies the current rows of every check-in the plan changes into one new DEV table, checks the copy is
         the rows the list read (count and fingerprints), prints and dry-runs the statement that puts them back.
@@ -60,6 +67,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from urllib.parse import unquote
 
 from _harness import PROJECT, JobLog, make_client, stamp
@@ -232,11 +240,8 @@ def load_svc(client):
     return main
 
 
-def prepare(svc, schema, data: dict):
-    """
-    One call's row exactly as main.plan_target_writes prepares it, except that a key the table lacks
-    is dropped and reported instead of added as a column. (row, errors, unknown_keys, keyless, guarded)
-    """
+def _prepare(svc, schema, data: dict):
+    """prepare(), plus the row before the stale-reply guard: what the old writer stored for this call."""
     names = {f.name.lower() for f in schema}
     unknown = sorted(k for k in data if k.lower() not in names)
     normalized, normalize_errors = normalize_payload_to_schema(dict(data), schema)
@@ -249,7 +254,15 @@ def prepare(svc, schema, data: dict):
     if not keyless:
         errors = errors + key_errors + validate_upsert_keys(resolved, schema, row)
     guarded_row = apply_stale_reply_guard(row, REPLY_FIELDS)
-    return guarded_row, errors, unknown, keyless, guarded_row != row
+    return guarded_row, errors, unknown, keyless, guarded_row != row, row
+
+
+def prepare(svc, schema, data: dict):
+    """
+    One call's row exactly as main.plan_target_writes prepares it, except that a key the table lacks
+    is dropped and reported instead of added as a column. (row, errors, unknown_keys, keyless, guarded)
+    """
+    return _prepare(svc, schema, data)[:5]
 
 
 def fold(schema, calls: list[dict]) -> dict:
@@ -282,15 +295,15 @@ def make_calls(svc, schema, r) -> list[dict]:
     base = {"id": r["httplog_id"], "fired_at": r["fired_at"], "endpoint": _endpoint(r["request_path"], r["fired_at"]),
             "status": _status(r["response_status_line"]), "repaired": rep is not None}
     if err:
-        return [dict(base, sid=None, raw_sid=None, row=None, errors=[err], unknown=[], keyless=False, guarded=False,
-                     order=(r["fired_at"], r["httplog_id"], 0))]
+        return [dict(base, sid=None, raw_sid=None, row=None, snap=None, errors=[err], unknown=[], keyless=False,
+                     guarded=False, order=(r["fired_at"], r["httplog_id"], 0))]
     out = []
     for i, data in enumerate(items):
-        row, errors, unknown, keyless, guarded = prepare(svc, schema, data)
+        row, errors, unknown, keyless, guarded, snap = _prepare(svc, schema, data)
         raw_sid = _get(data, "sessionID")
         sid = row.get("SessionID") if not keyless else None
         out.append(dict(base, sid=sid, raw_sid=unquote(str(raw_sid)) if raw_sid is not None else None,
-                        row=row, errors=errors, unknown=unknown, keyless=keyless, guarded=guarded,
+                        row=row, snap=snap, errors=errors, unknown=unknown, keyless=keyless, guarded=guarded,
                         order=(r["fired_at"], r["httplog_id"], i)))
     return out
 
@@ -1285,6 +1298,168 @@ def cmd_rehearse(client, keep=False) -> bool:
             print(f"dropped {', '.join(made)}")
 
 
+# ---------------------------------------------------------------------------------------------
+# history: what the old writer got wrong before the window (read-only)
+# ---------------------------------------------------------------------------------------------
+
+CT = ZoneInfo("America/Chicago")
+# Spans with no webhook of any kind in the log while traffic ran (read from OPS.webhook_log, httplog_id contiguity):
+# a call fired in one of them was not logged, so a check-in that had one cannot be rebuilt exactly.
+HOLES = [(datetime(2026, 8, 26, 16, 59, 32, tzinfo=UTC), datetime(2026, 8, 26, 18, 52, 6, tzinfo=UTC), "hole"),
+         (datetime(2026, 9, 3, 7, 1, 25, tzinfo=UTC), datetime(2026, 9, 3, 9, 25, 58, tzinfo=UTC), "possible hole")]
+DT_TYPES = ("DATETIME", "TIMESTAMP")
+H_CLASSES = ["no row", "more than one row", "one row: its own last call (the old contract met)",
+             "one row: an earlier call's values (a later call lost: dropped or out of order)",
+             "one row: no call's values"]
+
+
+def ct_day(d: str) -> datetime:
+    return datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=CT).astimezone(UTC)
+
+
+def history_seed(client, start, end, read_to):
+    """Check-ins whose session id's own time is in [start, end), found in any logged call up to read_to;
+    and the calls without a session id fired in [start, end)."""
+    sid_t = r"SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez', SUBSTR(sid, 37))"
+    sql = (f"WITH c AS (SELECT fired_at, {SID_SQL} sid FROM `{LOG}` WHERE fired_at >= @floor AND fired_at < @to "
+           f"AND {IS_RESP_SQL}) "
+           f"SELECT sid, {sid_t} started, fired_at FROM c WHERE (sid IS NULL OR sid = '') AND fired_at >= @s AND "
+           f"fired_at < @e UNION ALL SELECT DISTINCT sid, {sid_t} started, CAST(NULL AS TIMESTAMP) FROM c "
+           f"WHERE sid != '' AND {sid_t} >= @s AND {sid_t} < @e")
+    rows = list(client.query(sql, job_config=_params(floor=start - timedelta(minutes=10), to=read_to, s=start, e=end,
+                                                     old=OLD_PATHS, new=NEW_PATH, host=NEW_HOST)).result())
+    return sorted({r["sid"] for r in rows if r["sid"]}), sum(1 for r in rows if not r["sid"])
+
+
+def _in_hole(t) -> str | None:
+    t = _aware(t) if not isinstance(t, datetime) else (t if t.tzinfo else t.replace(tzinfo=UTC))
+    return next((kind for a, b, kind in HOLES if t is not None and a <= t <= b), None)
+
+
+def snapshot_match(snaps: list[dict], row: dict) -> int | None:
+    """The index of the last call whose own values equal the stored row in every column the call carried."""
+    hit = None
+    for i, snap in enumerate(snaps):
+        if all(same(row.get(c), v) for c, v in snap.items()):
+            hit = i
+    return hit
+
+
+def history_session(sid, calls, rows, folded, types) -> dict:
+    """One check-in: which class of the old writer's failure its stored rows show, and in which columns."""
+    valid = [c for c in calls if c["row"] is not None and not c["errors"] and not c["keyless"]]
+    snaps = [c["snap"] for c in valid]
+    out = {"sid": sid, "calls": len(calls), "rows": len(rows), "rejected_calls": sum(bool(c["errors"]) for c in calls),
+           "guarded_calls": sum(c["guarded"] for c in valid), "exclude": None, "unlogged": None, "class": None,
+           "match": None, "diff": [], "own_diff": [], "stale_reply": False, "time_blanked": False, "carried_then_null": [],
+           "yes_missing": False, "reply_differs": False}
+    if any(c["endpoint"].startswith("add-to-db") for c in calls):
+        out["exclude"] = "a call went to add-to-db (load test)"
+        return out
+    if any(c["fired_at"] >= WINDOW_START for c in calls):
+        out["exclude"] = "a call reaches the repaired window"
+        return out
+    times = [sid_time(sid)] + [r.get(c) for r in rows for c, t in types.items() if t in DT_TYPES]
+    out["unlogged"] = next((k for k in (_in_hole(t) for t in times if t is not None) if k), None)
+    if out["unlogged"]:
+        return out
+    if not valid:
+        out["exclude"] = "every call rejected by preparation"
+        return out
+    new = folded
+    old = snaps[-1]                                            # the old contract: the last call's own values
+    out["stale_reply"] = any(not same(old.get(c), new.get(c)) for c in REPLY_FIELDS if c in old)
+    out["time_blanked"] = old.get("checkinDateTime") is None and new.get("checkinDateTime") is not None
+    out["carried_then_null"] = sorted({c for s in snaps for c, v in s.items()
+                                       if _reply(v) is not None and new.get(c) is None and c != "SessionID"})
+    want = _reply(new.get("checkinReply"))
+    out["yes_missing"] = want == "Yes" and not any(r.get("checkinReply") == "Yes" for r in rows)
+    out["reply_differs"] = bool(rows) and any(_reply(r.get("checkinReply")) != want for r in rows)
+    if not rows:
+        out["class"] = H_CLASSES[0]
+        return out
+    out["diff"] = sorted({c for r in rows for c in new if c != "SessionID" and differs(r, new, c)})
+    out["own_diff"] = sorted({c for r in rows for c in old if c != "SessionID" and not same(r.get(c), old.get(c))})
+    if len(rows) > 1:
+        out["class"] = H_CLASSES[1]
+        return out
+    out["match"] = snapshot_match(snaps, rows[0])
+    out["class"] = (H_CLASSES[2] if out["match"] == len(snaps) - 1 else
+                    H_CLASSES[3] if out["match"] is not None else H_CLASSES[4])
+    return out
+
+
+def cmd_history(client, frm: str, to: str, table=TABLE, out=None) -> bool:
+    """Read-only. The check-ins that began in [frm, to) (CT dates), rebuilt from every logged call and compared to
+    the stored rows: the old writer's failures by class and column. Files stay on this machine."""
+    p = lambda *a: print(*a, file=out)  # noqa: E731
+    start, end = ct_day(frm), ct_day(to)
+    if start < LOG_FLOOR or end > WINDOW_START + timedelta(days=1) or end <= start:
+        raise SystemExit("history covers check-ins that began between 2026-08-25 and the repaired window")
+    svc = load_svc(client)
+    schema = list(client.get_table(table).schema)
+    types = {f.name: f.field_type.upper() for f in schema}
+    read_to = WINDOW_END
+    sids, keyless = history_seed(client, start, end, read_to)
+    calls = defaultdict(list)
+    wanted = set(sids)
+    for r in (history_rows(client, sids, start - timedelta(minutes=10), read_to) if sids else []):
+        for c in make_calls(svc, schema, r):
+            sid = c["sid"] if c["sid"] in wanted else (c["raw_sid"] if c.get("raw_sid") in wanted else None)
+            if sid:
+                calls[sid].append(c)
+    for cs in calls.values():
+        cs.sort(key=lambda c: c["order"])
+    folded = fold(schema, [c for cs in calls.values() for c in cs])
+    stored = read_stored(client, table, sids, [f.name for f in schema])
+    res = [history_session(sid, calls[sid], stored.get(sid, []), folded.get(sid, {}), types) for sid in sids]
+
+    run = stamp()
+    csv_path, sum_path = f"history_{frm}_{to}_{run}.csv", f"history_{frm}_{to}_{run}.txt"
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["SessionID", "excluded", "unlogged", "class", "calls", "stored_rows", "rejected_calls",
+                    "matched_call", "differs_from_fold", "differs_from_last_call", "stale_reply_stored",
+                    "checkin_time_blanked", "carried_then_null", "yes_missing", "reply_differs"])
+        for x in res:
+            w.writerow([x["sid"], x["exclude"] or "", x["unlogged"] or "", x["class"] or "", x["calls"], x["rows"],
+                        x["rejected_calls"], "" if x["match"] is None else x["match"] + 1, "|".join(x["diff"]),
+                        "|".join(x["own_diff"]), x["stale_reply"], x["time_blanked"], "|".join(x["carried_then_null"]),
+                        x["yes_missing"], x["reply_differs"]])
+    done = [x for x in res if x["class"]]
+    cls = Counter(x["class"] for x in done)
+    exc = Counter(x["exclude"] for x in res if x["exclude"])
+    unl = Counter(x["unlogged"] for x in res if x["unlogged"])
+    col = Counter(c for x in done for c in x["diff"])
+    own = Counter(c for x in done for c in x["own_diff"])
+    ctn = Counter(c for x in done for c in x["carried_then_null"])
+    lines = [
+        f"HISTORY {frm} to {to} (CT, session start) -- table {table}; calls read {start.isoformat()} to {read_to.isoformat()}",
+        f"check-ins that began in the slice: {len(sids)}; calls without a session id fired in the slice: {keyless}",
+        "not diagnosed: " + ("; ".join(f"{k} {n}" for k, n in exc.most_common()) or "none"),
+        "unlogged (a session start or stored time inside a log hole): " + ("; ".join(f"{k} {n}" for k, n in unl.items()) or "none"),
+        f"diagnosed: {len(done)}",
+    ] + [f"  {k:<78} {cls.get(k, 0):>7}" for k in H_CLASSES] + [
+        f"  reply differs from the rebuilt check-in                                       {sum(x['reply_differs'] for x in done):>7}",
+        f"  rebuilt reply is Yes, no stored row says Yes                                  {sum(x['yes_missing'] for x in done):>7}",
+        f"  previous session's reply kept (the old contract has no stale guard)           {sum(x['stale_reply'] for x in done):>7}",
+        f"  check-in time blanked by a later call (old contract)                          {sum(x['time_blanked'] for x in done):>7}",
+        f"  calls rejected by preparation (the old writer answered 500 on these)          {sum(x['rejected_calls'] for x in res):>7}",
+        "stored differs from the rebuilt check-in, by column (check-ins): "
+        + (", ".join(f"{c} {n}" for c, n in col.most_common()) or "none"),
+        "stored differs from the check-in's own last call, by column (check-ins): "
+        + (", ".join(f"{c} {n}" for c, n in own.most_common()) or "none"),
+        "a value an earlier call carried is NULL at the end, by column (check-ins): "
+        + (", ".join(f"{c} {n}" for c, n in ctn.most_common()) or "none"),
+        f"per check-in: {csv_path} (subscriber data: stays on this machine)",
+        "Nothing was written to BigQuery.",
+    ]
+    with open(sum_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    p("\n".join(lines))
+    return True
+
+
 def main_(argv=None):
     for stream in (sys.stdout, sys.stderr):          # reply text carries emoji; never depend on the code page
         try:
@@ -1292,12 +1467,15 @@ def main_(argv=None):
         except (AttributeError, ValueError):
             pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("action", choices=("calls", "repaired", "check", "list", "backup", "rehearse", "apply", "rollback"))
+    ap.add_argument("action", choices=("calls", "repaired", "check", "list", "history", "backup", "rehearse", "apply",
+                                       "rollback"))
     ap.add_argument("file", nargs="?", help="backup and apply: the plan; rollback: the applied record")
     ap.add_argument("--backup", help="backup: the DEV table to create; apply: the DEV backup made by backup")
     ap.add_argument("--table", default=TABLE, help="list and check: the table to read")
     ap.add_argument("--production", action="store_true")
     ap.add_argument("--keep", action="store_true", help="rehearse: keep the clone, backup and loaded rows")
+    ap.add_argument("--from", dest="frm", help="history: first CT date of the slice (YYYY-MM-DD)")
+    ap.add_argument("--to", help="history: CT date after the slice (YYYY-MM-DD)")
     args = ap.parse_args(argv)
     if args.action in ("backup", "apply", "rollback"):
         if not args.file:
@@ -1335,6 +1513,10 @@ def _run(client, args, doc) -> bool:
     elif args.action == "list":
         cmd_list(client, table=args.table)
         ok = True
+    elif args.action == "history":
+        if not (args.frm and args.to):
+            raise SystemExit("history needs --from and --to")
+        ok = cmd_history(client, args.frm, args.to, table=args.table)
     elif args.action == "backup":
         ok = cmd_backup(client, doc, args.backup)
     elif args.action == "rehearse":

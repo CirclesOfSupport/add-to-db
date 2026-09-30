@@ -539,3 +539,90 @@ def test_loaded_rows_mark_only_the_columns_each_checkin_writes():
     a, b = got["data"]
     assert a[G.PRESENT_FIELD] == "|SessionID|checkinDateTime|wellnessDomain|orgCode|"
     assert b[G.PRESENT_FIELD] == "|SessionID|wellnessDomain|" and b["orgCode"] is None
+
+
+# --- history: the old writer's failures before the window, read-only ----------------------------
+
+class _HistBQ:
+    """Stub BigQuery for `history`: the seed query, the call history, the stored rows."""
+
+    def __init__(self, reqs, stored):
+        self.reqs, self.stored, self.sql = reqs, stored, []
+
+    def get_table(self, table):
+        return _Table()
+
+    def query(self, sql, job_config=None):
+        self.sql.append(sql)
+        params = {q.name: getattr(q, "value", None) or getattr(q, "values", None) for q in job_config.query_parameters}
+        if "SAFE.PARSE_TIMESTAMP" in sql:
+            out = []
+            for r in self.reqs:
+                m = __import__("re").search(r'(?i)"sessionid"\s*:\s*"([^"]*)"', r["request_body"])
+                sid = m.group(1).replace("%3A", ":").replace("%2B", "+") if m else ""
+                if not sid and params["s"] <= r["fired_at"] < params["e"]:
+                    out.append({"sid": sid, "started": None, "fired_at": r["fired_at"]})
+                elif sid and params["s"] <= G.sid_time(sid) < params["e"]:
+                    out.append({"sid": sid, "started": G.sid_time(sid), "fired_at": None})
+            return _Job(out)
+        if "IN UNNEST(@sids)" in sql:
+            return _Job(sorted(self.reqs, key=lambda r: (r["fired_at"], r["httplog_id"])))
+        if "FARM_FINGERPRINT" in sql:
+            wanted = set(job_config.query_parameters[0].values)
+            return _Job([dict(r) for r in self.stored if r["SessionID"] in wanted])
+        raise AssertionError(sql)
+
+
+def test_history_classes_each_checkin_by_what_its_stored_row_shows(svc, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(G, "load_svc", lambda client: svc)
+    monkeypatch.chdir(tmp_path)
+    U = lambda n: f"{n:08d}-0000-0000-0000-{n:012d}"            # noqa: E731
+    A = f"{U(1)}2026-08-28T09:00:00.5-05:00"     # stored = its last call: the old contract met
+    B = f"{U(2)}2026-08-28T09:00:00.5-05:00"     # stored = its first call: the later Yes was lost
+    C = f"{U(3)}2026-08-29T09:00:00.5-05:00"     # no stored row
+    D = f"{U(4)}2026-08-29T09:00:00.5-05:00"     # two stored rows
+    E = f"{U(5)}2026-08-28T16:00:00.5-05:00"     # a call went to add-to-db during a load test
+    F = f"{U(6)}2026-08-30T09:00:00.5-05:00"     # a call in the repaired window
+    S = f"{U(7)}2026-08-31T09:00:00.5-05:00"     # its last call carries the previous session's reply
+    H = f"{U(8)}2026-09-03T02:30:00.5-05:00"     # began inside the possible 09-03 hole
+    X = f"{U(9)}2026-08-26T09:00:00.5-05:00"     # began before the slice: not seeded
+    ci = {k: v[36:] for k, v in dict(A=A, B=B, C=C, D=D, E=E, F=F, S=S, H=H, X=X).items()}
+    reqs = [req(1, "2026-08-28T14:00:01+00:00", old_body(A, ci["A"])),
+            req(2, "2026-08-28T15:00:01+00:00", old_body(A, ci["A"], wellnessDomain="Relational")),
+            req(3, "2026-08-28T14:00:02+00:00", old_body(B, ci["B"])),
+            req(4, "2026-08-28T15:00:02+00:00", old_body(B, ci["B"], reply="Yes", reply_t="2026-08-28T10:00:00-05:00")),
+            req(5, "2026-08-29T14:00:01+00:00", old_body(C, ci["C"])),
+            req(6, "2026-08-29T14:00:02+00:00", old_body(D, ci["D"])),
+            req(7, "2026-08-28T21:00:01+00:00", new_body(E, ci["E"]), path=G.NEW_PATH, status="HTTP/2.0 202 Accepted"),
+            req(8, "2026-08-30T14:00:01+00:00", old_body(F, ci["F"])),
+            req(9, "2026-09-26T12:00:00+00:00", old_body(F, ci["F"])),
+            req(10, "2026-08-31T14:00:01+00:00", old_body(S, ci["S"], reply="Yes", reply_t="2026-08-24T10:00:00-05:00")),
+            req(11, "2026-09-03T07:30:01+00:00", old_body(H, ci["H"])),
+            req(12, "2026-08-26T14:00:01+00:00", old_body(X, ci["X"])),
+            req(13, "2026-08-29T15:00:00+00:00", json.dumps({"Users": {}, "Responses": {"sessionID": ""}}))]
+    utc = lambda v: G._aware(v).astimezone(G.UTC).replace(tzinfo=None)      # noqa: E731
+    stored = [_stored(A, utc(ci["A"]), 1, wellnessDomain="Relational", checkinReplyDateTime=None),
+              _stored(B, utc(ci["B"]), 2),
+              _stored(D, utc(ci["D"]), 3), _stored(D, utc(ci["D"]), 4),
+              _stored(S, utc(ci["S"]), 5, checkinReply="Yes", checkinReplyDateTime=datetime(2026, 8, 24, 15, 0))]
+    for r in stored:
+        r.pop("gap_fp")
+        r.update(orgCode="demo", userWeek=3)
+    assert G.cmd_history(_HistBQ(reqs, stored), "2026-08-27", "2026-09-04")
+    text = capsys.readouterr().out
+    rows = {r[0]: r for r in __import__("csv").reader(open(next(tmp_path.glob("history_*.csv")), encoding="utf-8"))}
+    assert X not in rows and len(rows) == 1 + 8
+    assert rows[A][3] == G.H_CLASSES[2]
+    assert rows[B][3] == G.H_CLASSES[3] and rows[B][7] == "1" and rows[B][13] == "True"
+    assert "checkinReply" in rows[B][8].split("|")
+    assert rows[C][3] == G.H_CLASSES[0] and rows[D][3] == G.H_CLASSES[1]
+    assert rows[E][1].startswith("a call went to add-to-db") and rows[F][1] == "a call reaches the repaired window"
+    assert rows[H][2] == "possible hole" and rows[H][3] == ""
+    assert rows[S][3] == G.H_CLASSES[2] and rows[S][10] == "True"          # stored the stale reply, as its contract said
+    assert "calls without a session id fired in the slice: 1" in text
+    assert "Nothing was written to BigQuery." in text
+
+
+def test_history_refuses_a_slice_outside_the_log():
+    with pytest.raises(SystemExit):
+        G.cmd_history(None, "2026-08-01", "2026-08-08")
