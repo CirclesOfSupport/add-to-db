@@ -626,3 +626,11 @@ def test_history_classes_each_checkin_by_what_its_stored_row_shows(svc, monkeypa
 def test_history_refuses_a_slice_outside_the_log():
     with pytest.raises(SystemExit):
         G.cmd_history(None, "2026-08-01", "2026-08-08")
+
+
+def test_ct_day_without_a_time_zone_database(monkeypatch):
+    import zoneinfo
+    assert G.ct_day("2026-08-27") == datetime(2026, 8, 27, 5, 0, tzinfo=UTC)
+    monkeypatch.setattr(zoneinfo, "ZoneInfo", lambda k: (_ for _ in ()).throw(zoneinfo.ZoneInfoNotFoundError(k)))
+    assert G.ct_day("2026-08-27") == datetime(2026, 8, 27, 5, 0, tzinfo=UTC)          # the Windows path: pytz
+    assert G.ct_day("2026-11-02") == datetime(2026, 11, 2, 6, 0, tzinfo=UTC)

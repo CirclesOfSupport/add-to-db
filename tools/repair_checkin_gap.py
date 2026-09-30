@@ -67,7 +67,6 @@ import sys
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 from urllib.parse import unquote
 
 from _harness import PROJECT, JobLog, make_client, stamp
@@ -1302,7 +1301,6 @@ def cmd_rehearse(client, keep=False) -> bool:
 # history: what the old writer got wrong before the window (read-only)
 # ---------------------------------------------------------------------------------------------
 
-CT = ZoneInfo("America/Chicago")
 # Spans with no webhook of any kind in the log while traffic ran (read from OPS.webhook_log, httplog_id contiguity):
 # a call fired in one of them was not logged, so a check-in that had one cannot be rebuilt exactly.
 HOLES = [(datetime(2026, 8, 26, 16, 59, 32, tzinfo=UTC), datetime(2026, 8, 26, 18, 52, 6, tzinfo=UTC), "hole"),
@@ -1314,7 +1312,15 @@ H_CLASSES = ["no row", "more than one row", "one row: its own last call (the old
 
 
 def ct_day(d: str) -> datetime:
-    return datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=CT).astimezone(UTC)
+    """Midnight Central time on that date, in UTC. Windows has no time-zone database of its own, so zoneinfo needs
+    the tzdata package; pytz (a dev requirement of this repository) carries its own."""
+    naive = datetime.strptime(d, "%Y-%m-%d")
+    try:
+        from zoneinfo import ZoneInfo
+        return naive.replace(tzinfo=ZoneInfo("America/Chicago")).astimezone(UTC)
+    except Exception:  # noqa: BLE001 -- ZoneInfoNotFoundError, or no zoneinfo
+        import pytz
+        return pytz.timezone("America/Chicago").localize(naive).astimezone(UTC)
 
 
 def history_seed(client, start, end, read_to):
