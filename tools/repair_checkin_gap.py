@@ -14,8 +14,11 @@ service, not rewritten here. Every logged call counts, from both endpoints and w
   * /upsert on add-to-db after the switch: the responses item of the body, exactly as sent, including
     the calls the service has already written; a body that is not valid JSON (answered 400) is repaired
     by escaping only the string values that broke it -- every other byte is kept -- and then used.
-A check-in is in scope when it has a call to the old writer inside the window or a rejected call after
-the switch; its calls are taken from the whole log (bodies are kept from 2026-08-25), whatever the edge.
+A check-in is in scope when it began in the window (its identity call, the session id's own time, between the
+partition swap and the switch), or has a call rejected after the switch, or began before the window and the fold
+of its calls fired before the window equals its one stored row -- so every change the repair makes comes from a
+call inside the window. Every other check-in is left untouched and counted. Its calls are taken from the whole
+log (bodies are kept from 2026-08-25), whatever the edge.
 Calls without a SessionID (sign-up events) are counted and left alone; the users table is out of scope.
 
     python tools/repair_checkin_gap.py calls
@@ -32,9 +35,12 @@ Calls without a SessionID (sign-up events) are counted and left alone; the users
         Files: gap_repair_list_<stamp>.txt (every change), gap_repair_plan_<stamp>.json (for apply),
         gap_repair_planned_<stamp>.csv (every planned row), gap_repair_sample_<stamp>.txt (the sample
         with every call). They carry subscriber reply text: they stay on this machine.
+    python tools/repair_checkin_gap.py backup PLAN --backup DEV.<table>
+        copies the current rows of every check-in the plan changes into one new DEV table, checks the copy is
+        the rows the list read (count and fingerprints), prints and dry-runs the statement that puts them back.
     python tools/repair_checkin_gap.py rehearse [--keep]
         on a DEV clone of today's RESPONSES.response_data: list, apply, list again, roll back.
-    python tools/repair_checkin_gap.py apply PLAN [--production]
+    python tools/repair_checkin_gap.py apply PLAN [--production] [--backup DEV.<table made by backup>]
         production only with --production, and never 02:00-04:30 CT (07:00-09:30 UTC). Flush
         maintenance pause on (OPS); drops from the plan any check-in add-to-db has staged a call for
         after the log the list read; backs up the plan's rows to DEV; loads the planned rows to DEV; ONE
@@ -51,11 +57,12 @@ import hashlib
 import json
 import re
 import sys
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote
 
-from _harness import PROJECT, make_client, stamp
+from _harness import PROJECT, JobLog, make_client, stamp
 
 from google.cloud import bigquery
 
@@ -435,16 +442,43 @@ def _enc(v):
     return v
 
 
+REJECTED = "one of the calls rejected after the switch"
+
+
 def group_of(sid: str, rejected: set) -> str:
+    """By its identity call (the session id's own time); a check-in with a rejected call is its own group."""
+    if sid in rejected:
+        return REJECTED
     t = sid_time(sid)
-    if t is not None and t >= SWITCH_AT:
-        return "began after the switch (rejected call)"
     if t is not None and t < WINDOW_START:
         return "began before the window"
+    if t is not None and t > SWITCH_AT:
+        return "began after the switch"
     return "began in the window"
 
 
-def build_plan(client, table: str, loaded: dict | None = None) -> dict:
+def pre_window_matches(schema, calls: list[dict], rows: list[dict]) -> str | None:
+    """
+    Scope rule for a check-in that began before the window: it is repaired only if the fold of its calls fired
+    before the window equals its one stored row, so every change the repair makes comes from a call in the window.
+    Returns None when it qualifies, else the reason it is left out.
+    """
+    pre = [c for c in calls if c["fired_at"] < WINDOW_START]
+    if not any(c["row"] is not None and not c["errors"] for c in pre):
+        return "no call before the window in the log"
+    if not rows:
+        return "no stored row"
+    if len(rows) > 1:
+        return "more than one stored row"
+    folded = next(iter(fold(schema, pre).values()), None)
+    if folded is None:
+        return "no call before the window in the log"
+    if any(differs(rows[0], folded, c) for c in folded if c != "SessionID"):
+        return "stored row differs from its calls before the window"
+    return None
+
+
+def build_plan(client, table: str, loaded: dict | None = None, keep: set | None = None) -> dict:
     """Read-only. Per check-in in scope: the fold of its complete call sequence against its stored rows."""
     svc = load_svc(client)
     schema = list(client.get_table(table).schema)
@@ -462,6 +496,17 @@ def build_plan(client, table: str, loaded: dict | None = None) -> dict:
     in_scope = [sid for sid in loaded["sids"] if sid in folded and sid not in moving]
     cols = [f.name for f in schema]
     stored = read_stored(client, table, in_scope, cols)
+    excluded = {}
+    if loaded["mode"] == "window":            # the window's scope rule (2026-09-29)
+        for sid in list(in_scope):
+            g = group_of(sid, rejected)
+            if g == "began in the window" or g == REJECTED or sid in (keep or ()):
+                continue
+            reason = (pre_window_matches(schema, by_sid[sid], stored.get(sid, [])) if g == "began before the window"
+                      else "began after the switch")
+            if reason:
+                excluded[sid] = f"{g}: {reason}"
+        in_scope = [sid for sid in in_scope if sid not in excluded]
     sessions = {}
     for sid in in_scope:
         rows, planned = stored.get(sid, []), folded[sid]
@@ -476,6 +521,8 @@ def build_plan(client, table: str, loaded: dict | None = None) -> dict:
     plan = {
         "table": table, "listed_at": datetime.now(UTC).isoformat(), "log_cutoff": loaded["cutoff"].isoformat(),
         "rule": "add-to-db's fold over every logged call of the check-in, in fired order",
+        "scope": ("began in the window, or has a call rejected after the switch, or began before the window and the "
+                  "fold of its calls before the window equals its stored row"),
         "window": [WINDOW_START.isoformat(), WINDOW_END.isoformat()],
         "columns": {c: types[c] for c in cols if any(c in s["row"] for s in actions)},
         "totals": {"insert": sum(s["insert"] for s in actions), "update": sum(s["update"] for s in actions),
@@ -487,6 +534,7 @@ def build_plan(client, table: str, loaded: dict | None = None) -> dict:
                       "row": {c: _enc(v) for c, v in s["row"].items()}} for s in actions],
     }
     plan["_ctx"] = {"loaded": loaded, "sessions": sessions, "moving": sorted(set(loaded["sids"]) & moving),
+                    "excluded": excluded,
                     "bad": bad, "no_row_planned": sorted(set(loaded["sids"]) - set(folded)), "schema": schema}
     return plan
 
@@ -734,14 +782,15 @@ def sample_lines(s: dict) -> list[str]:
     return lines
 
 
-def cmd_list(client, table=TABLE, out=None) -> tuple[str, dict]:
+def cmd_list(client, table=TABLE, out=None, keep: set | None = None) -> tuple[str, dict]:
+    """keep: check-ins a repair already wrote; they stay in scope on the list that verifies it."""
     run = stamp()
     list_path, plan_path = f"gap_repair_list_{run}.txt", f"gap_repair_plan_{run}.json"
     csv_path, sample_path = f"gap_repair_planned_{run}.csv", f"gap_repair_sample_{run}.txt"
     p = lambda *a: print(*a, file=out)  # noqa: E731
     p("dry run of every statement shape (made-up check-ins):")
     preflight(client, statement_set(table, synthetic_plan(client.get_table(table).schema)))
-    plan = build_plan(client, table)
+    plan = build_plan(client, table, keep=keep)
     ctx = plan.pop("_ctx")
     sessions, L = ctx["sessions"], ctx["loaded"]
     before = diagnose(client, table, sessions)
@@ -786,6 +835,8 @@ def cmd_list(client, table=TABLE, out=None) -> tuple[str, dict]:
         f"check-ins in scope {len(L['sids'])}: planned {len(sessions)}; with a call staged after the log cutoff "
         f"(left for a later list) {len(ctx['moving'])}; every call rejected by the service's preparation "
         f"{len(ctx['no_row_planned'])}; with at least one call so rejected (the rest folded) {len(ctx['bad'])}",
+        f"left out by the window's scope rule: {len(ctx['excluded'])} ("
+        + "; ".join(f"{k} {v}" for k, v in Counter(ctx["excluded"].values()).most_common()) + ")",
         "  by group: " + "; ".join(f"{g} {n} (insert {act_by_group[g]['insert']}, update {act_by_group[g]['update']}, "
                                    f"collapse {act_by_group[g]['collapse']})" for g, n in by_group.most_common()),
         f"calls folded {sum(len(s['calls']) for s in sessions.values())}: " + ", ".join(
@@ -1068,13 +1119,61 @@ class Pause:
         return False
 
 
-def cmd_apply(client, plan: dict, production: bool, pause: bool | None = None, created: list | None = None) -> dict:
+def _expected_fps(plan: dict) -> dict:
+    return {s["sid"]: [s["n"], s["fps"]] for s in plan["sessions"] if s["n"]}
+
+
+def restore_sql(table: str, backup: str) -> str:
+    return (f"BEGIN TRANSACTION;\nDELETE FROM `{table}` WHERE SessionID IN UNNEST(@gap_sids);\n"
+            f"INSERT INTO `{table}` SELECT * FROM `{backup}` WHERE SessionID IN UNNEST(@gap_sids);\nCOMMIT TRANSACTION;")
+
+
+def cmd_backup(client, plan: dict, backup: str) -> bool:
+    """
+    Copy the current rows of every check-in the plan changes into one DEV table, check the copy is exactly the
+    rows the list read (count and fingerprints), and print (and dry-run) the statement that puts them back.
+    Writes only the DEV table; refuses any other dataset and an existing table.
+    """
+    if not backup.startswith(DEV_PREFIX):
+        raise SystemExit(f"refusing: the backup must be a DEV table, not {backup}")
+    table = plan["table"]
+    sids = [x["sid"] for x in plan["sessions"]]
+    sid_param = [bigquery.ArrayQueryParameter("s", "STRING", sids)]
+    sql = f"CREATE TABLE `{backup}` AS SELECT * FROM `{table}` WHERE SessionID IN UNNEST(@s)"
+    preflight(client, [(sql, sid_param)])
+    client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=sid_param)).result()
+    got = fp_state(client, backup, sids)
+    want = _expected_fps(plan)
+    rows = sum(v[0] for v in got.values())
+    differ = [sid for sid in sids if got[sid] != want.get(sid, [0, ""])]
+    print(f"backup {backup}: {rows} rows for {len(sids)} check-ins (the list read {sum(v[0] for v in want.values())} "
+          f"rows; {len(sids) - len(want)} check-ins have no row yet and are inserts)")
+    print(f"check-ins whose backed-up rows differ from the rows the list read: {len(differ)}"
+          + (f" (first {differ[:3]})" if differ else ""))
+    rs = restore_sql(table, backup)
+    stmts = [x.strip() for x in rs.split(";\n") if x.strip() and not x.strip().startswith(("BEGIN", "COMMIT"))]
+    preflight(client, [(x.rstrip(";"), [bigquery.ArrayQueryParameter("gap_sids", "STRING", sids)]) for x in stmts])
+    print("restore statement (@gap_sids = the plan's check-ins; the rollback command runs it with its checks):")
+    print(rs)
+    ok = not differ and rows == sum(v[0] for v in want.values())
+    print(f"BACKUP {'PASS' if ok else 'FAIL'}: {rows} rows kept in {backup}")
+    return ok
+
+
+def cmd_apply(client, plan: dict, production: bool, pause: bool | None = None, created: list | None = None,
+              backup: str | None = None) -> dict:
     table = plan["table"]
     refuse_unless_allowed(table, production)
     created = created if created is not None else []
     run = stamp()
-    backup = f"{DEV_PREFIX}adb_gap_repair_backup_{run}"
-    rows_table = f"{DEV_PREFIX}adb_gap_repair_rows_{run}"
+    made_backup = backup is None
+    if backup is None:
+        backup = f"{DEV_PREFIX}adb_gap_repair_backup_{run}"
+        rows_table = f"{DEV_PREFIX}adb_gap_repair_rows_{run}"
+    else:
+        if not backup.startswith(DEV_PREFIX):
+            raise SystemExit(f"refusing: the backup must be a DEV table, not {backup}")
+        rows_table = backup.replace("_backup_", "_rows_") if "_backup_" in backup else backup + "_rows"
     path = f"gap_repair_applied_{run}.json"
     with Pause(client, production if pause is None else pause):
         staged = staged_since(client, datetime.fromisoformat(plan["log_cutoff"]))
@@ -1089,12 +1188,20 @@ def cmd_apply(client, plan: dict, production: bool, pause: bool | None = None, c
               f"read: {len(dropped)}")
         sids = [s["sid"] for s in plan["sessions"]]
         sid_param = [bigquery.ArrayQueryParameter("s", "STRING", sids)]
-        backup_sql = f"CREATE TABLE `{backup}` AS SELECT * FROM `{table}` WHERE SessionID IN UNNEST(@s)"
-        preflight(client, [(backup_sql, sid_param)])
-        client.query(backup_sql, job_config=bigquery.QueryJobConfig(query_parameters=sid_param)).result()
-        created.append(backup)
-        nb = list(client.query(f"SELECT COUNT(*) n FROM `{backup}`").result())[0]["n"]
-        print(f"backup: {backup} ({nb} rows)")
+        if made_backup:
+            backup_sql = f"CREATE TABLE `{backup}` AS SELECT * FROM `{table}` WHERE SessionID IN UNNEST(@s)"
+            preflight(client, [(backup_sql, sid_param)])
+            client.query(backup_sql, job_config=bigquery.QueryJobConfig(query_parameters=sid_param)).result()
+            created.append(backup)
+            nb = list(client.query(f"SELECT COUNT(*) n FROM `{backup}`").result())[0]["n"]
+            print(f"backup: {backup} ({nb} rows)")
+        else:
+            got, want = fp_state(client, backup, sids), _expected_fps(plan)
+            bad = [sid for sid in sids if got[sid] != want.get(sid, [0, ""])]
+            if bad:
+                raise SystemExit(f"STOPPED before writing: {len(bad)} check-ins in {backup} are not the rows the list "
+                                 f"read (first {bad[:3]}); nothing was written")
+            print(f"backup {backup}: checked, {sum(v[0] for v in got.values())} rows are the rows the list read")
         created.append(rows_table)
         loaded = load_rows(client, plan, rows_table)
         print(f"planned rows loaded: {rows_table} ({loaded} rows)")
@@ -1153,7 +1260,7 @@ def cmd_rehearse(client, keep=False) -> bool:
         for sid in applied["dropped"]:
             before_fp.pop(sid, None)
         print("\nrehearsal: list again on the repaired clone (the repair must leave nothing to do):")
-        _, again = cmd_list(client, table=clone)
+        _, again = cmd_list(client, table=clone, keep=set(before_fp))
         again.pop("_ctx")
         t2 = again["totals"]
         diag_before, diag_after = Counter(plan["diagnosis_before"]), Counter(again["diagnosis_before"])
@@ -1185,19 +1292,40 @@ def main_(argv=None):
         except (AttributeError, ValueError):
             pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("action", choices=("calls", "repaired", "check", "list", "rehearse", "apply", "rollback"))
-    ap.add_argument("file", nargs="?", help="apply: the plan; rollback: the applied record")
+    ap.add_argument("action", choices=("calls", "repaired", "check", "list", "backup", "rehearse", "apply", "rollback"))
+    ap.add_argument("file", nargs="?", help="backup and apply: the plan; rollback: the applied record")
+    ap.add_argument("--backup", help="backup: the DEV table to create; apply: the DEV backup made by backup")
     ap.add_argument("--table", default=TABLE, help="list and check: the table to read")
     ap.add_argument("--production", action="store_true")
     ap.add_argument("--keep", action="store_true", help="rehearse: keep the clone, backup and loaded rows")
     args = ap.parse_args(argv)
-    if args.action in ("apply", "rollback"):
+    if args.action in ("backup", "apply", "rollback"):
         if not args.file:
             raise SystemExit(f"{args.action} needs its file")
         with open(args.file, encoding="utf-8") as f:
             doc = json.load(f)
-        refuse_unless_allowed(doc["table"], args.production)            # before any sign-in or query
+        if args.action != "backup":
+            refuse_unless_allowed(doc["table"], args.production)        # before any sign-in or query
+        if args.action == "backup" and not args.backup:
+            raise SystemExit("backup needs --backup DEV-table-name")
+    started = time.monotonic()
     client = make_client()
+    jobs = JobLog(client)
+    try:
+        ok = _run(client, args, doc if args.action in ("backup", "apply", "rollback") else None)
+    finally:
+        if args.action == "apply" and args.backup:
+            rows_table = args.backup.replace("_backup_", "_rows_") if "_backup_" in args.backup else args.backup + "_rows"
+            client.delete_table(rows_table, not_found_ok=True)
+            print(f"dropped {rows_table} (the planned rows, loaded for the MERGE only)")
+        billed = sum((r["bytes_billed"] or 0) for r in jobs.stats())
+        print(f"measured: {(time.monotonic() - started) / 60:.1f} minutes, {billed / 1e9:.2f} GB billed "
+              f"({len(jobs.jobs)} BigQuery jobs)")
+    if not ok:
+        raise SystemExit(1)
+
+
+def _run(client, args, doc) -> bool:
     if args.action == "calls":
         ok = cmd_calls(client)
     elif args.action == "repaired":
@@ -1207,12 +1335,14 @@ def main_(argv=None):
     elif args.action == "list":
         cmd_list(client, table=args.table)
         ok = True
+    elif args.action == "backup":
+        ok = cmd_backup(client, doc, args.backup)
     elif args.action == "rehearse":
         ok = cmd_rehearse(client, keep=args.keep)
     elif args.action == "apply":
-        applied = cmd_apply(client, doc, production=args.production)
+        applied = cmd_apply(client, doc, production=args.production, backup=args.backup)
         print("\nafter the apply: list again (read-only)")
-        _, again = cmd_list(client, table=doc["table"])
+        _, again = cmd_list(client, table=doc["table"], keep={x["sid"] for x in applied["sessions"]})
         again.pop("_ctx")
         before, after = Counter(doc["diagnosis_before"]), Counter(again["diagnosis_before"])
         print("\ndiagnosis, the list read before the apply vs now:")
@@ -1224,8 +1354,7 @@ def main_(argv=None):
     else:
         cmd_rollback(client, doc, production=args.production)
         ok = True
-    if not ok:
-        raise SystemExit(1)
+    return ok
 
 
 if __name__ == "__main__":

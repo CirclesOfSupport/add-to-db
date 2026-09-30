@@ -147,7 +147,7 @@ def test_differs_follows_the_merge():
 
 def test_sid_time_and_groups():
     assert G.sid_time(S9) == at("2026-09-29T16:54:00.675676+00:00")
-    assert G.group_of(S9, set()) == "began after the switch (rejected call)"
+    assert G.group_of(S9, {S9}) == G.REJECTED and G.group_of(S9, set()) == "began after the switch"
     assert G.group_of(f"{U1}2026-09-20T13:00:00-04:00", set()) == "began before the window"
     assert G.group_of(f"{U1}2026-09-27T13:00:00-04:00", set()) == "began in the window"
 
@@ -244,13 +244,65 @@ def test_plan_folds_every_call_of_every_checkin_in_scope(svc, monkeypatch):
     assert ss[A]["insert"] and ss[A]["row"]["wellnessDomain"] == "Physical"    # pre-switch add-to-db test call ignored
     assert [c["endpoint"] for c in ss[A]["calls"]][0].startswith("add-to-db before the switch")
     assert ss[D]["insert"] and ss[D]["rejected"] and ss[D]["calls"][0]["repaired"]
-    assert ss[D]["group"] == "began after the switch (rejected call)" and ss[C]["group"] == "began before the window"
+    assert ss[D]["group"] == G.REJECTED and ss[C]["group"] == "began before the window"
     by = {s["sid"]: s for s in plan["sessions"]}
     assert set(by) == {A, B, C, D} and by[B]["fps"] == "-2,5" and by[B]["n"] == 2
     assert plan["totals"] == {"insert": 2, "update": 2, "collapse": 1, "extra_rows": 1}
     assert plan["log_cutoff"] == CUTOFF.isoformat()
     assert all(w == [c for c in [f.name for f in RESPONSE_DATA_SCHEMA] if c in s["row"]] for s in by.values()
                for w in [s["write"]])                                    # every carried column is written
+
+
+def test_window_scope_rule_for_checkins_that_began_earlier(svc, monkeypatch):
+    """Began before the window: repaired only when its calls before the window fold to its stored row."""
+    monkeypatch.setattr(G, "load_svc", lambda client: svc)
+    ok_ = f"{U1}2026-09-20T13:00:00.5-04:00"       # stored row = its pre-window calls; a reply arrives in the window
+    old = f"{U2}2026-09-21T13:00:00.5-04:00"       # stored row already wrong before the window (a reply lost on 09-21)
+    may = f"{U3}2026-05-08T12:20:17.4-04:00"       # no call before the window in the log (the May session)
+    dup = "44444444-0000-0000-0000-0000000000042026-09-22T13:00:00.5-04:00"   # two stored rows
+    scope = [req(10, "2026-09-27T17:00:00+00:00", old_body(ok_, ok_[36:], reply="Yes", reply_t="2026-09-27T12:00:00-04:00")),
+             req(11, "2026-09-27T17:00:01+00:00", old_body(old, old[36:], reply="Yes", reply_t="2026-09-21T14:00:00-04:00")),
+             req(12, "2026-09-27T00:20:55+00:00", old_body(may, "2026-09-26T20:20:53-04:00", contactType="Subscribe")),
+             req(13, "2026-09-27T17:00:02+00:00", old_body(dup, dup[36:], reply="Yes", reply_t="2026-09-27T12:00:00-04:00"))]
+    history = [req(1, "2026-09-20T17:00:01+00:00", old_body(ok_, ok_[36:])),
+               req(2, "2026-09-21T17:00:01+00:00", old_body(old, old[36:])),
+               req(3, "2026-09-21T18:00:01+00:00", old_body(old, old[36:], reply="Yes", reply_t="2026-09-21T14:00:00-04:00")),
+               req(4, "2026-09-22T17:00:01+00:00", old_body(dup, dup[36:]))] + scope
+    history.sort(key=lambda r: (r["fired_at"], r["httplog_id"]))
+    stored = [_stored(ok_, datetime(2026, 9, 20, 17, 0, 0, 500000), 1),
+              _stored(old, datetime(2026, 9, 21, 17, 0, 0, 500000), 2),          # "No": the 09-21 reply was lost
+              _stored(may, None, 3, contactType="CheckIn"),
+              _stored(dup, datetime(2026, 9, 22, 17, 0, 0, 500000), 4), _stored(dup, datetime(2026, 9, 22, 17, 0, 0, 500000), 5)]
+    plan = G.build_plan(_BQ(scope, history, [], stored), "p.DEV.x")
+    ctx = plan.pop("_ctx")
+    assert set(ctx["sessions"]) == {ok_}
+    assert ctx["excluded"] == {old: "began before the window: stored row differs from its calls before the window",
+                               may: "began before the window: no call before the window in the log",
+                               dup: "began before the window: more than one stored row"}
+    assert ctx["sessions"][ok_]["changed"] == ["checkinReply", "checkinReplyDateTime"]
+    kept = G.build_plan(_BQ(scope, history, [], stored), "p.DEV.x", keep={old})
+    assert old in kept["_ctx"]["sessions"]                               # the verifying list keeps what was repaired
+
+
+def test_backup_checks_the_copy_and_prints_the_restore(capsys):
+    plan = {"table": "p.RESPONSES.t", "sessions": [{"sid": "a", "n": 2, "fps": "1,2"}, {"sid": "b", "n": 0, "fps": ""}]}
+
+    class _B:
+        def __init__(self, fps):
+            self.fps, self.sql = fps, []
+
+        def query(self, sql, job_config=None):
+            self.sql.append(sql)
+            if "FARM_FINGERPRINT" in sql:
+                return _Job([{"SessionID": "a", "gap_fp": f} for f in self.fps])
+            return _Job([])
+    b = _B([2, 1])
+    assert G.cmd_backup(b, plan, "early-alert-responses.DEV.gaprepair_backup_20260930") is True
+    out = capsys.readouterr().out
+    assert "BACKUP PASS: 2 rows" in out and "1 check-ins have no row yet" in out and "DELETE FROM `p.RESPONSES.t`" in out
+    assert G.cmd_backup(_B([1]), plan, "early-alert-responses.DEV.gaprepair_backup_20260930") is False
+    with pytest.raises(SystemExit, match="must be a DEV table"):
+        G.cmd_backup(_B([]), plan, "early-alert-responses.RESPONSES.x")
 
 
 def _world():
