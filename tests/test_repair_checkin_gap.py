@@ -634,3 +634,40 @@ def test_ct_day_without_a_time_zone_database(monkeypatch):
     monkeypatch.setattr(zoneinfo, "ZoneInfo", lambda k: (_ for _ in ()).throw(zoneinfo.ZoneInfoNotFoundError(k)))
     assert G.ct_day("2026-08-27") == datetime(2026, 8, 27, 5, 0, tzinfo=UTC)          # the Windows path: pytz
     assert G.ct_day("2026-11-02") == datetime(2026, 11, 2, 6, 0, tzinfo=UTC)
+
+
+def test_history_leaves_out_another_writers_columns_and_notes_two_domains(svc, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(G, "load_svc", lambda client: svc)
+    monkeypatch.chdir(tmp_path)
+    U = lambda n: f"{n:08d}-0000-0000-0000-{n:012d}"            # noqa: E731
+    Z = f"{U(1)}2026-09-18T09:00:00.5-05:00"     # a nightly job changed zipcode on the stored row
+    W = f"{U(2)}2026-09-18T09:00:00.5-05:00"     # two check-in questions, two domains; stored holds the first
+    reqs = [req(1, "2026-09-18T14:00:01+00:00", old_body(Z, Z[36:], zipcode="64050")),
+            req(2, "2026-09-18T14:00:02+00:00", old_body(W, W[36:], wellnessDomain="Physical")),
+            req(3, "2026-09-18T15:00:02+00:00", old_body(W, W[36:], wellnessDomain="Relational", reply="Yes",
+                                                         reply_t="2026-09-18T10:00:00-05:00"))]
+    utc = lambda v: G._aware(v).astimezone(G.UTC).replace(tzinfo=None)      # noqa: E731
+    stored = [_stored(Z, utc(Z[36:]), 1, zipcode="64055"),
+              _stored(W, utc(W[36:]), 2, wellnessDomain="Physical", checkinReply="Yes",
+                      checkinReplyDateTime=datetime(2026, 9, 18, 15, 0))]
+    for r in stored:
+        r.pop("gap_fp")
+    csv_ = __import__("csv")
+
+    def run(**kw):
+        for f in tmp_path.glob("history_*"):
+            f.unlink()
+        assert G.cmd_history(_HistBQ(reqs, stored), "2026-09-17", "2026-09-24", **kw)
+        return {r[0]: r for r in csv_.reader(open(next(tmp_path.glob("history_*.csv")), encoding="utf-8"))}, \
+            capsys.readouterr().out
+
+    rows, text = run()
+    assert rows[Z][3] == G.H_CLASSES[4] and rows[Z][17] == "zipcode"
+    assert rows[W][3] == G.H_CLASSES[2] and rows[W][15] == "2" and rows[W][16] == "True"
+    assert "wellnessDomain" not in rows[W][8].split("|")
+    assert "one row equal to no call: columns that differ from the closest call (check-ins): zipcode 1" in text
+    assert "two or more wellness domains in one check-in" in text and "another writer owns them): none" in text
+    rows, text = run(exclude=["zipcode"])
+    assert rows[Z][3] == G.H_CLASSES[2] and "another writer owns them): zipcode" in text
+    with pytest.raises(SystemExit):
+        G.cmd_history(_HistBQ(reqs, stored), "2026-09-17", "2026-09-24", exclude=["nosuchcolumn"])

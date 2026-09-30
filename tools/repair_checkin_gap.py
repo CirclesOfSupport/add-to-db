@@ -1342,23 +1342,37 @@ def _in_hole(t) -> str | None:
     return next((kind for a, b, kind in HOLES if t is not None and a <= t <= b), None)
 
 
-def snapshot_match(snaps: list[dict], row: dict) -> int | None:
-    """The index of the last call whose own values equal the stored row in every column the call carried."""
+def snapshot_match(snaps: list[dict], row: dict, skip=frozenset()) -> int | None:
+    """The index of the last call whose own values equal the stored row in every column the call carried
+    (columns in `skip` not compared)."""
     hit = None
     for i, snap in enumerate(snaps):
-        if all(same(row.get(c), v) for c, v in snap.items()):
+        if all(same(row.get(c), v) for c, v in snap.items() if c not in skip):
             hit = i
     return hit
 
 
-def history_session(sid, calls, rows, folded, types) -> dict:
-    """One check-in: which class of the old writer's failure its stored rows show, and in which columns."""
+def closest_diff(snaps: list[dict], row: dict, skip=frozenset()) -> list[str]:
+    """The columns in which the stored row differs from the call it agrees with most (latest on a tie)."""
+    best = None
+    for snap in snaps:
+        d = sorted(c for c, v in snap.items() if c not in skip and c != "SessionID" and not same(row.get(c), v))
+        if best is None or len(d) <= len(best):
+            best = d
+    return best or []
+
+
+def history_session(sid, calls, rows, folded, types, exclude=frozenset()) -> dict:
+    """One check-in: which class of the old writer's failure its stored rows show, and in which columns.
+    `exclude`: columns another writer owns, left out of every comparison. A check-in whose calls carry two or more
+    wellness domains (one session, two check-in questions: both writers store the last) also leaves wellnessDomain
+    out, and is counted as a data-model note."""
     valid = [c for c in calls if c["row"] is not None and not c["errors"] and not c["keyless"]]
     snaps = [c["snap"] for c in valid]
     out = {"sid": sid, "calls": len(calls), "rows": len(rows), "rejected_calls": sum(bool(c["errors"]) for c in calls),
            "guarded_calls": sum(c["guarded"] for c in valid), "exclude": None, "unlogged": None, "class": None,
            "match": None, "diff": [], "own_diff": [], "stale_reply": False, "time_blanked": False, "carried_then_null": [],
-           "yes_missing": False, "reply_differs": False}
+           "yes_missing": False, "reply_differs": False, "domains": 0, "domain_differs": False, "closest_diff": []}
     if any(c["endpoint"].startswith("add-to-db") for c in calls):
         out["exclude"] = "a call went to add-to-db (load test)"
         return out
@@ -1372,30 +1386,38 @@ def history_session(sid, calls, rows, folded, types) -> dict:
     if not valid:
         out["exclude"] = "every call rejected by preparation"
         return out
+    out["domains"] = len({s.get("wellnessDomain") for s in snaps if _reply(s.get("wellnessDomain")) is not None})
+    skip = set(exclude) | ({"wellnessDomain"} if out["domains"] >= 2 else set())
     new = folded
     old = snaps[-1]                                            # the old contract: the last call's own values
     out["stale_reply"] = any(not same(old.get(c), new.get(c)) for c in REPLY_FIELDS if c in old)
     out["time_blanked"] = old.get("checkinDateTime") is None and new.get("checkinDateTime") is not None
     out["carried_then_null"] = sorted({c for s in snaps for c, v in s.items()
-                                       if _reply(v) is not None and new.get(c) is None and c != "SessionID"})
+                                       if c not in skip and _reply(v) is not None and new.get(c) is None
+                                       and c != "SessionID"})
     want = _reply(new.get("checkinReply"))
     out["yes_missing"] = want == "Yes" and not any(r.get("checkinReply") == "Yes" for r in rows)
     out["reply_differs"] = bool(rows) and any(_reply(r.get("checkinReply")) != want for r in rows)
     if not rows:
         out["class"] = H_CLASSES[0]
         return out
-    out["diff"] = sorted({c for r in rows for c in new if c != "SessionID" and differs(r, new, c)})
-    out["own_diff"] = sorted({c for r in rows for c in old if c != "SessionID" and not same(r.get(c), old.get(c))})
+    out["domain_differs"] = out["domains"] >= 2 and any(not same(r.get("wellnessDomain"), old.get("wellnessDomain"))
+                                                         for r in rows)
+    out["diff"] = sorted({c for r in rows for c in new if c != "SessionID" and c not in skip and differs(r, new, c)})
+    out["own_diff"] = sorted({c for r in rows for c in old if c != "SessionID" and c not in skip
+                              and not same(r.get(c), old.get(c))})
     if len(rows) > 1:
         out["class"] = H_CLASSES[1]
         return out
-    out["match"] = snapshot_match(snaps, rows[0])
+    out["match"] = snapshot_match(snaps, rows[0], skip)
     out["class"] = (H_CLASSES[2] if out["match"] == len(snaps) - 1 else
                     H_CLASSES[3] if out["match"] is not None else H_CLASSES[4])
+    if out["class"] == H_CLASSES[4]:
+        out["closest_diff"] = closest_diff(snaps, rows[0], skip)
     return out
 
 
-def cmd_history(client, frm: str, to: str, table=TABLE, out=None) -> bool:
+def cmd_history(client, frm: str, to: str, table=TABLE, out=None, exclude=()) -> bool:
     """Read-only. The check-ins that began in [frm, to) (CT dates), rebuilt from every logged call and compared to
     the stored rows: the old writer's failures by class and column. Files stay on this machine."""
     p = lambda *a: print(*a, file=out)  # noqa: E731
@@ -1418,7 +1440,12 @@ def cmd_history(client, frm: str, to: str, table=TABLE, out=None) -> bool:
         cs.sort(key=lambda c: c["order"])
     folded = fold(schema, [c for cs in calls.values() for c in cs])
     stored = read_stored(client, table, sids, [f.name for f in schema])
-    res = [history_session(sid, calls[sid], stored.get(sid, []), folded.get(sid, {}), types) for sid in sids]
+    exclude = [c for c in exclude if c]
+    unknown_cols = [c for c in exclude if c not in types]
+    if unknown_cols:
+        raise SystemExit(f"--exclude names columns the table lacks: {', '.join(unknown_cols)}")
+    res = [history_session(sid, calls[sid], stored.get(sid, []), folded.get(sid, {}), types, frozenset(exclude))
+           for sid in sids]
 
     run = stamp()
     csv_path, sum_path = f"history_{frm}_{to}_{run}.csv", f"history_{frm}_{to}_{run}.txt"
@@ -1426,12 +1453,14 @@ def cmd_history(client, frm: str, to: str, table=TABLE, out=None) -> bool:
         w = csv.writer(f)
         w.writerow(["SessionID", "excluded", "unlogged", "class", "calls", "stored_rows", "rejected_calls",
                     "matched_call", "differs_from_fold", "differs_from_last_call", "stale_reply_stored",
-                    "checkin_time_blanked", "carried_then_null", "yes_missing", "reply_differs"])
+                    "checkin_time_blanked", "carried_then_null", "yes_missing", "reply_differs", "wellness_domains",
+                    "domain_differs", "no_call_closest_diff"])
         for x in res:
             w.writerow([x["sid"], x["exclude"] or "", x["unlogged"] or "", x["class"] or "", x["calls"], x["rows"],
                         x["rejected_calls"], "" if x["match"] is None else x["match"] + 1, "|".join(x["diff"]),
                         "|".join(x["own_diff"]), x["stale_reply"], x["time_blanked"], "|".join(x["carried_then_null"]),
-                        x["yes_missing"], x["reply_differs"]])
+                        x["yes_missing"], x["reply_differs"], x["domains"], x["domain_differs"],
+                        "|".join(x["closest_diff"])])
     done = [x for x in res if x["class"]]
     cls = Counter(x["class"] for x in done)
     exc = Counter(x["exclude"] for x in res if x["exclude"])
@@ -1439,11 +1468,14 @@ def cmd_history(client, frm: str, to: str, table=TABLE, out=None) -> bool:
     col = Counter(c for x in done for c in x["diff"])
     own = Counter(c for x in done for c in x["own_diff"])
     ctn = Counter(c for x in done for c in x["carried_then_null"])
+    near = Counter(c for x in done for c in x["closest_diff"])
+    multi = [x for x in done if x["domains"] >= 2]
     lines = [
         f"HISTORY {frm} to {to} (CT, session start) -- table {table}; calls read {start.isoformat()} to {read_to.isoformat()}",
         f"check-ins that began in the slice: {len(sids)}; calls without a session id fired in the slice: {keyless}",
         "not diagnosed: " + ("; ".join(f"{k} {n}" for k, n in exc.most_common()) or "none"),
         "unlogged (a session start or stored time inside a log hole): " + ("; ".join(f"{k} {n}" for k, n in unl.items()) or "none"),
+        "columns left out of every comparison (another writer owns them): " + (", ".join(exclude) or "none"),
         f"diagnosed: {len(done)}",
     ] + [f"  {k:<78} {cls.get(k, 0):>7}" for k in H_CLASSES] + [
         f"  reply differs from the rebuilt check-in                                       {sum(x['reply_differs'] for x in done):>7}",
@@ -1451,6 +1483,10 @@ def cmd_history(client, frm: str, to: str, table=TABLE, out=None) -> bool:
         f"  previous session's reply kept (the old contract has no stale guard)           {sum(x['stale_reply'] for x in done):>7}",
         f"  check-in time blanked by a later call (old contract)                          {sum(x['time_blanked'] for x in done):>7}",
         f"  calls rejected by preparation (the old writer answered 500 on these)          {sum(x['rejected_calls'] for x in res):>7}",
+        f"  data-model note: two or more wellness domains in one check-in                 {len(multi):>7}",
+        f"    of them, stored wellnessDomain is not the last call's                       {sum(x['domain_differs'] for x in multi):>7}",
+        "one row equal to no call: columns that differ from the closest call (check-ins): "
+        + (", ".join(f"{c} {n}" for c, n in near.most_common()) or "none"),
         "stored differs from the rebuilt check-in, by column (check-ins): "
         + (", ".join(f"{c} {n}" for c, n in col.most_common()) or "none"),
         "stored differs from the check-in's own last call, by column (check-ins): "
@@ -1482,6 +1518,7 @@ def main_(argv=None):
     ap.add_argument("--keep", action="store_true", help="rehearse: keep the clone, backup and loaded rows")
     ap.add_argument("--from", dest="frm", help="history: first CT date of the slice (YYYY-MM-DD)")
     ap.add_argument("--to", help="history: CT date after the slice (YYYY-MM-DD)")
+    ap.add_argument("--exclude", default="", help="history: comma-separated columns another writer owns")
     args = ap.parse_args(argv)
     if args.action in ("backup", "apply", "rollback"):
         if not args.file:
@@ -1522,7 +1559,7 @@ def _run(client, args, doc) -> bool:
     elif args.action == "history":
         if not (args.frm and args.to):
             raise SystemExit("history needs --from and --to")
-        ok = cmd_history(client, args.frm, args.to, table=args.table)
+        ok = cmd_history(client, args.frm, args.to, table=args.table, exclude=args.exclude.split(","))
     elif args.action == "backup":
         ok = cmd_backup(client, doc, args.backup)
     elif args.action == "rehearse":
