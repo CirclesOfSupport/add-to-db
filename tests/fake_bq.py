@@ -85,6 +85,10 @@ class FakeClient:
     get_table_calls: list = field(default_factory=list)  # table ids, one per get_table call
     append_calls: list = field(default_factory=list)     # kwargs of every insert_rows_json call (retry, timeout)
     before_append: list = field(default_factory=list)    # callables run inside the next insert_rows_json calls
+    # Tables on which ANOTHER transaction holds uncommitted changes. BigQuery lets one transaction at a
+    # time change rows in a table: a script statement that updates, merges into or deletes from a held
+    # table is cancelled; reads and INSERTs run alongside it.
+    held_tables: set = field(default_factory=set)
 
     # --- table management -------------------------------------------------
     def _name(self, table_id: str) -> str:
@@ -193,6 +197,9 @@ class FakeClient:
                     if not self.duck.execute("SELECT " + self._translate(expr, params)).fetchone()[0]:
                         raise RuntimeError("Assertion failed: " + part)
                     continue
+                mutated = re.match(r"(?:MERGE|UPDATE|DELETE FROM)\s+`([^`]+)`", part)
+                if mutated and mutated.group(1) in self.held_tables:
+                    raise RuntimeError(f"Transaction is aborted due to concurrent update against table {mutated.group(1)}")
                 if any(pat in part for pat in self.fail_always):
                     raise RuntimeError("Transaction is aborted due to concurrent update against table")
                 if self.fail_in_script and self.fail_in_script[0] in part:

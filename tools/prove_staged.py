@@ -60,7 +60,7 @@ def main_():
     if failed:
         raise SystemExit("DDL does not validate on BigQuery (nothing was created):\n  " + "\n  ".join(failed))
     print(f"DDL: {len(creates)} of {len(creates)} CREATE statements valid on BigQuery")
-    names = ("response_data", "users", "staging", "set_aside", "flush_log", "flush_state",
+    names = ("response_data", "users", "staging", "set_aside", "flush_log", "flush_state", "flush_state_users",
              "night_users", "night_response_data")
     try:
         _run(args, client, run, prefix, ds, rd, us, statements)
@@ -142,7 +142,7 @@ def _run(args, client, run, prefix, ds, rd, us, statements):
     secs = timing["last"]
     r = rows(f"SELECT checkinReply, checkinDateTime FROM `{rd}` WHERE SessionID = @s", s=sid(1))
     u = rows(f"SELECT checkinrepliestotal FROM `{us}` WHERE uuid = @u", u=UUID)
-    st = rows(f"SELECT version FROM `{config.FLUSH_STATE_TABLE}`")
+    st = [r for t in ("responses", "users") for r in rows(f"SELECT version FROM `{config.flush_state_table(t)}`")]
     check("2 last call wins, one row, watermark advanced",
           out["status"] == "ok" and len(r) == 1 and r[0]["checkinReply"] == "Yes" and r[0]["checkinDateTime"] == CHECKIN_UTC
           and u == [{"checkinrepliestotal": 2}] and sorted(x["version"] for x in st) == [1, 1],
@@ -266,11 +266,12 @@ def _run(args, client, run, prefix, ds, rd, us, statements):
                                       for t in h["targets"].values()) and h["set_aside_24h"] >= 1, h)
 
     # 8. maintenance pause
-    st_table = config.FLUSH_STATE_TABLE
+    st_tables = [config.flush_state_table(t) for t in ("responses", "users")]   # one state table per target
 
     def set_pause(on):
-        client.query(f"UPDATE `{st_table}` SET paused_since = {'CURRENT_TIMESTAMP()' if on else 'NULL'} "
-                     f"WHERE id LIKE 'flush:%'").result()
+        for st_table in st_tables:
+            client.query(f"UPDATE `{st_table}` SET paused_since = {'CURRENT_TIMESTAMP()' if on else 'NULL'} "
+                         f"WHERE id LIKE 'flush:%'").result()
     alert_s = config.BACKLOG_ALERT_S
     config.BACKLOG_ALERT_S = 1              # production 300 s; 1 s here so a few seconds of backlog counts as old
     try:

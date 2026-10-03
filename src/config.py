@@ -117,8 +117,9 @@ TYPE_CHECKERS = {
 # each validated call to STAGING_TABLE (durable before the 202) stamped with
 # its receive time; one flusher at a time (queue FLUSH_QUEUE at max
 # concurrency 1, plus a compare-and-set watermark in the same transaction as
-# the writes) folds everything received up to (now - FLUSH_SAFETY_S) into one
-# MERGE per target. Empty = every target keeps the per-call path.
+# the writes, in a state table of the target's own) folds everything received
+# up to (now - FLUSH_SAFETY_S) into one MERGE per target. Empty = every target
+# keeps the per-call path.
 STAGED_TARGETS: set[str] = {t.strip() for t in os.getenv("STAGED_TARGETS", "").split(",") if t.strip()}
 # The single writer's own tables live in OPS (operational objects serving backend jobs), never in
 # RESPONSES. An override may point them at DEV (staging deployments and proofs) or OPS, nothing else.
@@ -140,6 +141,43 @@ FLUSH_SAFETY_S = int(os.getenv("FLUSH_SAFETY_S", "20"))      # only calls receiv
 FLUSH_MAX_ITEMS = int(os.getenv("FLUSH_MAX_ITEMS", "300"))
 FLUSH_ALERT_AFTER = int(os.getenv("FLUSH_ALERT_AFTER", "3"))  # consecutive failed flushes before FLUSH_ALERT
 FLUSH_TARGET_ORDER = ["responses", "users"]   # check-in rows first; each target is its own transaction
+
+# One flush-state table PER TARGET. A flush transaction advances its target's watermark row, and
+# BigQuery lets only one transaction at a time change rows in a table, whichever rows they are. With
+# both targets' rows in one table, each target's transaction waited on the other's: on 2026-09-30 a
+# check-in flush whose MERGE had finished in 5 s then waited 651 s to update its watermark, kept its
+# transaction open on response_data past the request timeout, and eight flushes failed behind it.
+# The first target in FLUSH_TARGET_ORDER keeps FLUSH_STATE_TABLE; every other staged target has its
+# own table -- FLUSH_STATE_TABLE_<TARGET> if set, else "<FLUSH_STATE_TABLE>_<target>" -- holding the
+# one row "flush:<target>". The watermark update stays inside the write transaction (compare-and-set
+# on version), so nothing else about the single writer changes.
+FLUSH_STATE_TABLE_OVERRIDES: dict[str, str] = {
+    t: v for t in FLUSH_TARGET_ORDER[1:] if (v := os.getenv(f"FLUSH_STATE_TABLE_{t.upper()}", "").strip())}
+for _target, _table in FLUSH_STATE_TABLE_OVERRIDES.items():
+    if not _table.startswith((f"{PROJECT_ID}.OPS.", f"{PROJECT_ID}.DEV.")):
+        raise RuntimeError(f"FLUSH_STATE_TABLE_{_target.upper()}: '{_table}' must be a {PROJECT_ID}.OPS or "
+                           f"{PROJECT_ID}.DEV table")
+
+
+def flush_state_table(target: str) -> str:
+    """The table holding `target`'s watermark row (read at call time, so a tool may repoint FLUSH_STATE_TABLE)."""
+    if target == FLUSH_TARGET_ORDER[0]:
+        return FLUSH_STATE_TABLE
+    return FLUSH_STATE_TABLE_OVERRIDES.get(target) or f"{FLUSH_STATE_TABLE}_{target}"
+
+
+def check_flush_state_tables(targets=None) -> None:
+    """Refuse a configuration in which two staged targets would share a flush-state table."""
+    owners: dict[str, str] = {}
+    for target in sorted(STAGED_TARGETS if targets is None else targets):
+        table = flush_state_table(target)
+        if table in owners:
+            raise RuntimeError(f"flush state: targets '{owners[table]}' and '{target}' share the table '{table}'; "
+                               f"each staged target needs its own")
+        owners[table] = target
+
+
+check_flush_state_tables()
 # Per target, per cycle: how long a contended flush keeps retrying before the cycle moves on
 # (the queue and the next bucket retry it later). responses covers the ~65 s nightly vamc UPDATE
 # on response_data (2026-09-26); users is kept short so a contended users flush cannot hold the

@@ -32,9 +32,10 @@ def sid_body(n, reply="Yes"):
 
 
 def set_pause(svc, since):
-    svc.fake.duck.execute(
-        f"UPDATE {svc.fake._name(config.FLUSH_STATE_TABLE)} SET paused_since = "
-        + ("NULL" if since is None else f"CAST('{since.isoformat()}' AS TIMESTAMPTZ)"))
+    for target in ("responses", "users"):
+        svc.fake.duck.execute(
+            f"UPDATE {svc.fake._name(config.flush_state_table(target))} SET paused_since = "
+            + ("NULL" if since is None else f"CAST('{since.isoformat()}' AS TIMESTAMPTZ)"))
 
 
 # --- the flush reads each schema once --------------------------------------------------------

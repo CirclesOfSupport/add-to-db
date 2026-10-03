@@ -32,13 +32,13 @@ def staged(svc, monkeypatch):
                                          F("to_wm", "TIMESTAMP"), F("items", "INT64"), F("statements", "INT64"),
                                          F("dead_letters", "INT64"), F("attempts", "INT64"), F("status", "STRING"),
                                          F("error", "STRING"), F("refs", "STRING", mode="REPEATED")])
-    fake.create(config.FLUSH_STATE_TABLE, [F("id", "STRING"), F("watermark", "TIMESTAMP"),
-                                           F("version", "INT64"), F("updated_at", "TIMESTAMP"),
-                                           F("paused_since", "TIMESTAMP")])
-    for target in ("responses", "users"):
-        fake.insert_raw(config.FLUSH_STATE_TABLE, {"id": f"flush:{target}", "updated_at": None, "version": 0,
-                                                   "watermark": datetime(1970, 1, 1, tzinfo=timezone.utc),
-                                                   "paused_since": None})
+    for target in ("responses", "users"):                      # one state table per target, one row each
+        fake.create(config.flush_state_table(target), [F("id", "STRING"), F("watermark", "TIMESTAMP"),
+                                                       F("version", "INT64"), F("updated_at", "TIMESTAMP"),
+                                                       F("paused_since", "TIMESTAMP")])
+        fake.insert_raw(config.flush_state_table(target), {"id": f"flush:{target}", "updated_at": None, "version": 0,
+                                                           "watermark": datetime(1970, 1, 1, tzinfo=timezone.utc),
+                                                           "paused_since": None})
     monkeypatch.setattr(config, "STAGED_TARGETS", {"users", "responses"})
     clock = [0.0]                                  # sleeping advances a fake clock, so retry budgets run out
     monkeypatch.setattr(svc.time_module, "sleep", lambda secs: clock.__setitem__(0, clock[0] + secs))
@@ -66,7 +66,7 @@ def resp_rows(svc):
 
 
 def state(svc, target="responses"):
-    return next(r for r in svc.fake.rows(config.FLUSH_STATE_TABLE) if r["id"] == f"flush:{target}")
+    return next(r for r in svc.fake.rows(config.flush_state_table(target)) if r["id"] == f"flush:{target}")
 
 
 def test_upsert_stages_both_halves_durably_and_kicks_one_flush(staged):

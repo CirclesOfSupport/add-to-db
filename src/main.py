@@ -941,11 +941,13 @@ def _state_id(target: str) -> str:
 
 def _read_flush_state(target: str) -> dict:
     rows = list(client.query(
-        f"SELECT watermark, version, paused_since FROM {quote_identifier(config.FLUSH_STATE_TABLE)} WHERE id = @id",
+        f"SELECT watermark, version, paused_since FROM {quote_identifier(config.flush_state_table(target))} "
+        f"WHERE id = @id",
         job_config=bigquery.QueryJobConfig(query_parameters=[
             bigquery.ScalarQueryParameter("id", "STRING", _state_id(target))])).result())
     if len(rows) != 1:
-        raise RuntimeError(f"flush state must hold exactly one row with id '{_state_id(target)}', found {len(rows)}")
+        raise RuntimeError(f"flush state table {config.flush_state_table(target)} must hold exactly one row with id "
+                           f"'{_state_id(target)}', found {len(rows)}")
     return {"watermark": rows[0]["watermark"], "version": rows[0]["version"], "paused_since": rows[0]["paused_since"]}
 
 
@@ -1020,7 +1022,14 @@ def _ref(row: dict) -> str:
 
 
 def _flush_target_once(target: str, now, flush_id: str, started, attempt: int) -> dict:
-    """One attempt: read, fold and write one target's calls in ONE transaction with its own watermark."""
+    """
+    One attempt: read, fold and write one target's calls in ONE transaction with its own watermark.
+
+    The transaction changes rows in two tables only: the target table and the target's own state
+    table (config.flush_state_table). Everything else it touches is an INSERT (set-aside, flush log),
+    which BigQuery runs alongside any other transaction. So no other target's flush can make this
+    one wait, and this one cannot hold another target's tables.
+    """
     cutoff = (now or _dt.now(_tz.utc)) - _td(seconds=config.FLUSH_SAFETY_S)
     state = _read_flush_state(target)
     watermark = state["watermark"]
@@ -1056,7 +1065,7 @@ def _flush_target_once(target: str, now, flush_id: str, started, attempt: int) -
         f"(flush_id, target, started_at, finished_at, from_wm, to_wm, items, statements, dead_letters, attempts, status, error, refs) "
         f"VALUES (@flush_id, @target, @started, CURRENT_TIMESTAMP(), @wm, @cutoff, @n_items, @n_statements, @n_dead, @attempt, 'ok', NULL, @refs)")
     script.append(
-        f"UPDATE {quote_identifier(config.FLUSH_STATE_TABLE)} "
+        f"UPDATE {quote_identifier(config.flush_state_table(target))} "   # this target's own state table
         f"SET watermark = @cutoff, version = version + 1, updated_at = CURRENT_TIMESTAMP() "
         f"WHERE id = @state_id AND version = @version AND paused_since IS NULL")
     script.append("ASSERT @@row_count = 1 AS 'flush watermark was moved by another writer'")
