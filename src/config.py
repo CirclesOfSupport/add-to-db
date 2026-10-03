@@ -186,6 +186,23 @@ FLUSH_RETRY_BUDGET_S: dict[str, float] = {
     "responses": float(os.getenv("FLUSH_RETRY_BUDGET_RESPONSES_S", "75")),
     "users": float(os.getenv("FLUSH_RETRY_BUDGET_USERS_S", "20")),
 }
+# How long one flush transaction may run before it is stopped. On 2026-09-30 one statement inside a
+# check-in flush's transaction (the watermark update, after the MERGE had finished) ran 651 s and ended
+# in a BigQuery internal error. Nothing bounded it: the request was cut at 300 s, the script went on
+# holding its transaction open on response_data, and every check-in flush behind it was cancelled
+# until it ended (11 minutes). Each flush script now carries this limit as its BigQuery job timeout,
+# and the flusher stops waiting FLUSH_JOB_TIMEOUT_GRACE_S after it and asks BigQuery to cancel the
+# job; a transaction that does not commit is rolled back. Both targets run in one request, so the two
+# limits and their grace must fit inside the service's request timeout (FLUSH_REQUEST_TIMEOUT_S).
+FLUSH_JOB_TIMEOUT_S: dict[str, float] = {
+    "responses": float(os.getenv("FLUSH_JOB_TIMEOUT_RESPONSES_S", "140")),
+    "users": float(os.getenv("FLUSH_JOB_TIMEOUT_USERS_S", "90")),
+}
+FLUSH_JOB_TIMEOUT_GRACE_S = float(os.getenv("FLUSH_JOB_TIMEOUT_GRACE_S", "10"))
+FLUSH_REQUEST_TIMEOUT_S = float(os.getenv("FLUSH_REQUEST_TIMEOUT_S", "300"))
+if sum(FLUSH_JOB_TIMEOUT_S.values()) + 2 * FLUSH_JOB_TIMEOUT_GRACE_S + 30 > FLUSH_REQUEST_TIMEOUT_S:
+    raise RuntimeError("FLUSH_JOB_TIMEOUT_*_S: the two flush limits, their grace and 30 s for the reads must fit "
+                       "inside FLUSH_REQUEST_TIMEOUT_S")
 FLUSH_BACKOFF_BASE_S = float(os.getenv("FLUSH_BACKOFF_BASE_S", "1"))
 FLUSH_BACKOFF_CAP_S = float(os.getenv("FLUSH_BACKOFF_CAP_S", "15"))
 

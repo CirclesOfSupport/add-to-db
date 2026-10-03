@@ -152,3 +152,63 @@ def test_an_override_names_the_users_state_table(monkeypatch):
 def test_a_users_state_table_outside_ops_or_dev_is_refused(monkeypatch, value):
     with pytest.raises(RuntimeError, match="FLUSH_STATE_TABLE_USERS"):
         _load(monkeypatch, {"FLUSH_STATE_TABLE_USERS": value})
+
+
+# --- a flush transaction has a limit on how long it may run ------------------------------------------
+
+def flush_jobs(svc) -> dict:
+    return {j.params["target"].value: j for j in svc.fake.statements if j.sql.lstrip().startswith("BEGIN TRANSACTION")}
+
+
+def test_every_flush_script_carries_its_targets_job_timeout(staged):
+    stage(staged, BOTH, T0)
+    staged.run_flush_cycle(now=NOW)
+    jobs = flush_jobs(staged)
+    for target in ("responses", "users"):
+        limit = config.FLUSH_JOB_TIMEOUT_S[target]
+        assert int(jobs[target].job_config.job_timeout_ms) == int(limit * 1000)
+        assert jobs[target].result_timeouts == [limit + config.FLUSH_JOB_TIMEOUT_GRACE_S]
+
+
+def test_a_hung_check_in_transaction_is_cancelled_and_the_users_flush_still_runs(staged, caplog):
+    stage(staged, BOTH, T0)
+    staged.fake.hang_scripts.add("RESPONSES.response_data")           # a statement inside the check-in script hangs
+    with pytest.raises(staged.FlushFailed) as info:
+        staged.run_flush_cycle(now=NOW)
+    hung = flush_jobs(staged)["responses"]
+    assert hung.cancelled                                              # BigQuery was asked to stop it
+    assert "timed out after 140 s" in info.value.errors["responses"] and "asked to cancel" in info.value.errors["responses"]
+    assert resp_rows(staged) == [] and state(staged, "responses")["version"] == 0      # nothing written, watermark kept
+    assert info.value.results["users"]["status"] == "ok" and state(staged, "users")["version"] == 1
+    failed = [x for x in staged.fake.rows(config.FLUSH_LOG_TABLE) if x["status"] == "failed"]
+    assert [(x["target"], "timed out" in x["error"]) for x in failed] == [("responses", True)]
+    staged.fake.hang_scripts.clear()                                   # the next flush takes the same calls
+    out = staged.run_flush_cycle(now=NOW + timedelta(seconds=30))
+    assert out["targets"]["responses"]["items"] == 1 and len(resp_rows(staged)) == 1
+
+
+def test_a_hung_transaction_is_not_retried_inside_the_same_request(staged):
+    stage(staged, BOTH, T0)
+    staged.fake.hang_scripts.add("RESPONSES.response_data")
+    real = staged._run_flush_script
+
+    def hang_takes_its_limit(target, sql, params):                     # the fake clock: a hang costs its whole limit
+        try:
+            return real(target, sql, params)
+        except staged.FlushTimedOut:
+            staged.clock[0] += config.FLUSH_JOB_TIMEOUT_S[target] + config.FLUSH_JOB_TIMEOUT_GRACE_S
+            raise
+    staged._run_flush_script = hang_takes_its_limit
+    with pytest.raises(staged.FlushFailed):
+        staged.run_flush_cycle(now=NOW)
+    staged._run_flush_script = real
+    attempts = [j for j in staged.fake.statements if j.sql.lstrip().startswith("BEGIN TRANSACTION")
+                and j.params["target"].value == "responses"]
+    assert len(attempts) == 1                                          # one hang per request, so both targets still fit
+
+
+def test_flush_limits_that_do_not_fit_in_the_request_are_refused(monkeypatch):
+    with pytest.raises(RuntimeError, match="FLUSH_JOB_TIMEOUT"):
+        _load(monkeypatch, {"FLUSH_JOB_TIMEOUT_RESPONSES_S": "200", "FLUSH_JOB_TIMEOUT_USERS_S": "90"})
+    c = _load(monkeypatch, {})
+    assert sum(c.FLUSH_JOB_TIMEOUT_S.values()) + 2 * c.FLUSH_JOB_TIMEOUT_GRACE_S + 30 <= c.FLUSH_REQUEST_TIMEOUT_S

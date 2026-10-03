@@ -1084,13 +1084,40 @@ def _flush_target_once(target: str, now, flush_id: str, started, attempt: int) -
         bigquery.ScalarQueryParameter("version", "INT64", state["version"]),
         bigquery.ArrayQueryParameter("refs", "STRING", [_ref(r) for r in staged]),
     ]
-    client.query(";\n".join(script) + ";", job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
+    _run_flush_script(target, ";\n".join(script) + ";", params)
     if dead:
         raise_alert("SET_ASIDE", f"{len(dead)} {target} call(s) set aside, not written, at flush {flush_id}; "
                                  f"first reason: {str(dead[0]['errors'])[:300]}")
     return {"status": "ok", "items": len(staged), "statements": len(statements), "dead_letters": len(dead),
             "rows": plan["rows"], "keys": plan["keys"], "keyless": plan["keyless"],
             "watermark": watermark, "cutoff": cutoff, "more": more}
+
+
+class FlushTimedOut(RuntimeError):
+    """A flush transaction ran past its limit; BigQuery was asked to cancel it."""
+
+
+def _run_flush_script(target: str, sql: str, params: list) -> None:
+    """
+    Run one flush transaction with a limit on how long it may run (config.FLUSH_JOB_TIMEOUT_S).
+    The limit goes to BigQuery as the job's own timeout; if the job is still running a grace period
+    after it, we stop waiting, ask BigQuery to cancel it and fail this attempt ("timed out" is
+    retried by the queue). A script that outlives its request holds its transaction open on the
+    target table, and every later flush of that target is cancelled until it ends.
+    """
+    limit = config.FLUSH_JOB_TIMEOUT_S.get(target, 120.0)
+    job = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params,
+                                                               job_timeout_ms=int(limit * 1000)))
+    try:
+        job.result(timeout=limit + config.FLUSH_JOB_TIMEOUT_GRACE_S)
+    except TimeoutError:
+        job_id = getattr(job, "job_id", None)
+        try:
+            job.cancel()
+            asked = "BigQuery was asked to cancel it"
+        except Exception as exc:
+            asked = f"the cancel request failed ({_reason(exc)})"
+        raise FlushTimedOut(f"{target}: the flush transaction timed out after {limit:.0f} s; {asked} [job {job_id}]")
 
 
 def flush_target(target: str, now=None, budget_s: float | None = None) -> dict:

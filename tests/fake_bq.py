@@ -68,9 +68,20 @@ class FakeJob:
     sql: str
     params: dict
     rows: list = field(default_factory=list)
+    job_config: object = None
+    job_id: str = "fake-job"
+    hang: bool = False            # the job never finishes: result() runs out of its timeout
+    cancelled: bool = False
+    result_timeouts: list = field(default_factory=list)
 
-    def result(self, *args, **kwargs):
+    def result(self, *args, timeout=None, **kwargs):
+        self.result_timeouts.append(timeout)
+        if self.hang:
+            raise TimeoutError("Operation did not complete within the designated timeout.")
         return self.rows
+
+    def cancel(self):
+        self.cancelled = True
 
 
 @dataclass
@@ -89,6 +100,8 @@ class FakeClient:
     # time change rows in a table: a script statement that updates, merges into or deletes from a held
     # table is cancelled; reads and INSERTs run alongside it.
     held_tables: set = field(default_factory=set)
+    # Substrings: a script containing one never finishes and changes nothing (a statement hung inside it).
+    hang_scripts: set = field(default_factory=set)
 
     # --- table management -------------------------------------------------
     def _name(self, table_id: str) -> str:
@@ -123,11 +136,14 @@ class FakeClient:
         params = {}
         for p in (job_config.query_parameters if job_config else []):
             params[p.name] = p
-        job = FakeJob(sql, params)
+        job = FakeJob(sql, params, job_config=job_config)
         self.statements.append(job)
         if self.fail_next:
             raise self.fail_next.pop(0)
         if sql.lstrip().startswith("BEGIN TRANSACTION"):
+            if any(pat in sql for pat in self.hang_scripts):
+                job.hang = True
+                return job
             self._run_script(sql, params)
             return job
         if sql.lstrip().upper().startswith("SELECT"):
