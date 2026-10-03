@@ -181,7 +181,9 @@ def test_a_fresh_backlog_does_not_alert(staged, caplog):
 def test_a_planned_pause_is_not_an_alert_and_writes_nothing(staged, caplog):
     now = datetime.now(timezone.utc)
     set_pause(staged, now - timedelta(minutes=10))
-    stage(staged, [("responses", sid_body(1)), ("users", {"uuid": UUID})], now - timedelta(minutes=20))
+    # a backlog well past the alert line, whatever the flush interval is set to
+    stage(staged, [("responses", sid_body(1)), ("users", {"uuid": UUID})],
+          now - timedelta(seconds=config.BACKLOG_ALERT_S + 600))
     with caplog.at_level(logging.WARNING):
         assert staged.sweep_check(now) == []
         out = staged.run_flush_cycle(now=now)

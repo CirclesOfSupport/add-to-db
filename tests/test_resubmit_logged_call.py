@@ -80,14 +80,86 @@ def out(svc) -> str:
     return "\n".join(svc.said)
 
 
+def part_line(svc, target) -> str:
+    return next(x for x in svc.said if x.startswith(f"  {target}"))
+
+
+# --- rule 1: a users half is never a send ----------------------------------------------------------------
+
+def test_a_users_half_is_never_a_send(lost):
+    """No later call and no users row at all: still not sent. And it stays out of a request that sends another part."""
+    lost.log(101, json.dumps({"tables": [{"table": "users", "data": {"uuid": UUID, "orgID": "8",
+                                                                     "checkInRepliesTotal": "33"}}]}))
+    assert lost.run(101, "--post") == 3
+    assert "NOT SENT: users is kept by the nightly contact sync" in part_line(lost, "users")
+    assert "to send: 0 of 1 part(s)" in out(lost) and "NOTHING TO SEND" in out(lost)
+    assert lost.sent == [] and lost.fake.rows(config.STAGING_TABLE) == [] and lost.fake.rows(lost.table("users")) == []
+    lost.log(102, json.dumps(both()))
+    assert lost.run(102, "--post") == 0
+    assert [t["table"] for t in lost.sent[0]["json"]["tables"]] == ["responses"]
+    lost.flush()
+    assert lost.fake.rows(lost.table("users")) == [] and len(resp_rows(lost)) == 1
+
+
+def test_a_users_half_costs_no_read(lost):
+    lost.log(101, json.dumps({"tables": [{"table": "users", "data": {"uuid": UUID}}]}))
+    lost.fake.statements.clear()
+    lost.run(101)
+    touched = " ".join(j.sql for j in lost.fake.statements)
+    assert "adb_staging" not in touched and "RESPONSES.users" not in touched
+
+
+# --- rule 2: a check-in whose row already equals the call has landed ------------------------------------------
+
+def test_a_check_in_whose_row_already_equals_the_call_is_reported_as_landed(lost):
+    """The lost call carries what an earlier call of the session already wrote: landed, never offered as a send."""
+    stage(lost, [("responses", body(CHECKIN, "Yes"))], FIRED - timedelta(seconds=27))
+    lost.flush(at=FIRED - timedelta(seconds=27))
+    lost.log(101, json.dumps(both(reply="Yes")))
+    assert lost.run(101, "--post") == 3
+    assert "LANDED: the stored row already equals the call in all" in part_line(lost, "responses")
+    assert "to send: 0 of 2 part(s)" in out(lost) and lost.sent == []
+    assert lost.run(101, "--verify") == 0 and "VERIFY PASS" in out(lost)
+
+
+def test_landed_is_judged_the_way_the_service_writes_a_carried_over_reply(lost):
+    """A call carrying the PREVIOUS session's reply is written as not replied; a row without the reply equals it."""
+    stale = body(CHECKIN, "Yes", checkinReplyDateTime="2026-09-11T10%3A00%3A00-04%3A00", checkinReplyNumerical="7")
+    stage(lost, [("responses", stale)], FIRED - timedelta(seconds=27))
+    lost.flush(at=FIRED - timedelta(seconds=27))
+    assert resp_rows(lost)[0]["checkinReply"] is None                      # the service's own guard
+    lost.log(101, json.dumps({"tables": [{"table": "responses", "data": stale}]}))
+    assert lost.run(101) == 3 and "LANDED" in part_line(lost, "responses")
+
+
+def test_a_row_that_differs_is_offered_with_the_columns_that_differ(lost):
+    stage(lost, [("responses", body(CHECKIN, "No"))], FIRED - timedelta(seconds=27))      # the session's earlier call
+    lost.flush(at=FIRED - timedelta(seconds=27))
+    lost.log(101, json.dumps(both(reply="Yes")))
+    assert lost.run(101) == 0
+    line = part_line(lost, "responses")
+    assert "SEND: no later call for this SessionID has been accepted since it fired" in line
+    assert "columns differ from the stored row (checkinReply: the call has 'Yes', the row has 'No')" in line
+    assert "to send: 1 of 2 part(s) (responses)" in out(lost)
+
+
+def test_a_json_column_is_compared_as_json(lost):
+    msg = {"table": "triage_data", "data": {"message_id": "m-json", "message": "hello", "classifier_details": {}}}
+    lost.fake.insert_raw(lost.table("triage_data"), {"message_id": "m-json", "message": "hello", "classifier_details": "{}"})
+    lost.log(401, json.dumps(msg), status=None, line="Connection Error", flow="LIVE: Unrecognized Message")
+    assert lost.run(401, "--post") == 3
+    assert "LANDED" in part_line(lost, "triage_data") and lost.sent == [] and lost.queued == []
+
+
 # --- a valid body ---------------------------------------------------------------------------------
 
 def test_without_post_the_plan_is_shown_and_nothing_is_sent(lost):
     lost.log(101, json.dumps(both()))
     assert lost.run(101) == 0
     text = out(lost)
-    assert "body: valid JSON as logged" in text and "to send: 2 of 2 part(s) (users, responses)" in text
-    assert f"SessionID = {SID_DECODED}" in text and "PLAN ONLY: nothing was sent" in text
+    assert "body: valid JSON as logged" in text and "to send: 1 of 2 part(s) (responses)" in text
+    assert f"SessionID = {SID_DECODED}" in text and "no stored row for this key" in text
+    assert "PLAN ONLY: nothing was sent" in text
     assert lost.sent == [] and lost.fake.rows(config.STAGING_TABLE) == []
 
 
@@ -97,41 +169,30 @@ def test_a_valid_body_is_sent_lands_and_verifies(lost):
     assert "HTTP 202" in out(lost) and "SENT: accepted (202)" in out(lost)
     assert [s["url"] for s in lost.sent] == [URL]
     assert lost.sent[0]["headers"]["X-Webhook-Secret"] == SECRET and SECRET not in out(lost)
-    assert lost.sent[0]["json"] == both()                                    # the logged body, part for part
+    assert lost.sent[0]["json"] == {"tables": [both()["tables"][1]]}        # the logged responses part, as logged
+    assert lost.run(101, "--verify") == 0                                   # accepted, not flushed yet: nothing left to send
+    assert "SUPERSEDED" in part_line(lost, "responses")
     lost.flush()
     r = resp_rows(lost)
     assert len(r) == 1 and r[0]["checkinReply"] == "Yes" and r[0]["checkinDateTime"] == CHECKIN_UTC
-    assert lost.fake.rows(lost.table("users"))[0]["checkinrepliestotal"] == 33
     assert lost.run(101, "--verify") == 0
-    text = out(lost)
-    assert "VERIFY PASS" in text and text.count("-> VERIFIED") == 2 and "re-submitted call accepted at" in text
+    assert "VERIFY PASS" in out(lost) and "LANDED" in part_line(lost, "responses")
 
 
 def test_verify_before_anything_landed_fails(lost):
     lost.log(101, json.dumps(both()))
     assert lost.run(101, "--verify") == 1
-    assert "0 stored rows, expected exactly 1 -> NOT VERIFIED" in out(lost) and "VERIFY FAIL" in out(lost)
-
-
-def test_verify_names_a_column_that_differs(lost):
-    lost.log(101, json.dumps(both()))
-    lost.run(101, "--post")
-    lost.flush()
-    lost.fake.duck.execute(f"UPDATE {lost.fake._name(lost.table('responses'))} SET \"wellnessDomain\" = 'Physical'")
-    assert lost.run(101, "--verify") == 1
-    assert "wellnessDomain: the call has 'Relational', the row has 'Physical'" in out(lost)
+    assert "no stored row for this key" in out(lost) and "VERIFY FAIL: a part has not landed" in out(lost)
 
 
 # --- a body the webhook template broke ---------------------------------------------------------------
 
-BROKEN = '''{
+BROKEN = """{
   "tables": [
     {
       "table": "users",
       "data": {
-        "uuid": "%s",
-        "orgCode": "She said "keep going" \\ always
-and meant it"
+        "uuid": "%s"
       }
     },
     {
@@ -140,12 +201,14 @@ and meant it"
         "uuid": "%s",
         "sessionID": "%s",
         "checkinDateTime": "%s",
+        "orgCode": "She said "keep going" \\ always
+and meant it",
         "checkinReply": "Yes",
         "userWeek": "76"
       }
     }
   ]
-}''' % (UUID, UUID, SID, CHECKIN)
+}""" % (UUID, UUID, SID, CHECKIN)
 RAW_VALUE = 'She said "keep going" \\ always\nand meant it'
 
 
@@ -159,9 +222,8 @@ def test_a_broken_body_is_repaired_proven_sent_and_lands_with_the_raw_text(lost)
     assert "string values identical to the raw text: 9 of 9" in text and "byte-identical: yes" in text
     assert lost.sent[0]["json"]["tables"][0]["data"]["orgCode"] == RAW_VALUE
     lost.flush()
-    assert lost.fake.rows(lost.table("users"))[0]["orgCode"] == RAW_VALUE
-    assert len(resp_rows(lost)) == 1 and resp_rows(lost)[0]["userWeek"] == 76
-    assert lost.run(202, "--verify") == 0
+    assert resp_rows(lost)[0]["orgCode"] == RAW_VALUE and resp_rows(lost)[0]["userWeek"] == 76
+    assert lost.run(202, "--verify") == 0 and "LANDED" in part_line(lost, "responses")
 
 
 def test_a_body_that_cannot_be_repaired_stops_the_run(lost):
@@ -173,81 +235,71 @@ def test_a_body_that_cannot_be_repaired_stops_the_run(lost):
 # --- the service's own 400 --------------------------------------------------------------------------
 
 def test_a_call_the_service_rejects_again_is_reported_not_accepted(lost):
-    bad = {"tables": [{"table": "users", "data": {"uuid": UUID, "userWeek": "not-a-number"}}]}
+    bad = {"tables": [{"table": "responses", "data": body(CHECKIN, "Yes", userWeek="not-a-number")}]}
     lost.log(301, json.dumps(bad), status=400, line="HTTP/2.0 400 Bad Request")
     assert lost.run(301, "--post") == 1
     text = out(lost)
+    assert "could not be compared with a stored row" in part_line(lost, "responses")
     assert "HTTP 400" in text and "NOT ACCEPTED: HTTP 400" in text and "userWeek" in text
-    assert lost.fake.rows(lost.table("users")) == []
+    assert resp_rows(lost) == []
 
 
-# --- a later accepted call supersedes a part ------------------------------------------------------------
-
-def test_a_part_with_a_later_accepted_call_is_not_sent(lost):
-    lost.log(101, json.dumps(both(reply="No")))
-    # two days later the same contact checked in again (another session): the users row is newer than the lost call
-    stage(lost, [("users", {"uuid": UUID, "checkInRepliesTotal": "35"})], FIRED + timedelta(days=2))
-    lost.flush(at=FIRED + timedelta(days=2))
-    assert lost.run(101, "--post") == 0
-    text = out(lost)
-    assert "users        uuid = " + UUID + "  ->  SUPERSEDED: 1 later call(s)" in text
-    assert "to send: 1 of 2 part(s) (responses)" in text
-    assert [t["table"] for t in lost.sent[0]["json"]["tables"]] == ["responses"]
-    lost.flush()
-    assert lost.fake.rows(lost.table("users"))[0]["checkinrepliestotal"] == 35         # not put back to 33
-    assert resp_rows(lost)[0]["checkinReply"] == "No"
-    assert lost.run(101, "--verify") == 0
-    assert "users        not compared: superseded, never re-submitted" in out(lost)
-
+# --- a later accepted call supersedes a responses part -----------------------------------------------------
 
 def test_an_earlier_call_of_the_session_does_not_supersede(lost):
-    stage(lost, [("responses", body(CHECKIN, "No"))], FIRED - timedelta(seconds=27))   # the session's earlier call landed
+    stage(lost, [("responses", body(CHECKIN, "No"))], FIRED - timedelta(seconds=27))   # staged, not yet flushed
     lost.log(101, json.dumps(both(reply="Yes")))
     assert lost.run(101) == 0
-    assert "to send: 2 of 2 part(s)" in out(lost)
+    assert "to send: 1 of 2 part(s) (responses)" in out(lost)
 
 
 def test_a_session_id_logged_plain_and_staged_encoded_is_one_session(lost):
     plain = both()
     plain["tables"][1]["data"]["sessionID"] = SID_DECODED                       # as the template sent it before encoding
     lost.log(101, json.dumps(plain))
-    stage(lost, [("responses", body(CHECKIN, "Yes"))], FIRED + timedelta(minutes=3))   # the later call, url-encoded
-    assert lost.run(101) == 0
+    stage(lost, [("responses", body(CHECKIN, "No"))], FIRED + timedelta(minutes=3))    # the later call, url-encoded
+    assert lost.run(101) == 3
     assert "responses    SessionID = " + SID_DECODED + "  ->  SUPERSEDED" in out(lost)
 
 
-def test_every_part_superseded_sends_nothing_and_exits_3(lost):
-    lost.log(101, json.dumps(both()))
-    stage(lost, [("users", {"uuid": UUID}), ("responses", body(CHECKIN, "Yes"))], FIRED + timedelta(minutes=5))
+def test_a_later_accepted_call_supersedes_and_its_values_stay(lost):
+    lost.log(101, json.dumps(both(reply="No")))
+    stage(lost, [("responses", body(CHECKIN, "Yes"))], FIRED + timedelta(minutes=5))
+    lost.flush(at=FIRED + timedelta(minutes=5))
     assert lost.run(101, "--post") == 3
+    assert "SUPERSEDED: 1 later call(s) for this SessionID were accepted" in part_line(lost, "responses")
     assert "NOTHING TO SEND" in out(lost) and lost.sent == []
+    assert resp_rows(lost)[0]["checkinReply"] == "Yes"                          # not put back to No
 
 
 def test_sending_twice_sends_once(lost):
     lost.log(101, json.dumps(both()))
     assert lost.run(101, "--post") == 0
     assert lost.run(101, "--post") == 3                                         # the first send is now the later call
-    assert len(lost.sent) == 1
-
-
-def test_verify_does_not_compare_once_a_later_call_follows_the_resubmission(lost):
-    lost.log(101, json.dumps(both(reply="No")))
-    lost.run(101, "--post")
-    stage(lost, [("responses", body(CHECKIN, "Yes"))], datetime.now(timezone.utc) + timedelta(seconds=5))
     lost.flush()
-    assert lost.run(101, "--verify") == 0
-    assert "responses    not compared: 1 call(s) accepted after the re-submission" in out(lost)
+    assert lost.run(101, "--post") == 3 and "LANDED" in part_line(lost, "responses")
+    assert len(lost.sent) == 1
 
 
 # --- the other tables are written by key ---------------------------------------------------------------
 
-def test_a_triage_part_is_sent_on_the_per_call_path(lost):
+def test_a_triage_part_with_no_row_is_sent_on_the_per_call_path(lost):
     msg = {"table": "triage_data", "data": {"message_id": "20260930151630123456-000001", "uuid": UUID,
                                             "message": "I need to talk to someone"}}
     lost.log(401, json.dumps(msg), status=None, line=None, flow="LIVE: Unrecognized Message")
     assert lost.run(401, "--post") == 0
-    assert "triage_data  message_id = 20260930151630123456-000001  ->  SEND: written by key" in out(lost)
+    line = part_line(lost, "triage_data")
+    assert "SEND: written by key with only the columns this part carries; no stored row for this key" in line
     assert [q[1] for q in lost.queued] == ["triage_data"] and lost.fake.rows(config.STAGING_TABLE) == []
+
+
+def test_a_triage_part_missing_from_its_row_is_sent_and_names_the_columns(lost):
+    lost.fake.insert_raw(lost.table("triage_data"), {"message_id": "m-1", "message": "hello", "determination": "LowConcern"})
+    req = {"table": "triage_data", "data": {"message_id": "m-1", "triage_request_id": "req-1"}}
+    lost.log(402, json.dumps(req), flow="LIVE: Initiate Triage Review")
+    assert lost.run(402) == 0
+    assert ("1 of 1 columns differ from the stored row (triage_request_id: the call has 'req-1', the row has None)"
+            in part_line(lost, "triage_data"))
 
 
 # --- what is refused -----------------------------------------------------------------------------------
