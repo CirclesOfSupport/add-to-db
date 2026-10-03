@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from google.cloud import bigquery
 
 PROJECT = "early-alert-responses"
-LIMIT_S, GRACE_S = 20.0, 10.0          # the service uses 140 / 90 s and 10 s; short here so the proof takes a minute
+LIMIT_S, GRACE_S = 20.0, 10.0          # the service uses 120 / 75 s and 10 s; short here so the proof takes a minute
 CONTROL_AT_S = 8.0
 FREE_WITHIN_S = 30.0
 # Busy for a long time and reads no table (0 bytes billed). Measured 2026-10-03: the same statement over

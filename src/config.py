@@ -192,17 +192,25 @@ FLUSH_RETRY_BUDGET_S: dict[str, float] = {
 # holding its transaction open on response_data, and every check-in flush behind it was cancelled
 # until it ended (11 minutes). Each flush script now carries this limit as its BigQuery job timeout,
 # and the flusher stops waiting FLUSH_JOB_TIMEOUT_GRACE_S after it and asks BigQuery to cancel the
-# job; a transaction that does not commit is rolled back. Both targets run in one request, so the two
-# limits and their grace must fit inside the service's request timeout (FLUSH_REQUEST_TIMEOUT_S).
+# job; a transaction that does not commit is rolled back.
+# BigQuery does not stop a job on the second: in our proof on 2026-10-03 (tools/prove_flush_timeout.py)
+# a script with a 20 s limit ended 39 s after it started, 19 s late, and the table was free for the
+# next transaction 3 s after that. So each target is allowed FLUSH_JOB_STOP_LAG_S on top of its limit,
+# and since both targets run in one request, the two limits, two lags and 30 s for the reads must fit
+# inside the service's request timeout (FLUSH_REQUEST_TIMEOUT_S), or the service refuses to start.
+# A normal flush script takes about 9 s (95th percentile 13 s).
 FLUSH_JOB_TIMEOUT_S: dict[str, float] = {
-    "responses": float(os.getenv("FLUSH_JOB_TIMEOUT_RESPONSES_S", "140")),
-    "users": float(os.getenv("FLUSH_JOB_TIMEOUT_USERS_S", "90")),
+    "responses": float(os.getenv("FLUSH_JOB_TIMEOUT_RESPONSES_S", "120")),
+    "users": float(os.getenv("FLUSH_JOB_TIMEOUT_USERS_S", "75")),
 }
 FLUSH_JOB_TIMEOUT_GRACE_S = float(os.getenv("FLUSH_JOB_TIMEOUT_GRACE_S", "10"))
+FLUSH_JOB_STOP_LAG_S = float(os.getenv("FLUSH_JOB_STOP_LAG_S", "30"))
 FLUSH_REQUEST_TIMEOUT_S = float(os.getenv("FLUSH_REQUEST_TIMEOUT_S", "300"))
-if sum(FLUSH_JOB_TIMEOUT_S.values()) + 2 * FLUSH_JOB_TIMEOUT_GRACE_S + 30 > FLUSH_REQUEST_TIMEOUT_S:
-    raise RuntimeError("FLUSH_JOB_TIMEOUT_*_S: the two flush limits, their grace and 30 s for the reads must fit "
-                       "inside FLUSH_REQUEST_TIMEOUT_S")
+if FLUSH_JOB_TIMEOUT_GRACE_S > FLUSH_JOB_STOP_LAG_S:
+    raise RuntimeError("FLUSH_JOB_TIMEOUT_GRACE_S must not be longer than FLUSH_JOB_STOP_LAG_S")
+if sum(FLUSH_JOB_TIMEOUT_S.values()) + 2 * FLUSH_JOB_STOP_LAG_S + 30 > FLUSH_REQUEST_TIMEOUT_S:
+    raise RuntimeError("FLUSH_JOB_TIMEOUT_*_S: the two flush limits, a stop lag for each and 30 s for the reads must "
+                       "fit inside FLUSH_REQUEST_TIMEOUT_S")
 FLUSH_BACKOFF_BASE_S = float(os.getenv("FLUSH_BACKOFF_BASE_S", "1"))
 FLUSH_BACKOFF_CAP_S = float(os.getenv("FLUSH_BACKOFF_CAP_S", "15"))
 

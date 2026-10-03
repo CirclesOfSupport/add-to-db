@@ -177,7 +177,7 @@ def test_a_hung_check_in_transaction_is_cancelled_and_the_users_flush_still_runs
         staged.run_flush_cycle(now=NOW)
     hung = flush_jobs(staged)["responses"]
     assert hung.cancelled                                              # BigQuery was asked to stop it
-    assert "timed out after 140 s" in info.value.errors["responses"] and "asked to cancel" in info.value.errors["responses"]
+    assert "timed out after 120 s" in info.value.errors["responses"] and "asked to cancel" in info.value.errors["responses"]
     assert resp_rows(staged) == [] and state(staged, "responses")["version"] == 0      # nothing written, watermark kept
     assert info.value.results["users"]["status"] == "ok" and state(staged, "users")["version"] == 1
     failed = [x for x in staged.fake.rows(config.FLUSH_LOG_TABLE) if x["status"] == "failed"]
@@ -209,6 +209,9 @@ def test_a_hung_transaction_is_not_retried_inside_the_same_request(staged):
 
 def test_flush_limits_that_do_not_fit_in_the_request_are_refused(monkeypatch):
     with pytest.raises(RuntimeError, match="FLUSH_JOB_TIMEOUT"):
-        _load(monkeypatch, {"FLUSH_JOB_TIMEOUT_RESPONSES_S": "200", "FLUSH_JOB_TIMEOUT_USERS_S": "90"})
+        _load(monkeypatch, {"FLUSH_JOB_TIMEOUT_RESPONSES_S": "140", "FLUSH_JOB_TIMEOUT_USERS_S": "90"})   # no room for the stop lag
     c = _load(monkeypatch, {})
-    assert sum(c.FLUSH_JOB_TIMEOUT_S.values()) + 2 * c.FLUSH_JOB_TIMEOUT_GRACE_S + 30 <= c.FLUSH_REQUEST_TIMEOUT_S
+    assert c.FLUSH_JOB_TIMEOUT_S == {"responses": 120.0, "users": 75.0} and c.FLUSH_JOB_STOP_LAG_S == 30.0
+    assert sum(c.FLUSH_JOB_TIMEOUT_S.values()) + 2 * c.FLUSH_JOB_STOP_LAG_S + 30 <= c.FLUSH_REQUEST_TIMEOUT_S
+    with pytest.raises(RuntimeError, match="GRACE"):
+        _load(monkeypatch, {"FLUSH_JOB_TIMEOUT_GRACE_S": "45"})
