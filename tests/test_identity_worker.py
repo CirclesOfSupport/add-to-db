@@ -63,7 +63,7 @@ def test_branch_matches_live_and_mutations_are_caught(tmp_path):
 
 # ---- check-in path: staged calls, pinned clock and uuid, flushed under the recorder ----------------------
 
-CUTOVER = "29257265d004196f1003b6ad79218d554c1cab1b"
+CUTOVER = "48a7b8537c82d6df29a44b43ffd447e00d7a9759"   # the revision on main this branch is built on
 
 
 def _checkin_src(tmp_path, rev, name):

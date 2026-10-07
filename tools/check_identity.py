@@ -1,9 +1,9 @@
 """
 Identity gate for the triage-queue change: proves the check-in path (response_data and users through the
-staged single writer) is unchanged from the cutover revision, in two parts.
+staged single writer) is unchanged from the revision on main this branch is built on, in two parts.
 
 1. SOURCE. Every top-level statement of src/*.py is compared, as a parsed syntax tree, between --base (the
-   cutover revision, default 2925726) and this checkout. Only the triage-queue additions may differ:
+   revision on main this branch is built on, default 48a7b85) and this checkout. Only the triage-queue additions may differ:
    config's TRIAGE_* settings, tasks.queue_for and tasks.enqueue_write, and in main the /tasks/upsert
    endpoint plus the four triage-alert helpers. Anything else that differs -- the staging append, the
    flush, the sweep, perform_upsert, the MERGE builder -- fails the gate.
@@ -41,7 +41,7 @@ from google.cloud import bigquery
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 LOG = f"{PROJECT}.OPS.webhook_log_detail"
-BASE = "29257265d004196f1003b6ad79218d554c1cab1b"   # cutover-prereqs head, the revision runbook B deploys
+BASE = "48a7b8537c82d6df29a44b43ffd447e00d7a9759"   # main: flush state per target, flush time limits, the re-submit tool
 ALLOWED_CHANGES = {
     "config.py": {"SERIALIZED_TARGETS", "TRIAGE_QUEUE", "TRIAGE_MAX_ATTEMPTS", "TRIAGE_WAIT_ALERT_S",
                   "if TRIAGE_QUEUE"},
@@ -111,7 +111,7 @@ def source_identity(base: str) -> bool:
 def main_():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=7)
-    ap.add_argument("--base", default=BASE, help="commit to compare against (default: the cutover revision)")
+    ap.add_argument("--base", default=BASE, help="commit to compare against (default: the revision on main this branch is built on)")
     ap.add_argument("--targets", default="users,responses")
     ap.add_argument("--source-only", action="store_true")
     args = ap.parse_args()
